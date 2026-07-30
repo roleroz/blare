@@ -100,4 +100,34 @@ def run_blare(
     return process.read_all_until_exit(timeout=timeout)
 
 
-__all__ = ["PtyProcess", "PtyResult", "run_blare"]
+def run_blare_noninteractive(
+    blare_bin: Path,
+    args: list[str],
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> PtyResult:
+    """Run `blare` via a plain (non-PTY) subprocess, so stdin is not a TTY.
+
+    Used by every refusal e2e test whose refusal fires before R22's TTY check (step
+    8) -- there is no checkpoint to drive, so a real terminal buys nothing and would
+    only mask a bug that made the run reach further than expected. The dedicated
+    R22 e2e test uses this deliberately, to prove the refusal itself.
+    """
+    full_env: dict[str, str] = dict(os.environ)
+    if env:
+        full_env.update(env)
+    result = subprocess.run(
+        [str(blare_bin), *args],
+        cwd=str(cwd),
+        env=full_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
+    return PtyResult(exit_code=result.returncode, output=result.stdout)
+
+
+__all__ = ["PtyProcess", "PtyResult", "run_blare", "run_blare_noninteractive"]

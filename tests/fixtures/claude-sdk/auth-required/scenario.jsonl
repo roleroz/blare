@@ -1,0 +1,2 @@
+{"capture_date": "2026-07-30", "sdk_version": "provisional-t2.2", "scenario": "auth-required", "provisional": true}
+{"direction": "inbound", "event": {"type": "auth_required"}}

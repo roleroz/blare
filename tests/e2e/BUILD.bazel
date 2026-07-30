@@ -42,3 +42,176 @@ py_test(
         "@rules_python//python/runfiles",
     ],
 )
+
+py_test(
+    name = "test_r17_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r17_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r17_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r19_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r19_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r19_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r24_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r24_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r24_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "//src/blare:blare_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r1_inverse_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r1_inverse_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r1_inverse_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r23_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r23_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r23_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r22_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r22_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r22_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r21_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r21_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r21_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "//src/blare:blare_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_r12_auth_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r12_auth_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r12_auth_refusal.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/auth-required:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
