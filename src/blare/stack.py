@@ -101,9 +101,10 @@ class AlertRuleInput:
 class UnsupportedStackError(BlareError):
     """Raised by `get_stack` for a name the registry does not recognize (R23).
 
-    Cause names the given value and the supported set; next action is the fix
-    (edit `.blare/config.yaml`'s `stack` key) — **artifacts**, which owns that file,
-    attaches the file name itself when propagating this as R23's refusal.
+    Cause names the given value and the supported set; next action names the fix
+    (edit `.blare/config.yaml`'s `stack` key) directly, since the config path is fixed
+    and never configurable (spec, Artifacts) — **artifacts** propagates this unchanged
+    as R23's refusal, with nothing left to attach.
     """
 
 
