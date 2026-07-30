@@ -257,7 +257,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 - [ ] **T2.4 amendments**: unit mechanics, frozen-only cascade, system amendments, the
   closure loop, outcome notification; e2e per the amendment scenarios. Traces: R2
   (amendment clauses), R3–R5 invariants at the gate.
-- [ ] **T2.5 re-analysis**: `blare analyze` over an existing state file, ID and byte
+- [x] **T2.5 re-analysis**: `blare analyze` over an existing state file, ID and byte
   stability. Traces: R16, R9.
 
 ### T3 — Diff mode

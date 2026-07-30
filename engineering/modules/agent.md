@@ -195,6 +195,10 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   provisional in the file, generated from the real phase-prompt/stack code to keep the
   prompt text byte-exact); a release-suite capture still supersedes it
 - analyze re-run over an existing state file (R16 re-analysis, edits against existing IDs)
+  — T2.5 hand-authored two provisional instances at
+  `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl` (unchanged
+  conclusions) and `tests/fixtures/claude-sdk/analyze-reanalysis-update/scenario.jsonl`
+  (one entry changed); a release-suite capture still supersedes both
 - update with an affected subset of phases
 - update no-impact conclusion (R18), and its chat-redirected variant
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
