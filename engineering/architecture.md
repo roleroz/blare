@@ -242,7 +242,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   templates, `create_client` with replay/record clients and normalization, transcripts,
   error taxonomy; hand-authored provisional fixtures for the analyze happy path. Traces:
   R12 (unit level; its e2e is T2.2's auth refusal) and R14 (unit level; e2e with T2.3).
-- [ ] **T2.2 orchestrator preflight**: the nine-step sequence (the update-only steps 5–6
+- [x] **T2.2 orchestrator preflight**: the nine-step sequence (the update-only steps 5–6
   are wired here but exercised end-to-end in T3.x), lock, run log, exit-code taxonomy,
   refusal e2e tests one per criterion — R1's inverse refusal (orphaned canonical files)
   and R19's structural-validation refusal included. Traces: R11, R12, R17, R19, R21, R22,

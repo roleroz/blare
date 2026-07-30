@@ -206,7 +206,10 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
 - update whose affected phases were seeded by a load-time semantic violation (R18),
   repaired via `request_repair`
 - auth-failure handshake shape (R12) — captured by a dedicated logged-out release
-  scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials
+  scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials.
+  T2.2 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/auth-required/scenario.jsonl` for its R12 refusal e2e test;
+  a release-suite capture still supersedes it
 - the minimal handshake fixture T1.1 hand-authored to reach session start
   (`tests/fixtures/claude-sdk/handshake/scenario.jsonl`, renamed by T2.1 from
   `handshake.jsonl` — a scenario is a whole session, not only a handshake; still marked
