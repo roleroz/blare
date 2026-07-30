@@ -6,6 +6,7 @@ mypy_extensions==1.1.0
 packaging==26.2
 pathspec==1.1.1
 pluggy==1.6.0
+promql-parser==0.10.0
 Pygments==2.20.0
 pytest==9.1.1
 pytest_bazel==0.1.6
