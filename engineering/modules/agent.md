@@ -204,10 +204,13 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   `update-multi-commit/scenario.jsonl` (R8's multi-commit delta); a release-suite capture
   still supersedes both
 - update no-impact conclusion (R18) — T3.1 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; its chat-redirected variant
-  is still needed (T3.2's build); a release-suite capture still supersedes both
+  `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; T3.2 hand-authored its
+  chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`; a release-suite
+  capture still supersedes all three
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
-  a behind-position phase
+  a behind-position phase — T3.2 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`; a release-suite
+  capture still supersedes it
 - checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/analyze-checkpoint-chat/scenario.jsonl`; a release-suite
   capture still supersedes it
@@ -223,7 +226,9 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   `tests/fixtures/claude-sdk/amendment-system/scenario.jsonl`; a release-suite capture
   still supersedes it
 - update whose affected phases were seeded by a load-time semantic violation (R18),
-  repaired via `request_repair`
+  repaired via `request_repair` — T3.2 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/update-load-seeded-repair/scenario.jsonl`; a release-suite
+  capture still supersedes it
 - auth-failure handshake shape (R12) — captured by a dedicated logged-out release
   scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials.
   T2.2 hand-authored a provisional instance at
