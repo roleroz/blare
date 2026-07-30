@@ -220,7 +220,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   `.claude/test-commands.json` declaring the fast/full/release commands as Bazel tag
   filters, and the repo's `PreToolUse` merge gate running the full command. Traces: R11
   (first clause), R13.
-- [ ] **T1.2 gitrepo**: the module complete per `gitrepo.md` — interface, answer sets,
+- [x] **T1.2 gitrepo**: the module complete per `gitrepo.md` — interface, answer sets,
   `--no-renames` semantics, contract and failure tests (real git; stub executables). No e2e
   of its own: its behaviour surfaces end-to-end through T2.2's refusals and T3.1's deltas,
   so the done-criterion's e2e clause is satisfied by its design doc's test plan alone.
