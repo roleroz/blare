@@ -7,6 +7,7 @@ py_library(
     srcs = [
         "__init__.py",
         "agent.py",
+        "artifacts.py",
         "cli.py",
         "gitrepo.py",
         "model.py",
@@ -17,6 +18,7 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         "@pip//promql_parser",
+        "@pip//ruamel_yaml",
     ],
 )
 
@@ -81,6 +83,21 @@ py_test(
         "//:pytest_main.py",
     ],
     args = ["$(location :test_orchestrator.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    deps = [
+        ":blare_lib",
+        "@pip//pytest_bazel",
+    ],
+)
+
+py_test(
+    name = "test_artifacts",
+    srcs = [
+        "test_artifacts.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_artifacts.py)"],
     legacy_create_init = False,
     main = "//:pytest_main.py",
     deps = [

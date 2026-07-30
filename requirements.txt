@@ -10,5 +10,6 @@ promql-parser==0.10.0
 Pygments==2.20.0
 pytest==9.1.1
 pytest_bazel==0.1.6
+ruamel.yaml==0.18.10
 ruff==0.16.0
 typing_extensions==4.16.0
