@@ -1,16 +1,18 @@
 """Unit tests for blare.orchestrator: T2.2's nine-step preflight sequence, the lock,
 the run log, and the exit-code taxonomy; T2.3's phase engine, checkpoints, the
-approval gate, and the write path.
+approval gate, and the write path; T2.4's amendment mechanism (unit mechanics, the
+frozen-only cascade, system amendments, the closure loop, outcome notification).
 
 Fakes per orchestrator.md's test plan: `FakeSDKClient` (a scripted `agent.SDKClient`
 stand-in, used only by tests that exercise the real `agent.AgentSession`'s own auth
 handshake), `FakeAgentSession` (a scripted `agent.AgentSession` stand-in -- phase edit
-batches, chat replies -- for every test that needs the phase engine to actually run),
-and `FakePresenter` (scripted replies, records every `CheckpointView` presented).
+batches, chat replies, request_repair/notify_amendment_outcome -- for every test that
+needs the phase engine to actually run), and `FakePresenter` (scripted replies,
+records every `CheckpointView`/`AmendmentView` presented).
 gitrepo and artifacts are real, exercised over temporary git repositories -- matching
 the design doc's "gitrepo and artifacts are real, over temp repos".
 
-Amendments (T2.4) and the diff-mode phase engine (T3.x) are out of this file's scope.
+The diff-mode phase engine and `triage` (T3.x) are out of this file's scope.
 """
 
 from __future__ import annotations
@@ -35,8 +37,11 @@ from blare.model import (
     RunControlCall,
     RunControlVerdict,
     RunMode,
+    Violation,
+    ViolationKind,
 )
 from blare.orchestrator import (
+    AmendmentOrigin,
     AmendmentReply,
     AmendmentView,
     CheckpointReply,
@@ -69,6 +74,9 @@ class FakePresenter:
     checkpoint_replies: list[CheckpointReply] = field(default_factory=list)
     chat_reply_script: list[AmendmentReply | None] = field(default_factory=list)
     chat_reply_calls: list[tuple[str, PromptKind | None]] = field(default_factory=list)
+    amendment_views: list[AmendmentView] = field(default_factory=list)
+    amendment_rejectable_seen: list[bool] = field(default_factory=list)
+    amendment_replies: list[AmendmentReply] = field(default_factory=list)
 
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
         self.checkpoint_views.append(view)
@@ -77,7 +85,11 @@ class FakePresenter:
         return orchestrator.Approve()
 
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply:
-        raise NotImplementedError
+        self.amendment_views.append(view)
+        self.amendment_rejectable_seen.append(rejectable)
+        if self.amendment_replies:
+            return self.amendment_replies.pop(0)
+        return orchestrator.Approve()
 
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
         raise NotImplementedError
@@ -157,6 +169,12 @@ class FakeAgentSession:
     transcript: object
     edits_by_phase: dict[Phase, list[EditBatch]] = field(default_factory=dict)
     chat_script: list[str] = field(default_factory=list)
+    # Scripted edit batches / run_control calls to apply, via the real sink/control
+    # handlers, when `chat` is called with exactly this text -- what lets a test
+    # simulate the model proposing/completing an amendment, or landing a repair
+    # batch, during checkpoint or amendment re-presentation chat.
+    chat_edits_by_text: dict[str, list[EditBatch]] = field(default_factory=dict)
+    chat_run_control_by_text: dict[str, list[RunControlCall]] = field(default_factory=dict)
     # Scripted `run_control` calls to issue via the real control handler during a
     # given phase's turn (orchestrator.md's test plan wants run-control totality
     # exercised, even though analyze mode rejects every one of them today).
@@ -167,11 +185,37 @@ class FakeAgentSession:
     # agent session dying mid-phase (orchestrator.md's failure-mode test plan:
     # "agent: AgentSessionError mid-phase").
     raise_in_phase: dict[Phase, Exception] = field(default_factory=dict)
+    # Repair batches to apply (through the real sink) when `request_repair` is
+    # called naming exactly this sorted phase tuple -- keyed the same way
+    # `edits_by_phase` keys phase turns, so a test scripts "what the model does
+    # when asked to repair phases X" once, however many times the closure loop
+    # calls request_repair for that exact frontier.
+    repair_edits_by_phases: dict[tuple[Phase, ...], list[EditBatch]] = field(
+        default_factory=dict
+    )
+    # Extra run_control calls (e.g. a fresh amend_proposal joining more phases) to
+    # issue, via the real control handler, during a given request_repair call --
+    # keyed like repair_edits_by_phases, applied before the scripted amend_complete.
+    repair_run_control_by_phases: dict[tuple[Phase, ...], list[RunControlCall]] = field(
+        default_factory=dict
+    )
+    # When True, a request_repair call does not itself acknowledge amend_complete
+    # -- the test drives it explicitly (via `control`) to exercise the reminder /
+    # resume path at the orchestrator level. Default False: every scripted fake
+    # acknowledges completion immediately, since the resume-retry mechanics are
+    # agent.py's own unit-level concern (test_agent.py), not this module's.
+    withhold_amend_complete: bool = False
     started_with: tuple[RunMode, RunContext] | None = field(default=None, init=False)
     ran_phases: list[Phase] = field(default_factory=list, init=False)
     chat_calls: list[str] = field(default_factory=list, init=False)
     rejected_batches: list[BatchVerdict] = field(default_factory=list, init=False)
     run_control_verdicts: list[RunControlVerdict] = field(default_factory=list, init=False)
+    request_repair_calls: list[tuple[tuple[Phase, ...], tuple[Violation, ...]]] = field(
+        default_factory=list, init=False
+    )
+    notify_outcomes: list[tuple[bool, tuple[Phase, ...]]] = field(
+        default_factory=list, init=False
+    )
     closed: bool = field(default=False, init=False)
 
     def start(self, mode: RunMode, context: RunContext) -> None:
@@ -204,6 +248,12 @@ class FakeAgentSession:
     def chat(self, text: str) -> str:
         self.chat_calls.append(text)
         self._write_transcript("outbound", {"type": "chat", "text": text})
+        for batch in self.chat_edits_by_text.get(text, []):
+            verdict = self.sink(batch)
+            if not verdict.ok:
+                self.rejected_batches.append(verdict)
+        for call in self.chat_run_control_by_text.get(text, []):
+            self.run_control_verdicts.append(self.control(call))
         reply = self.chat_script.pop(0) if self.chat_script else ""
         self._write_transcript("inbound", {"type": "text", "text": reply})
         return reply
@@ -221,11 +271,29 @@ class FakeAgentSession:
     def triage(self) -> None:
         raise NotImplementedError("analyze mode never calls triage")
 
-    def request_repair(self, phases: object, violations: object) -> None:
-        raise NotImplementedError("amendments are a later task's scope")
+    def request_repair(self, phases: list[Phase], violations: list[Violation]) -> None:
+        key = tuple(sorted(phases, key=int))
+        self.request_repair_calls.append((key, tuple(violations)))
+        self._write_transcript(
+            "outbound", {"type": "request_repair", "phases": [int(p) for p in key]}
+        )
+        for batch in self.repair_edits_by_phases.get(key, []):
+            verdict = self.sink(batch)
+            if not verdict.ok:
+                self.rejected_batches.append(verdict)
+        for call in self.repair_run_control_by_phases.get(key, []):
+            self.run_control_verdicts.append(self.control(call))
+        if not self.withhold_amend_complete:
+            self.control(RunControlCall(action=RunControlAction.AMEND_COMPLETE, payload={}))
+        self._write_transcript("inbound", {"type": "turn_end"})
 
-    def notify_amendment_outcome(self, approved: bool, restored_phases: object) -> None:
-        raise NotImplementedError("amendments are a later task's scope")
+    def notify_amendment_outcome(
+        self, approved: bool, restored_phases: list[Phase]
+    ) -> None:
+        self.notify_outcomes.append((approved, tuple(restored_phases)))
+        self._write_transcript(
+            "outbound", {"type": "amendment_outcome", "approved": approved}
+        )
 
 
 def _ready_session(
@@ -235,6 +303,11 @@ def _ready_session(
     chat_script: list[str] | None = None,
     run_control_calls_by_phase: dict[Phase, list[RunControlCall]] | None = None,
     raise_in_phase: dict[Phase, Exception] | None = None,
+    chat_edits_by_text: dict[str, list[EditBatch]] | None = None,
+    chat_run_control_by_text: dict[str, list[RunControlCall]] | None = None,
+    repair_edits_by_phases: dict[tuple[Phase, ...], list[EditBatch]] | None = None,
+    repair_run_control_by_phases: dict[tuple[Phase, ...], list[RunControlCall]] | None = None,
+    withhold_amend_complete: bool = False,
 ) -> list[FakeAgentSession]:
     """Patch `agent.create_client` and `agent.AgentSession` so the phase engine runs
     against a scripted `FakeAgentSession` instead of real SDK wire replay -- what
@@ -248,6 +321,10 @@ def _ready_session(
     scripted_chat = list(chat_script or [])
     scripted_run_control = run_control_calls_by_phase or {}
     scripted_raises = raise_in_phase or {}
+    scripted_chat_edits = chat_edits_by_text or {}
+    scripted_chat_run_control = chat_run_control_by_text or {}
+    scripted_repair_edits = repair_edits_by_phases or {}
+    scripted_repair_run_control = repair_run_control_by_phases or {}
     sessions: list[FakeAgentSession] = []
 
     def _factory(
@@ -267,6 +344,11 @@ def _ready_session(
             chat_script=list(scripted_chat),
             run_control_calls_by_phase=scripted_run_control,
             raise_in_phase=scripted_raises,
+            chat_edits_by_text=scripted_chat_edits,
+            chat_run_control_by_text=scripted_chat_run_control,
+            repair_edits_by_phases=scripted_repair_edits,
+            repair_run_control_by_phases=scripted_repair_run_control,
+            withhold_amend_complete=withhold_amend_complete,
         )
         sessions.append(session)
         return session
@@ -1597,13 +1679,15 @@ def test_contract_abort_at_checkpoint_writes_nothing(
     ]
 
 
-def test_contract_gate_failure_reports_violations_and_writes_nothing(
+def test_contract_gate_failure_opens_system_amendment_instead_of_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T2.3's scoped boundary: a candidate that fails the final semantic gate (an
-    unmapped, non-excluded failure mode) is not silently written, nor is an
-    amendment invented -- the run fails clearly (exit 2), naming the violation, and
-    writes nothing (R20)."""
+    """T2.3's scoped boundary is gone (T2.4 supersedes it, per architecture.md's
+    Amendment mechanism): a candidate that fails the final semantic gate (an
+    unmapped, non-excluded failure mode) opens a system-originated amendment
+    instead of failing the run outright. Once the repair lands (via chat) and is
+    approved, the run reaches final confirmation and writes the repaired set --
+    nothing is written before that (R20)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -1630,25 +1714,38 @@ def test_contract_gate_failure_reports_violations_and_writes_nothing(
             )
         ],
     }
-    sessions = _ready_session(monkeypatch, edits_by_phase=edits_by_phase)
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits_by_phase,
+        chat_script=["fixed"],
+        chat_run_control_by_text={
+            "fix it": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})]
+        },
+        chat_edits_by_text={
+            "fix it": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-unmapped", ["fm-unmapped"]),
+                        _coverage_alert_edit("fm-unmapped", ["ar-unmapped"]),
+                    ),
+                )
+            ]
+        },
+    )
     presenter = FakePresenter()
+    presenter.amendment_replies = [orchestrator.Chat("fix it"), orchestrator.Approve()]
 
     code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
 
-    assert code == 2
-    assert len(presenter.errors) == 1
-    cause, next_action, _detail = presenter.errors[0]
-    assert "unmapped_failure_mode" in cause
-    assert "fm-unmapped" in cause
-    assert next_action != ""
-    assert len(presenter.summaries) == 1
-    assert presenter.summaries[0].outcome == "failed"
-    assert presenter.summaries[0].discarded
-    assert not (_blare_root(repo) / "state.yaml").exists()
-    # The session is closed on every exit from the phase engine, gate failures
-    # included -- not only the approval and abort paths (agent.md: `close` is
-    # idempotent and safe after any error, which only matters if it is actually
-    # called on every path).
+    assert code == 0
+    assert len(presenter.errors) == 0
+    assert len(presenter.amendment_views) == 2
+    assert presenter.amendment_views[0].origin is AmendmentOrigin.SYSTEM
+    assert presenter.amendment_rejectable_seen == [False, False]
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert set(loaded.alert_recommendations) == {"ar-unmapped"}
+    assert artifacts.semantic_violations(loaded) == []
     assert sessions[0].closed
 
 
@@ -1741,6 +1838,1190 @@ def test_contract_derived_doc_not_restored_on_abort(
     assert code == 3
     assert doc_path.read_text() == edited_content
     assert not (_blare_root(repo) / "state.yaml").exists()
+
+
+# --- T2.4: amendments (unit mechanics, the frozen-only cascade, system amendments,
+# the closure loop, outcome notification) --------------------------------------------
+
+
+def _fm_edit(
+    fm_id: str,
+    *,
+    title: str = "a failure mode",
+    severity: str = "warning",
+    user_visible: bool = False,
+    caused_by: list[str] | None = None,
+    coverage_status: str = "alertable",
+    exclusion_reason: str | None = None,
+) -> Edit:
+    payload: dict[str, object] = {
+        "id": fm_id,
+        "title": title,
+        "description": "d",
+        "severity": severity,
+        "user_visible": user_visible,
+        "caused_by": caused_by or [],
+        "coverage_status": coverage_status,
+    }
+    if exclusion_reason is not None:
+        payload["exclusion_reason"] = exclusion_reason
+    return Edit(EditOp.ADD, "failure_modes", payload)
+
+
+def _fm_update_edit(
+    fm_id: str,
+    *,
+    title: str = "a failure mode",
+    severity: str = "warning",
+    user_visible: bool = False,
+    caused_by: list[str] | None = None,
+    coverage_status: str = "alertable",
+    exclusion_reason: str | None = None,
+) -> Edit:
+    payload: dict[str, object] = {
+        "id": fm_id,
+        "title": title,
+        "description": "d",
+        "severity": severity,
+        "user_visible": user_visible,
+        "caused_by": caused_by or [],
+        "coverage_status": coverage_status,
+    }
+    if exclusion_reason is not None:
+        payload["exclusion_reason"] = exclusion_reason
+    return Edit(EditOp.UPDATE, "failure_modes", payload)
+
+
+def _alert_edit(alert_id: str, fm_ids: list[str], severity: str = "critical") -> Edit:
+    return Edit(
+        EditOp.ADD,
+        "alert_recommendations",
+        {
+            "id": alert_id,
+            "name": alert_id,
+            "expr": "up == 0",
+            "for_duration": "5m",
+            "severity": severity,
+            "failure_mode_ids": fm_ids,
+            "annotations": {"summary": "s", "description": "d"},
+        },
+    )
+
+
+def _coverage_alert_edit(fm_id: str, alert_ids: list[str]) -> Edit:
+    return Edit(EditOp.UPDATE, "coverage", {"failure_mode_id": fm_id, "alert_ids": alert_ids})
+
+
+def _coverage_metric_edit(fm_id: str, detecting_metric_ids: list[str]) -> Edit:
+    return Edit(
+        EditOp.UPDATE,
+        "coverage",
+        {"failure_mode_id": fm_id, "detecting_metric_ids": detecting_metric_ids},
+    )
+
+
+def test_contract_agent_amendment_single_phase_no_cascade_approved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent-proposed amendment naming one frozen phase, whose repair touches
+    nothing any other phase references: no cascade, one re-presentation, approval
+    re-freezes exactly that phase. Proposed during the (frozen) phase-4 checkpoint's
+    chat, resumed via `request_repair` since the proposing turn ends without
+    `amend_complete` (agent.md's resume path)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_edits_by_text={"please amend phase 1": []},
+        chat_run_control_by_text={
+            "please amend phase 1": [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.SYSTEM_MAP,): [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web",
+                                "kind": "service",
+                                "description": "revised during the amendment",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    # Phase 4's checkpoint: chat first (proposes the amendment), then approve.
+    presenter.checkpoint_replies = [
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Chat("please amend phase 1"),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.request_repair_calls == [((Phase.SYSTEM_MAP,), ())]
+    assert session.notify_outcomes == [(True, ())]
+    assert len(presenter.amendment_views) == 1
+    view = presenter.amendment_views[0]
+    assert view.origin is AmendmentOrigin.AGENT
+    assert presenter.amendment_rejectable_seen == [True]
+    assert [s.phase for s in view.sections] == [Phase.SYSTEM_MAP]
+    [section] = view.sections
+    assert [c.id for c in section.updated] == ["sm-web"]
+
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.system_components["sm-web"].description == "revised during the amendment"
+
+
+def test_contract_amendment_cascade_reference_and_invariant_approved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cascade pulls in a frozen phase via a semantic-violation repair phase
+    (the invariant half: the unit's own origin, an `EMPTY_LINKAGE_METRIC_RECOMMENDATION`
+    violation opening metric coverage) and a *different* frozen phase via
+    `referencing_phases` (the reference half: repairing the linkage also touches
+    fm-A, which ar-A references, cascading into alert recommendations -- reachable
+    here only because this is a *system*-originated unit: by the time the gate
+    runs, every phase has already frozen, unlike any agent-proposed amendment,
+    which can only ever arise before phase 4 itself has frozen). The unit is
+    re-presented once; approval re-freezes exactly the phases frozen when it
+    opened."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-a", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+        Phase.METRIC_COVERAGE: [
+            EditBatch(
+                phase=Phase.METRIC_COVERAGE,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "metrics",
+                        {
+                            "id": "mx-1",
+                            "name": "some_metric_total",
+                            "type": "counter",
+                            "labels": [],
+                            "emitted_at": ["a.go:1"],
+                            "description": "d",
+                        },
+                    ),
+                    # A metric recommendation with no failure modes named yet --
+                    # the EMPTY_LINKAGE_METRIC_RECOMMENDATION violation the gate
+                    # will find, deliberately left broken for this test.
+                    Edit(
+                        EditOp.ADD,
+                        "metric_recommendations",
+                        {
+                            "id": "mr-bad",
+                            "kind": "new",
+                            "failure_mode_ids": [],
+                            "rationale": "r",
+                            "details": "d",
+                        },
+                    ),
+                ),
+            )
+        ],
+        Phase.ALERT_RECOMMENDATIONS: [
+            EditBatch(
+                phase=Phase.ALERT_RECOMMENDATIONS,
+                edits=(_alert_edit("ar-a", ["fm-a"]), _coverage_alert_edit("fm-a", ["ar-a"])),
+            )
+        ],
+    }
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        repair_edits_by_phases={
+            (Phase.METRIC_COVERAGE,): [
+                EditBatch(
+                    phase=Phase.METRIC_COVERAGE,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "metric_recommendations",
+                            {
+                                "id": "mr-bad",
+                                "kind": "new",
+                                "failure_mode_ids": ["fm-a"],
+                                "rationale": "r",
+                                "details": "d",
+                            },
+                        ),
+                        _coverage_metric_edit("fm-a", []),
+                    ),
+                )
+            ],
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # Round 1: the system unit's own opening announcement, carrying the invariant
+    # violation that triggered it. Round 2: a pure-reference cascade (no new
+    # violation drove it) into alert recommendations, via ar-a referencing fm-a.
+    assert len(session.request_repair_calls) == 2
+    first_phases, first_violations = session.request_repair_calls[0]
+    assert first_phases == (Phase.METRIC_COVERAGE,)
+    assert {v.kind for v in first_violations} == {ViolationKind.EMPTY_LINKAGE_METRIC_RECOMMENDATION}
+    second_phases, second_violations = session.request_repair_calls[1]
+    assert second_phases == (Phase.ALERT_RECOMMENDATIONS,)
+    assert second_violations == ()
+    assert len(presenter.amendment_views) == 1  # re-presented once
+    assert presenter.amendment_views[0].origin is AmendmentOrigin.SYSTEM
+    assert {s.phase for s in presenter.amendment_views[0].sections} == {
+        Phase.METRIC_COVERAGE,
+        Phase.ALERT_RECOMMENDATIONS,
+    }
+    assert session.notify_outcomes == [(True, ())]
+
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.metric_recommendations["mr-bad"].failure_mode_ids == ("fm-a",)
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_contract_agent_amendment_cascades_into_already_frozen_phase_via_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An *agent*-proposed amendment can cascade into an already-frozen phase
+    too, not only a system-originated one (the prior cascade test's origin):
+    proposed during phase 4's own checkpoint chat (phase 3 already frozen),
+    renaming fm-503 -- which mr-x references -- pulls metric coverage in via
+    pure `referencing_phases`, no violation involved, logged as a genuine
+    cascade join in the run log."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    state_home = _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    edits[Phase.METRIC_COVERAGE] = [
+        *edits[Phase.METRIC_COVERAGE],
+        EditBatch(
+            phase=Phase.METRIC_COVERAGE,
+            edits=(
+                Edit(
+                    EditOp.ADD,
+                    "metric_recommendations",
+                    {
+                        "id": "mr-x",
+                        "kind": "new",
+                        "failure_mode_ids": ["fm-503"],
+                        "rationale": "r",
+                        "details": "d",
+                    },
+                ),
+            ),
+        ),
+    ]
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_run_control_by_text={
+            "please rename fm-503": [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [2]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.FAILURE_MODES,): [
+                EditBatch(
+                    phase=Phase.FAILURE_MODES,
+                    edits=(
+                        _fm_update_edit(
+                            "fm-503",
+                            title="web returns 503 (renamed)",
+                            severity="critical",
+                            user_visible=True,
+                            caused_by=["fm-timeout"],
+                            coverage_status="alertable",
+                        ),
+                    ),
+                )
+            ],
+        },
+    )
+    presenter = FakePresenter()
+    presenter.checkpoint_replies = [
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Chat("please rename fm-503"),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.request_repair_calls[0] == ((Phase.FAILURE_MODES,), ())
+    second_phases, second_violations = session.request_repair_calls[1]
+    assert second_phases == (Phase.METRIC_COVERAGE,)
+    assert second_violations == ()  # pure reference, no invariant involved
+    assert len(session.request_repair_calls) == 2
+    assert len(presenter.amendment_views) == 1
+    assert presenter.amendment_views[0].origin is AmendmentOrigin.AGENT
+    assert {s.phase for s in presenter.amendment_views[0].sections} == {
+        Phase.FAILURE_MODES,
+        Phase.METRIC_COVERAGE,
+    }
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.failure_modes["fm-503"].title == "web returns 503 (renamed)"
+
+    repo_id = gitrepo.GitRepo.discover(repo).repo_id()
+    run_log_dir = state_home / "blare" / repo_id / "runs"
+    [log_path] = list(run_log_dir.glob("*.jsonl"))
+    lines = [json.loads(line) for line in log_path.read_text().splitlines()]
+    cascade_events = [e for e in lines if e["event"] == "amendment_cascade_joined"]
+    assert len(cascade_events) == 1
+    assert cascade_events[0]["phases"] == [3]
+    assert cascade_events[0]["violation_count"] == 0
+
+
+def test_contract_amendment_names_unvisited_ahead_phase_approved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An amendment naming an unvisited (ahead) phase opens it; approval leaves it
+    open rather than freezing it (it was never frozen to begin with) -- it takes its
+    ordinary checkpoint when the queue reaches it, and its unit repairs are present
+    as pending edits there (opening a phase for a repair never substitutes for
+    running it)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    _fm_edit("fm-timeout", coverage_status="excluded", exclusion_reason="r"),
+                    _fm_edit(
+                        "fm-503",
+                        severity="critical",
+                        user_visible=True,
+                        caused_by=["fm-timeout"],
+                        coverage_status="alertable",
+                    ),
+                ),
+            )
+        ],
+    }
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        run_control_calls_by_phase={
+            Phase.FAILURE_MODES: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [4]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.ALERT_RECOMMENDATIONS,): [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-early", ["fm-503"]),
+                        _coverage_alert_edit("fm-503", ["ar-early"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.request_repair_calls == [((Phase.ALERT_RECOMMENDATIONS,), ())]
+    assert session.notify_outcomes == [(True, ())]
+    # The ordinary phase-4 checkpoint still fired, showing the amendment's repairs
+    # as its own content -- its baseline was captured when the amendment opened it,
+    # not "nothing changed" (opening a phase never substitutes for running it).
+    phase4_views = [v for v in presenter.checkpoint_views if v.phase is Phase.ALERT_RECOMMENDATIONS]
+    assert len(phase4_views) == 1
+    assert [c.id for c in phase4_views[0].added] == ["ar-early"]
+
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert set(loaded.alert_recommendations) == {"ar-early"}
+    assert loaded.coverage["fm-503"].alert_ids == ("ar-early",)
+
+
+def test_contract_amendment_names_unvisited_ahead_phase_rejected_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rejecting an amendment that opened an unvisited phase returns it to
+    unvisited, its repairs discarded; the phase's own later checkpoint runs
+    normally and the final artifact set reflects only the ordinary work."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    _fm_edit("fm-timeout", coverage_status="excluded", exclusion_reason="r"),
+                    _fm_edit(
+                        "fm-503",
+                        severity="critical",
+                        user_visible=True,
+                        caused_by=["fm-timeout"],
+                        coverage_status="alertable",
+                    ),
+                ),
+            )
+        ],
+        Phase.ALERT_RECOMMENDATIONS: [
+            EditBatch(
+                phase=Phase.ALERT_RECOMMENDATIONS,
+                edits=(
+                    _alert_edit("ar-final", ["fm-503"]),
+                    _coverage_alert_edit("fm-503", ["ar-final"]),
+                ),
+            )
+        ],
+    }
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        run_control_calls_by_phase={
+            Phase.FAILURE_MODES: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [4]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.ALERT_RECOMMENDATIONS,): [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-early", ["fm-503"]),
+                        _coverage_alert_edit("fm-503", ["ar-early"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.amendment_replies = [orchestrator.Reject()]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.notify_outcomes == [(False, (Phase.ALERT_RECOMMENDATIONS,))]
+    phase4_views = [v for v in presenter.checkpoint_views if v.phase is Phase.ALERT_RECOMMENDATIONS]
+    assert len(phase4_views) == 1
+    assert [c.id for c in phase4_views[0].added] == ["ar-final"]
+
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert set(loaded.alert_recommendations) == {"ar-final"}
+    assert loaded.coverage["fm-503"].alert_ids == ("ar-final",)
+
+
+def test_contract_run_control_totality_amend_proposal_and_amend_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run-control totality for the amendment actions: a proposal adding a
+    non-open phase mid-unit joins the unit (join-over-reject precedence); a
+    proposal naming only already-open phases is rejected as a verdict; an
+    amend_complete with no unit open is rejected as a verdict."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        run_control_calls_by_phase={
+            Phase.FAILURE_MODES: [
+                # No unit open yet: rejected as a verdict.
+                RunControlCall(RunControlAction.AMEND_COMPLETE, {}),
+                # Opens a unit on phase 1.
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]}),
+                # Joins phase 3 (non-open) -- phase 1 (already open, part of the
+                # unit) is a no-op within it.
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1, 3]}),
+                # Names only already-open phases (1 and 3, both open now): rejected.
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]}),
+            ],
+        },
+        # Both opened phases must be resolved before the run can finish: repair
+        # them trivially and close the unit without residual violations.
+        repair_edits_by_phases={
+            (Phase.SYSTEM_MAP, Phase.METRIC_COVERAGE): [],
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    verdicts = session.run_control_verdicts
+    assert len(verdicts) == 4
+    assert verdicts[0].ok is False  # amend_complete, no unit open
+    assert verdicts[1].ok is True  # amend_proposal opens phase 1
+    assert verdicts[2].ok is True  # amend_proposal joins phase 3 (phase 1 a no-op)
+    assert verdicts[3].ok is False  # amend_proposal naming only already-open phases
+
+
+def test_contract_amendment_open_when_run_phase_returns_defers_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An amendment unit open when `run_phase` returns defers that phase's
+    checkpoint: the unit is resumed via `request_repair` to closure and
+    re-presentation, and only then does the checkpoint present -- recorded here by
+    checking the amendment view is presented before the phase's own checkpoint
+    view (the gate never fires while a unit is open, so the run only reaches exit 0
+    if the deferred checkpoint eventually did present and get approved)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    # The amendment fires during phase 2's own turn (phase 1 is frozen by then).
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        run_control_calls_by_phase={
+            Phase.FAILURE_MODES: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.SYSTEM_MAP,): [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web",
+                                "kind": "service",
+                                "description": "repaired mid-phase-2",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert len(presenter.amendment_views) == 1
+    # Phase 2's own checkpoint view (added failure modes) still shows up, and
+    # every phase's checkpoint fired in order despite the mid-run amendment.
+    assert [v.phase for v in presenter.checkpoint_views] == list(Phase)
+    fm_view = next(v for v in presenter.checkpoint_views if v.phase is Phase.FAILURE_MODES)
+    assert {c.id for c in fm_view.added} == {"fm-timeout", "fm-503"}
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.system_components["sm-web"].description == "repaired mid-phase-2"
+
+
+def test_contract_amend_proposal_during_ordinary_checkpoint_chat_defers_and_represents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An `amend_proposal` arising during an ordinary checkpoint's chat defers that
+    checkpoint: the chat reply still renders (via `prompt=None`, mooting the
+    in-progress prompt), the unit runs to closure, and the checkpoint re-presents
+    fresh afterward."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_script=["noted, opening an amendment"],
+        chat_run_control_by_text={
+            "what about sm-web?": [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.SYSTEM_MAP,): [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web",
+                                "kind": "service",
+                                "description": "revised via checkpoint chat",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    # Phase 1's own checkpoint: chat first (opens an amendment on the very phase
+    # under checkpoint... no: use phase 2's checkpoint chatting about phase 1,
+    # which is frozen by then).
+    presenter.checkpoint_replies = [
+        orchestrator.Approve(),
+        orchestrator.Chat("what about sm-web?"),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.chat_calls == ["what about sm-web?"]
+    # The chat reply rendered with prompt=None (mooted) rather than re-offering the
+    # checkpoint prompt directly.
+    assert ("noted, opening an amendment", None) in presenter.chat_reply_calls
+    assert len(presenter.amendment_views) == 1
+    # Phase 2's checkpoint re-presented fresh after the unit closed: two views for
+    # phase 2 would indicate a redraw bug, but cli.md's presenter is stateless per
+    # call, so what matters is a *second* present_checkpoint call happened for
+    # phase 2 after the amendment resolved -- i.e. the run reached phase 2's
+    # approval and continued, which only exit 0 for the full run confirms here.
+    assert [v.phase for v in presenter.checkpoint_views] == [
+        Phase.SYSTEM_MAP,
+        Phase.FAILURE_MODES,
+        Phase.FAILURE_MODES,
+        Phase.METRIC_COVERAGE,
+        Phase.ALERT_RECOMMENDATIONS,
+    ]
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.system_components["sm-web"].description == "revised via checkpoint chat"
+
+
+def test_contract_amendment_representation_chat_lands_batch_returns_to_closure_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chat during an amendment's re-presentation that lands a batch (and signals
+    completion) returns the unit to the closure loop: recompute runs, and the next
+    `AmendmentView` shows the updated set -- two distinct views, not a redraw of the
+    same one."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_run_control_by_text={
+            "please open phase 1": [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ],
+            "also fix the name": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})],
+        },
+        chat_edits_by_text={
+            "also fix the name": [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web-2",
+                                "kind": "service",
+                                "description": "the web frontend",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.checkpoint_replies = [
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Chat("please open phase 1"),
+    ]
+    presenter.amendment_replies = [
+        orchestrator.Chat("also fix the name"),
+        orchestrator.Approve(),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert len(presenter.amendment_views) == 2
+    first, second = presenter.amendment_views
+    assert first != second
+    [first_section] = first.sections
+    assert not first_section.added and not first_section.updated and not first_section.removed
+    [second_section] = second.sections
+    assert second_section.updated and second_section.updated[0].id == "sm-web"
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.system_components["sm-web"].name == "web-2"
+
+
+def test_contract_system_amendment_no_reject_chat_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A semantic violation at the approval gate opens a system-originated
+    amendment: no reject is offered, and chat that repairs the violation converges
+    (the gate re-fires and passes once the residual repair lands)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    _fm_edit(
+                        "fm-orphan",
+                        severity="critical",
+                        user_visible=True,
+                        coverage_status="alertable",
+                    ),
+                ),
+            )
+        ],
+        # Phase 4 runs and freezes without ever mapping fm-orphan to an alert.
+    }
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_script=["fixed"],
+        chat_run_control_by_text={
+            "let me fix that": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})]
+        },
+        chat_edits_by_text={
+            "let me fix that": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-orphan", ["fm-orphan"]),
+                        _coverage_alert_edit("fm-orphan", ["ar-orphan"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.amendment_replies = [orchestrator.Chat("let me fix that"), orchestrator.Approve()]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert presenter.amendment_rejectable_seen == [False, False]
+    assert presenter.amendment_views[0].origin is AmendmentOrigin.SYSTEM
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_contract_system_amendment_abort_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Abort is always available at a system-originated amendment's
+    re-presentation (R2), even though reject is not."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-orphan", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+    }
+    _ready_session(monkeypatch, edits_by_phase=edits)
+    presenter = FakePresenter()
+    presenter.amendment_replies = [orchestrator.Abort()]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 3
+    assert not (_blare_root(repo) / "state.yaml").exists()
+
+
+def test_contract_gate_loop_residual_violation_raises_second_system_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A system-originated unit approved with a residual violation elsewhere
+    re-fails the gate and raises a second unit; the write is reached only after a
+    passing check."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    _fm_edit("fm-a", severity="critical", coverage_status="alertable"),
+                    _fm_edit("fm-b", severity="critical", coverage_status="alertable"),
+                ),
+            )
+        ],
+    }
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_script=["fixed fm-a", "fixed fm-b"],
+        chat_run_control_by_text={
+            "fix fm-a": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})],
+            "fix fm-b": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})],
+        },
+        chat_edits_by_text={
+            "fix fm-a": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(_alert_edit("ar-a", ["fm-a"]), _coverage_alert_edit("fm-a", ["ar-a"])),
+                )
+            ],
+            "fix fm-b": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(_alert_edit("ar-b", ["fm-b"]), _coverage_alert_edit("fm-b", ["ar-b"])),
+                )
+            ],
+        },
+    )
+    presenter = FakePresenter()
+    presenter.amendment_replies = [
+        orchestrator.Chat("fix fm-a"),
+        orchestrator.Approve(),
+        orchestrator.Chat("fix fm-b"),
+        orchestrator.Approve(),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    # Approving the first unit right after fixing only fm-a (fm-b's violation
+    # still stands) closes it prematurely -- the gate re-fires and opens a
+    # *second*, separate system unit for the residual violation, never reaching
+    # the write until that one closes too: four presentations across two units
+    # (open -> Chat fixes fm-a -> Approve closes early; re-open -> Chat fixes
+    # fm-b -> Approve closes for good), all system-originated.
+    assert len(presenter.amendment_views) == 4
+    assert all(v.origin is AmendmentOrigin.SYSTEM for v in presenter.amendment_views)
+    assert sessions[0].notify_outcomes == [(True, ()), (True, ())]
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert set(loaded.alert_recommendations) == {"ar-a", "ar-b"}
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_failure_reject_at_non_rejectable_amendment_is_protocol_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `FakePresenter` returning `Reject` at a system-originated (non-rejectable)
+    unit's re-presentation is a protocol violation, handled as an unexpected
+    exception (exit 2)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-orphan", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+    }
+    _ready_session(monkeypatch, edits_by_phase=edits)
+    presenter = FakePresenter()
+    presenter.amendment_replies = [orchestrator.Reject()]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 2
+
+
+def test_contract_amendment_representation_chat_lands_batch_without_amend_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-presentation chat that lands a batch *without* the model also calling
+    amend_complete in that same chat turn (legal: request_repair's completion
+    contract only ever applies to the announcing round, never to re-presentation
+    chat) still returns the unit to the closure loop and converges -- a
+    regression test for a first-review-round bug where `_advance_unit` asserted
+    a phase must always be pending whenever `amend_complete_received` was False,
+    which does not hold once a unit has already been through one closure round."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_run_control_by_text={
+            "please open phase 1": [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ],
+            # No run_control call here -- landing this batch does not also
+            # signal amend_complete, unlike every other amendment test.
+        },
+        chat_edits_by_text={
+            "one more tweak, no need to confirm": [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web",
+                                "kind": "service",
+                                "description": "tweaked without amend_complete",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.checkpoint_replies = [
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Chat("please open phase 1"),
+    ]
+    presenter.amendment_replies = [
+        orchestrator.Chat("one more tweak, no need to confirm"),
+        orchestrator.Approve(),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert len(presenter.amendment_views) == 2
+    second_view = presenter.amendment_views[1]
+    [section] = second_view.sections
+    assert section.updated and section.updated[0].id == "sm-web"
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.system_components["sm-web"].description == "tweaked without amend_complete"
+    assert sessions[0].notify_outcomes == [(True, ())]
+
+
+def test_contract_restore_from_baseline_revives_removed_failure_mode_coverage(
+    tmp_path: Path,
+) -> None:
+    """`_restore_from_baseline` restores a failure mode's coverage byte-for-byte
+    even when it was *removed* by the amendment and the unit never opened
+    metric coverage or alert recommendations at all -- a regression test for a
+    first-review-round bug where the removed entry's absence from `current`
+    (mechanical coverage completeness deletes it alongside the failure mode)
+    made the restore fall back to an empty entry instead of reviving the
+    baseline's."""
+    root = tmp_path / ".blare"
+    root.mkdir()
+    base = artifacts.empty_set(root)
+    baseline = artifacts.apply(
+        base,
+        EditBatch(
+            phase=Phase.FAILURE_MODES,
+            edits=(_fm_edit("fm-b", coverage_status="excluded", exclusion_reason="r"),),
+        ),
+    )
+    baseline = artifacts.apply(
+        baseline,
+        EditBatch(
+            phase=Phase.METRIC_COVERAGE,
+            edits=(_coverage_metric_edit("fm-b", ["mx-1"]),),
+        ),
+    )
+    current = artifacts.apply(
+        baseline,
+        EditBatch(phase=Phase.FAILURE_MODES, edits=(Edit(EditOp.REMOVE, "failure_modes", "fm-b"),)),
+    )
+    assert "fm-b" not in current.coverage  # mechanical completeness removed it
+
+    restored = orchestrator._restore_from_baseline(
+        current, baseline, {Phase.FAILURE_MODES: orchestrator._PhaseStatus.FROZEN}
+    )
+
+    assert "fm-b" in restored.failure_modes
+    assert restored.coverage["fm-b"].detecting_metric_ids == ("mx-1",)
+
+
+def test_contract_amendment_naming_unvisited_repair_phase_does_not_expand_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A violation whose repair phase is unvisited does not expand the unit
+    (orchestrator.md's Test plan, distinct from the frozen-vs-currently-open
+    exclusion other tests cover): the amendment fires during phase 2's own
+    turn, well before phase 4 (alert recommendations) has ever run, so a
+    naturally-occurring UNMAPPED_FAILURE_MODE violation there (fm-x has no
+    alert yet) must not pull phase 4 into the unit -- it stays unvisited and
+    only opens later, on its own ordinary turn."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-x", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+        Phase.ALERT_RECOMMENDATIONS: [
+            EditBatch(
+                phase=Phase.ALERT_RECOMMENDATIONS,
+                edits=(_alert_edit("ar-x", ["fm-x"]), _coverage_alert_edit("fm-x", ["ar-x"])),
+            )
+        ],
+    }
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        run_control_calls_by_phase={
+            Phase.FAILURE_MODES: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.SYSTEM_MAP,): [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.ADD,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web",
+                                "kind": "service",
+                                "description": "added during the amendment",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # fm-x is unmapped (no alert yet) at the moment of the recompute -- a real
+    # violation whose repair phase is ALERT_RECOMMENDATIONS, still unvisited at
+    # that point, so it must not appear anywhere in what got announced/joined.
+    assert session.request_repair_calls == [((Phase.SYSTEM_MAP,), ())]
+    assert len(presenter.amendment_views) == 1
+    assert {s.phase for s in presenter.amendment_views[0].sections} == {Phase.SYSTEM_MAP}
+    # Phase 4 still took its own, ordinary checkpoint later (never substituted).
+    assert [v.phase for v in presenter.checkpoint_views] == list(Phase)
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_contract_run_log_records_amendment_units_and_gate_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run log records amendment units and gate results alongside the
+    ordinary preflight/phase events (orchestrator.md, Failure visibility and
+    Test plan: "amendment units, gate results... all present"): a unit
+    opening, a unit closing, and a failed-then-passed gate. The cascade-join
+    event (`amendment_cascade_joined`) is asserted separately, in
+    `test_contract_agent_amendment_cascades_into_already_frozen_phase_via_reference`,
+    whose scenario actually produces one -- this one's single-phase violation
+    never cascades."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    state_home = _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-orphan", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+    }
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_script=["fixed"],
+        chat_run_control_by_text={
+            "let me fix that": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})]
+        },
+        chat_edits_by_text={
+            "let me fix that": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-orphan", ["fm-orphan"]),
+                        _coverage_alert_edit("fm-orphan", ["ar-orphan"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.amendment_replies = [orchestrator.Chat("let me fix that"), orchestrator.Approve()]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    repo_id = gitrepo.GitRepo.discover(repo).repo_id()
+    run_log_dir = state_home / "blare" / repo_id / "runs"
+    [log_path] = list(run_log_dir.glob("*.jsonl"))
+    lines = [json.loads(line) for line in log_path.read_text().splitlines()]
+    events = [entry["event"] for entry in lines]
+    assert "gate_failed" in events
+    assert "amendment_unit_opened" in events
+    assert "amendment_unit_closed" in events
+    opened = next(e for e in lines if e["event"] == "amendment_unit_opened")
+    assert opened["origin"] == "system"
+    assert opened["phases"] == [4]
+    closed = next(e for e in lines if e["event"] == "amendment_unit_closed")
+    assert closed["approved"] is True
+    assert "gate_passed" in events
 
 
 # --- Failure-mode tests ---------------------------------------------------------------
@@ -1975,9 +3256,12 @@ def test_contract_write_recheck_aborts_on_mid_run_canonical_yaml_hand_edit(
 def test_contract_run_control_calls_reach_the_real_handler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Run-control handling is total (architecture): every `run_control` action is
-    rejected with a verdict naming why, never a raise -- exercised here for each
-    action kind in analyze mode."""
+    """Run-control handling is total (architecture): every action reaches the real
+    handler and gets a verdict, never a raise. `affected_verdict`/`no_impact` stay
+    rejected in analyze mode (diff-mode-only, R18); `amend_proposal`/
+    `amend_complete` are real (T2.4) -- proposing and completing an amendment for
+    an unvisited phase, all within one turn, is accepted both times and needs no
+    `request_repair` round-trip (the model already knows, having done it itself)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -1998,11 +3282,17 @@ def test_contract_run_control_calls_reach_the_real_handler(
     assert code == 0
     verdicts = sessions[0].run_control_verdicts
     assert len(verdicts) == 4
-    assert all(not v.ok for v in verdicts)
+    assert verdicts[0].ok is False
+    assert verdicts[1].ok is False
+    assert verdicts[2].ok is True
+    assert verdicts[3].ok is True
     assert "diff-mode verdict" in (verdicts[0].message or "")
     assert "diff-mode verdict" in (verdicts[1].message or "")
-    assert "not supported in this build" in (verdicts[2].message or "")
-    assert "not supported in this build" in (verdicts[3].message or "")
+    # The amendment closed within the same turn (no request_repair round-trip):
+    # phase 4 was opened from unvisited, so it stays open, taking its ordinary
+    # checkpoint later.
+    assert sessions[0].request_repair_calls == []
+    assert len(presenter.amendment_views) == 1
 
 
 def test_contract_checkpoint_view_carries_real_entry_content(

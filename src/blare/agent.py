@@ -4,10 +4,14 @@ T2.1 scope (`engineering/modules/agent.md`): session lifecycle (`start`, `run_ph
 `chat`, `close`), the two structured tools (`propose_edits`, `run_control`) dispatched
 over orchestrator-injected handlers, the phase/system prompt templates, `create_client`
 with the replay and (directory-validation-only) record branches, transcript writing, and
-the error taxonomy. Deliberately NOT built here, per this task's scope: `triage`,
-`request_repair`, and `notify_amendment_outcome` (amendment/diff-mode-specific; land with
-T2.4/T3.1), and the live (`unset`) SDK client (out of scope for T2.1 too — `create_client`
-keeps T1.1's `NotImplementedError` for that branch).
+the error taxonomy.
+
+T2.4 scope: `request_repair` (the channel for every system-initiated repair and for
+resuming an agent-proposed amendment whose turn ended before `amend_complete`) and
+`notify_amendment_outcome` (closes the loop on every amendment unit). `triage` is
+diff-mode-only (T3.1's scope) and stays unbuilt. The live (`unset`) SDK client is out
+of scope for this task too — `create_client` keeps T1.1's `NotImplementedError` for
+that branch.
 
 Design note on the client/wire boundary: the real `claude_agent_sdk.ClaudeSDKClient`
 takes the system prompt, tool registrations, and disallowed-tools policy as
@@ -45,6 +49,7 @@ from blare.model import (
     RunControlCall,
     RunControlVerdict,
     RunMode,
+    Violation,
 )
 from blare.stack import ObservabilityStack
 
@@ -666,10 +671,10 @@ def _parse_run_control_call(raw: object) -> RunControlCall:
 class AgentSession:
     """One Claude Agent SDK session (architecture: one per run).
 
-    T2.1 builds `start`, `run_phase`, `chat`, `close`, and `transcript_path` in full,
-    plus the two-tool dispatch over the injected `sink`/`control` handlers. `triage`,
-    `request_repair`, and `notify_amendment_outcome` are deliberately not built here
-    (T2.4/T3.1's scope, per architecture.md's Tasks section).
+    T2.1 built `start`, `run_phase`, `chat`, `close`, and `transcript_path` in full,
+    plus the two-tool dispatch over the injected `sink`/`control` handlers. T2.4 adds
+    `request_repair` and `notify_amendment_outcome`. `triage` is diff-mode-only
+    (T3.1's scope, per architecture.md's Tasks section) and stays unbuilt.
     """
 
     def __init__(
@@ -688,7 +693,16 @@ class AgentSession:
         self._closed = False
         self._current_phase: Phase | None = None
         self._current_driving_call = ""
+        self._current_repair_phases: tuple[Phase, ...] = ()
         self._tool_call_in_flight = False
+        # Message-wording state for `request_repair` (agent.md's discriminator): set
+        # when an `amend_proposal` is accepted, cleared when the following
+        # `amend_complete` is accepted -- "the session's own state, not the
+        # argument". `_awaiting_amend_complete` is per-`request_repair`-call: set
+        # before sending, cleared the moment an `amend_complete` is accepted during
+        # the drained turn.
+        self._unresolved_amend_proposal = False
+        self._awaiting_amend_complete = False
 
     def start(self, mode: RunMode, context: RunContext) -> None:
         """Handshake, then configure the client for this run.
@@ -754,6 +768,78 @@ class AgentSession:
         self._send({"type": "chat", "text": text})
         return self._drain_turn()
 
+    def request_repair(self, phases: list[Phase], violations: list[Violation]) -> None:
+        """The channel for every system-initiated repair (the approval-gate system
+        amendment, and R18's load-seeded violations) and for resuming an
+        agent-proposed amendment whose turn ended after `amend_proposal` but before
+        `amend_complete` (agent.md). Sends a message naming the phases and (when
+        non-empty) the violations, then waits for the model to call `run_control`
+        with `amend_complete` -- reminding once via a follow-up message when a
+        drained turn ends without it, and raising `AgentSessionError` after a
+        second eventless turn.
+        """
+        self._current_driving_call = "request_repair"
+        self._current_phase = None
+        self._current_repair_phases = tuple(phases)
+        message = self._request_repair_message(phases, violations)
+        self._awaiting_amend_complete = True
+        self._send(
+            {
+                "type": "request_repair",
+                "phases": [int(p) for p in phases],
+                "violations": [self._violation_payload(v) for v in violations],
+                "text": message,
+            }
+        )
+        self._drain_turn()
+        if not self._awaiting_amend_complete:
+            return
+        self._send(
+            {
+                "type": "request_repair_reminder",
+                "text": (
+                    "Please call run_control with amend_complete once the repair "
+                    "for the named phase(s) is done."
+                ),
+            }
+        )
+        self._drain_turn()
+        if not self._awaiting_amend_complete:
+            return
+        self._raise_error(
+            "repair turn ended without amend_complete after a reminder", False
+        )
+
+    def notify_amendment_outcome(
+        self, approved: bool, restored_phases: list[Phase]
+    ) -> None:
+        """Closes the loop on every amendment unit (R2): sends a message stating
+        approval, or rejection with the restored phases, and blocks until the
+        model's acknowledgment turn ends. Anything the model does in that turn
+        (a batch against a re-frozen phase, a fresh amend_proposal) flows through
+        the normal tool handlers.
+        """
+        self._current_driving_call = "notify_amendment_outcome"
+        self._current_phase = None
+        if approved:
+            message = "The amendment was approved; its changes are now part of the run."
+        else:
+            phases_text = ", ".join(f"phase {int(p)}" for p in restored_phases)
+            message = (
+                "The amendment was rejected; the following phase(s) were restored "
+                f"to their pre-amendment state: {phases_text}. Any edits you made "
+                "to them during the amendment no longer exist."
+            )
+        self._send(
+            {
+                "type": "amendment_outcome",
+                "approved": approved,
+                "restored_phases": [int(p) for p in restored_phases],
+                "text": message,
+            }
+        )
+        self._drain_turn()
+
     def close(self) -> None:
         """End the SDK session only (the orchestrator owns and closes the
         `TranscriptWriter` itself). Idempotent; safe after any `AgentSessionError`.
@@ -781,7 +867,41 @@ class AgentSession:
     def _context_label(self) -> str:
         if self._current_phase is not None:
             return f"phase {int(self._current_phase)}"
+        if self._current_driving_call == "request_repair":
+            phases_text = ", ".join(str(int(p)) for p in self._current_repair_phases)
+            return f"request_repair (phases {phases_text})"
         return self._current_driving_call
+
+    def _request_repair_message(self, phases: list[Phase], violations: list[Violation]) -> str:
+        """The message `request_repair` sends: violations wording whenever any are
+        named; otherwise the discriminator between the resume and cascade wording
+        is this session's own state (agent.md), not the call's arguments -- the
+        resume wording iff an `amend_proposal` still stands unresolved from a prior
+        drained turn."""
+        phases_text = ", ".join(f"phase {int(p)}" for p in phases)
+        if violations:
+            violations_text = "; ".join(
+                f"{v.kind.value} ({', '.join(v.entry_ids)})" for v in violations
+            )
+            return (
+                f"Repair needed in {phases_text}: {violations_text}. Propose edits "
+                "via propose_edits tagged for these phase(s), then call run_control "
+                "with amend_complete when the repair is done."
+            )
+        if self._unresolved_amend_proposal:
+            return (
+                "Your proposed amendment's standing phase(s) are now open: "
+                f"{phases_text}. Propose repairs via propose_edits, then call "
+                "run_control with amend_complete when done."
+            )
+        return (
+            f"The amendment now also covers {phases_text} (pulled in by reference "
+            "to your changes). Propose repairs via propose_edits, then call "
+            "run_control with amend_complete when done."
+        )
+
+    def _violation_payload(self, v: Violation) -> dict[str, object]:
+        return {"kind": v.kind.value, "entry_ids": list(v.entry_ids), "phase": int(v.phase)}
 
     def _raise_error(self, cause: str, tool_call_in_flight: bool) -> NoReturn:
         context = self._context_label()
@@ -891,4 +1011,15 @@ class AgentSession:
             verdict = self._control(call)
         except Exception as exc:  # noqa: BLE001 - a raising handler is a programmer error
             self._raise_error(f"run-control handler raised: {exc}", True)
+        if verdict.ok:
+            # Message-wording state for `request_repair` (see its docstring and
+            # `_request_repair_message`): an accepted amend_proposal leaves a
+            # standing, unresolved proposal; an accepted amend_complete resolves it
+            # and also satisfies whichever request_repair call is currently
+            # awaiting one.
+            if call.action is RunControlAction.AMEND_PROPOSAL:
+                self._unresolved_amend_proposal = True
+            elif call.action is RunControlAction.AMEND_COMPLETE:
+                self._unresolved_amend_proposal = False
+                self._awaiting_amend_complete = False
         return {"ok": verdict.ok, "message": verdict.message}

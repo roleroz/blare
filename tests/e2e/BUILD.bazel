@@ -343,3 +343,104 @@ py_test(
         "@rules_python//python/runfiles",
     ],
 )
+
+py_test(
+    name = "test_amendment_agent_approved",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_amendment_agent_approved.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_amendment_agent_approved.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/amendment-agent-approved:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_amendment_agent_rejected",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_amendment_agent_rejected.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_amendment_agent_rejected.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/amendment-agent-rejected:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_amendment_cascade",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_amendment_cascade.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_amendment_cascade.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/amendment-cascade-approved:scenario.jsonl",
+        "//tests/fixtures/claude-sdk/amendment-cascade-rejected:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_amendment_system",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_amendment_system.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_amendment_system.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/amendment-system:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)

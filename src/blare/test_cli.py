@@ -1,7 +1,8 @@
 """Unit tests for blare.cli: T1.1's parse_args/main wiring and error/summary/notice
-rendering, plus T2.3's checkpoint screen, the chat loop (`show_chat_reply`, kind-aware
+rendering, T2.3's checkpoint screen and the chat loop (`show_chat_reply`, kind-aware
 for every `PromptKind`), and the full `RunSummary` rendering (entry counts, gap
-counts). `present_amendment`/`present_no_impact` stay stubbed (T2.4/T3.1's views)."""
+counts); T2.4's `present_amendment` screen. `present_no_impact` stays stubbed
+(T3.1's view)."""
 
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ from blare.cli import ParsedCommand, TerminalPresenter, main, parse_args
 from blare.model import Phase, RunMode
 from blare.orchestrator import (
     Abort,
+    AmendmentOrigin,
+    AmendmentPhaseSection,
+    AmendmentView,
     Approve,
     Chat,
     CheckpointView,
@@ -403,6 +407,116 @@ def test_contract_rejectable_amendment_prompt_names_reject() -> None:
     presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
     presenter.show_chat_reply("x", PromptKind.AMENDMENT)
     assert "reject" not in stdout.getvalue()
+
+
+def _fixed_amendment_view() -> AmendmentView:
+    """One fixed `AmendmentView` for byte-exact rendering: a two-phase unit (system
+    map, alert recommendations), each with content, plus the gap summary."""
+    return AmendmentView(
+        origin=AmendmentOrigin.AGENT,
+        sections=(
+            AmendmentPhaseSection(
+                phase=Phase.SYSTEM_MAP,
+                updated=(
+                    EntryChange(
+                        entry_type="system_components",
+                        id="sm-web",
+                        fields=(("name", "web"), ("description", "revised")),
+                    ),
+                ),
+            ),
+            AmendmentPhaseSection(
+                phase=Phase.ALERT_RECOMMENDATIONS,
+                added=(
+                    EntryChange(
+                        entry_type="alert_recommendations",
+                        id="ar-503",
+                        fields=(("severity", "critical"),),
+                    ),
+                ),
+            ),
+        ),
+        gap_counts=GapSummary(alertable=1, metric_gap=0, excluded=0),
+    )
+
+
+_FIXED_AMENDMENT_LINES = (
+    "amendment · proposed by agent",
+    "",
+    "phase 1 — system map",
+    "updated:",
+    "  sm-web (system_components)",
+    "    name: web",
+    "    description: revised",
+    "",
+    "phase 4 — alert recommendations",
+    "added:",
+    "  ar-503 (alert_recommendations)",
+    "    severity: critical",
+    "",
+    "1 alertable · 0 metric-gap · 0 excluded",
+    "$ approve · reject · abort · anything else is chat",
+)
+
+
+def test_contract_amendment_screen_renders_byte_exact() -> None:
+    """Amendment screen: origin line, one section per involved phase, prompt --
+    asserted for a fixed two-phase unit (cli.md)."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+
+    reply = presenter.present_amendment(_fixed_amendment_view(), rejectable=True)
+
+    assert reply == Approve()
+    expected = "".join(line + "\n" for line in _FIXED_AMENDMENT_LINES)
+    assert stdout.getvalue() == expected
+
+
+def test_contract_amendment_replies_rejectable_true_reject_maps() -> None:
+    """`rejectable=True`: exact `reject` returns `Reject`, and the prompt names it."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO("reject\n"), stdout, io.StringIO())
+
+    reply = presenter.present_amendment(_fixed_amendment_view(), rejectable=True)
+
+    assert reply == Reject()
+    assert "reject" in stdout.getvalue()
+
+
+def test_contract_amendment_replies_rejectable_false_reject_is_chat() -> None:
+    """`rejectable=False`: the prompt offers no reject wording, and `reject` is
+    ordinary chat (the no-rejection rule for system-originated units)."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO("reject\n"), stdout, io.StringIO())
+
+    reply = presenter.present_amendment(_fixed_amendment_view(), rejectable=False)
+
+    assert reply == Chat("reject")
+    assert "reject ·" not in stdout.getvalue()
+
+
+def test_contract_amendment_replies_approve_and_abort_map_either_way() -> None:
+    """`approve`/`abort` map to Approve/Abort at both rejectable and non-rejectable
+    amendment prompts."""
+    for rejectable in (True, False):
+        presenter = TerminalPresenter(io.StringIO("approve\n"), io.StringIO(), io.StringIO())
+        assert presenter.present_amendment(_fixed_amendment_view(), rejectable) == Approve()
+
+        presenter = TerminalPresenter(io.StringIO("abort\n"), io.StringIO(), io.StringIO())
+        assert presenter.present_amendment(_fixed_amendment_view(), rejectable) == Abort()
+
+
+def test_failure_present_amendment_stdout_broken_pipe_is_abort() -> None:
+    """A BrokenPipeError rendering the amendment view returns Abort rather than
+    raising (the same reply-pending stream-failure rule as present_checkpoint)."""
+    presenter = TerminalPresenter(io.StringIO("approve\n"), _BrokenPipeStream(), io.StringIO())
+    assert presenter.present_amendment(_fixed_amendment_view(), rejectable=True) == Abort()
+
+
+def test_failure_present_amendment_stdin_eof_is_abort() -> None:
+    """stdin EOF at the amendment prompt returns Abort, no exception."""
+    presenter = TerminalPresenter(_RaisingStream(EOFError()), io.StringIO(), io.StringIO())
+    assert presenter.present_amendment(_fixed_amendment_view(), rejectable=True) == Abort()
 
 
 def test_failure_show_chat_reply_broken_pipe_prompting_is_abort() -> None:

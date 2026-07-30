@@ -1,12 +1,13 @@
 """Entry point and terminal surface (architecture): no run logic of its own.
 
 T1.1 built `parse_args`, `main`, and `error`/`summary`/`notice`/`is_interactive`.
-T2.3 builds the rest of `cli.md`'s presenter contract: `present_checkpoint`, the
+T2.3 built the rest of `cli.md`'s presenter contract: `present_checkpoint`, the
 chat loop's `show_chat_reply` (kind-aware for every `PromptKind`, including the
-amendment kinds -- it only needs the kind, never the not-yet-built `AmendmentView`
-itself), and `summary`'s full R13 content (entry counts, gap counts). `present_amendment`
-and `present_no_impact` stay stubbed (`NotImplementedError`): those views land with
-T2.4 and T3.1 respectively.
+amendment kinds -- it only needed the kind, never the amendment view itself), and
+`summary`'s full R13 content (entry counts, gap counts). T2.4 builds
+`present_amendment`: the amendment screen (origin line, one section per involved
+phase, the reply alphabet including `reject` when rejectable). `present_no_impact`
+stays stubbed (`NotImplementedError`): that view lands with T3.1.
 """
 
 from __future__ import annotations
@@ -54,6 +55,12 @@ _PHASE_TITLES: dict[Phase, str] = {
 # (D9's third reserved word, only ever offered there).
 _CHECKPOINT_PROMPT = f"{_PROMPT_MARKER}approve · abort · anything else is chat"
 _REJECTABLE_AMENDMENT_PROMPT = f"{_PROMPT_MARKER}approve · reject · abort · anything else is chat"
+
+# cli.md: "amendment · proposed by agent" / "amendment · invariant repair".
+_AMENDMENT_ORIGIN_LINES: dict[orchestrator.AmendmentOrigin, str] = {
+    orchestrator.AmendmentOrigin.AGENT: "amendment · proposed by agent",
+    orchestrator.AmendmentOrigin.SYSTEM: "amendment · invariant repair",
+}
 
 # Which prompt text and whether `reject` is reserved, per `show_chat_reply`'s
 # `PromptKind` (cli.md: reject is a reserved word only at the rejectable-amendment
@@ -149,7 +156,13 @@ class TerminalPresenter:
         return reply
 
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply:
-        raise NotImplementedError("amendment rendering lands in T2.4")
+        if not self._write_lines(self._stdout, self._amendment_lines(view)):
+            return orchestrator.Abort()
+        prompt_text = _REJECTABLE_AMENDMENT_PROMPT if rejectable else _CHECKPOINT_PROMPT
+        reply = self._prompt_and_read(prompt_text, rejectable)
+        if reply is None:
+            return orchestrator.Abort()
+        return reply
 
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
         raise NotImplementedError("no-impact rendering lands in T3.1")
@@ -222,6 +235,26 @@ class TerminalPresenter:
                 lines.append(f"  {change.id} ({change.entry_type})")
                 for name, value in change.fields:
                     lines.append(f"    {self._render_field(name, value)}")
+            lines.append("")
+        lines.append(self._gap_line(view.gap_counts))
+        return lines
+
+    def _amendment_lines(self, view: AmendmentView) -> list[str]:
+        lines = [_AMENDMENT_ORIGIN_LINES[view.origin], ""]
+        for section in view.sections:
+            lines.append(f"phase {int(section.phase)} — {_PHASE_TITLES[section.phase]}")
+            for label, changes in (
+                ("added", section.added),
+                ("updated", section.updated),
+                ("removed", section.removed),
+            ):
+                if not changes:
+                    continue
+                lines.append(f"{label}:")
+                for change in changes:
+                    lines.append(f"  {change.id} ({change.entry_type})")
+                    for name, value in change.fields:
+                        lines.append(f"    {self._render_field(name, value)}")
             lines.append("")
         lines.append(self._gap_line(view.gap_counts))
         return lines

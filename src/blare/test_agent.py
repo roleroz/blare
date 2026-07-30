@@ -1,8 +1,8 @@
-"""Unit tests for blare.agent (T2.1 scope): session lifecycle, the two-tool dispatch
+"""Unit tests for blare.agent: T2.1 scope (session lifecycle, the two-tool dispatch
 over injected handlers, prompt templates, `create_client`'s replay/record branches,
-transcripts, and the error taxonomy. `triage`, `request_repair`, and
-`notify_amendment_outcome` are out of this task's scope (T2.4/T3.1) and are not tested
-here.
+transcripts, and the error taxonomy) plus T2.4's `request_repair` and
+`notify_amendment_outcome`. `triage` is diff-mode-only (T3.1's scope) and is not
+tested here.
 
 Contract tests cover what this module promises while its dependencies behave;
 failure-mode tests cover one per dependency failure mode (agent.md's Test plan):
@@ -45,6 +45,8 @@ from blare.model import (
     RunControlCall,
     RunControlVerdict,
     RunMode,
+    Violation,
+    ViolationKind,
 )
 from blare.stack import PrometheusStack
 
@@ -506,6 +508,275 @@ def test_contract_run_control_reaches_handler_verbatim_for_each_action(
     assert control.calls == [RunControlCall(action=action, payload=payload)]
     tool_result = next(e for e in fake.sent_events if e.get("type") == "tool_result")
     assert tool_result["result"] == {"ok": True, "message": "noted"}
+
+
+# ==== amendments: request_repair / notify_amendment_outcome (T2.4) ================
+
+
+def test_contract_request_repair_sends_phases_and_violations_and_returns_on_amend_complete(
+    tmp_path: Path,
+) -> None:
+    """request_repair sends the named phases and violations, and returns once the
+    model calls run_control with amend_complete (agent.md: "each call waits for its
+    own amend_complete")."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "amend_complete", "payload": {}},
+                },
+            ]
+        ]
+    )
+    control = RecordingControl(verdict=RunControlVerdict(ok=True, message="noted"))
+    session, _, control, _ = _session(fake, tmp_path, control=control)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.request_repair(
+        [Phase.ALERT_RECOMMENDATIONS],
+        [Violation(ViolationKind.UNMAPPED_FAILURE_MODE, ("fm-1",))],
+    )
+    session.close()
+
+    sent = fake.sent_events[0]
+    assert sent["type"] == "request_repair"
+    assert sent["phases"] == [4]
+    assert sent["violations"] == [
+        {"kind": "unmapped_failure_mode", "entry_ids": ["fm-1"], "phase": 4}
+    ]
+    assert control.calls == [RunControlCall(action=RunControlAction.AMEND_COMPLETE, payload={})]
+
+
+def test_contract_request_repair_wording_violations_present(tmp_path: Path) -> None:
+    """A request_repair call with non-empty violations always carries the violation
+    wording, regardless of any standing proposal."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "amend_complete", "payload": {}},
+                }
+            ]
+        ]
+    )
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.request_repair(
+        [Phase.METRIC_COVERAGE], [Violation(ViolationKind.INVALID_EXPRESSION, ("ar-1",))]
+    )
+    session.close()
+
+    text = fake.sent_events[0]["text"]
+    assert isinstance(text, str)
+    assert "invalid_expression" in text
+    assert "ar-1" in text
+
+
+def test_contract_request_repair_wording_follows_standing_proposal_discriminator(
+    tmp_path: Path,
+) -> None:
+    """With an unresolved amend_proposal held (from a prior drained turn), an
+    empty-violations request_repair call states the standing proposal's phases are
+    open; with none held, the same arguments produce the cascade wording (agent.md's
+    message discriminator)."""
+    # First: a turn that proposes an amendment and ends without amend_complete --
+    # the proposal stands (legal), leaving an unresolved proposal held.
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {
+                        "action": "amend_proposal",
+                        "payload": {"phases": [1]},
+                    },
+                }
+            ]
+        ]
+    )
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+    session.run_phase(Phase.FAILURE_MODES)  # turn ends without amend_complete
+
+    fake.queue_turn(
+        [
+            {
+                "type": "tool_use",
+                "id": "t2",
+                "name": "run_control",
+                "input": {"action": "amend_complete", "payload": {}},
+            }
+        ]
+    )
+    session.request_repair([Phase.SYSTEM_MAP], [])
+    resume_text = fake.sent_events[-2]["text"]
+    assert isinstance(resume_text, str)
+    assert "standing" in resume_text.lower() or "your proposed amendment" in resume_text.lower()
+    session.close()
+
+    # Second, fresh session: no amend_proposal ever made -- the same empty-violations
+    # call must get the cascade wording instead.
+    fake2 = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "amend_complete", "payload": {}},
+                }
+            ]
+        ]
+    )
+    session2, _, _, _ = _session(fake2, tmp_path)
+    session2.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+    session2.request_repair([Phase.SYSTEM_MAP], [])
+    cascade_text = fake2.sent_events[-2]["text"]
+    session2.close()
+
+    assert isinstance(cascade_text, str)
+    assert cascade_text != resume_text
+    assert "reference" in cascade_text.lower() or "cascade" in cascade_text.lower() or (
+        "covers" in cascade_text.lower()
+    )
+
+
+def test_contract_turn_ending_with_unresolved_amend_proposal_returns_normally(
+    tmp_path: Path,
+) -> None:
+    """A turn ending with an unresolved amend_proposal (no amend_complete) is legal:
+    the driving call (run_phase) returns normally rather than raising."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "amend_proposal", "payload": {"phases": [1]}},
+                }
+            ]
+        ]
+    )
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.run_phase(Phase.FAILURE_MODES)  # must not raise
+    session.close()
+
+
+def test_failure_request_repair_reminds_once_then_raises_without_amend_complete(
+    tmp_path: Path,
+) -> None:
+    """request_repair reminds the model once via a follow-up message, then raises
+    AgentSessionError if a second turn also ends without amend_complete."""
+    fake = FakeSDKClient(turns=[[{"type": "text", "text": "still thinking"}]])
+    fake.queue_turn([{"type": "text", "text": "still thinking again"}])
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    with pytest.raises(AgentSessionError) as exc_info:
+        session.request_repair([Phase.ALERT_RECOMMENDATIONS], [])
+
+    assert "amend_complete" in exc_info.value.cause
+    assert "phase" in exc_info.value.cause.lower()
+    # Exactly one reminder was sent: the initial request_repair message plus one
+    # follow-up -- two outbound sends total.
+    outbound_texts = [e for e in fake.sent_events if "text" in e]
+    assert len(outbound_texts) == 2
+
+
+def test_contract_notify_amendment_outcome_approved_message(tmp_path: Path) -> None:
+    """notify_amendment_outcome(approved=True) sends an approval message and blocks
+    until the model's acknowledgment turn ends."""
+    fake = FakeSDKClient(turns=[[{"type": "text", "text": "understood"}]])
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.notify_amendment_outcome(approved=True, restored_phases=[])
+    session.close()
+
+    sent = fake.sent_events[0]
+    assert sent["type"] == "amendment_outcome"
+    assert sent["approved"] is True
+    assert sent["restored_phases"] == []
+
+
+def test_contract_notify_amendment_outcome_rejected_names_restored_phases(
+    tmp_path: Path,
+) -> None:
+    """notify_amendment_outcome(approved=False) names every restored phase in the
+    message -- this, together with the approved variant, is what distinguishes the
+    two fixture variants at the SDK boundary (agent.md)."""
+    fake = FakeSDKClient(turns=[[{"type": "text", "text": "understood"}]])
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.notify_amendment_outcome(
+        approved=False, restored_phases=[Phase.SYSTEM_MAP, Phase.FAILURE_MODES]
+    )
+    session.close()
+
+    sent = fake.sent_events[0]
+    assert sent["approved"] is False
+    assert sent["restored_phases"] == [1, 2]
+    text = sent["text"]
+    assert isinstance(text, str)
+    assert "1" in text and "2" in text
+
+
+def test_contract_notify_amendment_outcome_tool_calls_flow_through_normal_handlers(
+    tmp_path: Path,
+) -> None:
+    """Anything the model does during its acknowledgment turn flows through the
+    normal tool handlers (agent.md): a fresh amend_proposal in that turn is legal
+    and reaches the control handler like any other."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "amend_proposal", "payload": {"phases": [3]}},
+                }
+            ]
+        ]
+    )
+    control = RecordingControl()
+    session, _, control, _ = _session(fake, tmp_path, control=control)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.notify_amendment_outcome(approved=False, restored_phases=[Phase.METRIC_COVERAGE])
+    session.close()
+
+    assert control.calls == [
+        RunControlCall(action=RunControlAction.AMEND_PROPOSAL, payload={"phases": [3]})
+    ]
+
+
+def test_contract_request_repair_context_label_names_the_phases(tmp_path: Path) -> None:
+    """An error during a request_repair call reports the phase list in its cause
+    (agent.md: the context label is "request_repair with its phase list")."""
+    fake = FakeSDKClient(turns=[[{"type": "text", "text": "..."}]])
+    fake.queue_turn([{"type": "text", "text": "..."}])
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    with pytest.raises(AgentSessionError) as exc_info:
+        session.request_repair([Phase.ALERT_RECOMMENDATIONS, Phase.METRIC_COVERAGE], [])
+
+    assert "3" in exc_info.value.cause
+    assert "4" in exc_info.value.cause
 
 
 # ==== chat ===========================================================================

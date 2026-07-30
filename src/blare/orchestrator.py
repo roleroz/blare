@@ -5,21 +5,28 @@ sequence, the lock, the run log, and the exit-code taxonomy. Steps 5-6 (update-o
 SHA ancestry, the R7 empty-delta short-circuit) are wired for real here but their e2e
 coverage is T3.x's.
 
-T2.3 scope (this task): the analyze-mode phase engine -- four phases in order, each
-opening a phase, running it via `AgentSession.run_phase`, presenting a
-`CheckpointView` and looping chat to a terminal reply -- the final approval gate
+T2.3 scope: the analyze-mode phase engine -- four phases in order, each opening a
+phase, running it via `AgentSession.run_phase`, presenting a `CheckpointView` and
+looping chat to a terminal reply -- the final approval gate
 (`artifacts.semantic_violations`), and the write path (the R20 re-check, then the
 three write primitives in order, state last). Diff mode's post-preflight flow
 (triage, the phase engine over the R18-seeded queue) is unchanged from T2.2's
-placeholder tail -- that is T3.x's build. The amendment mechanism (unit tracking,
-cascade, system-originated amendments' repair loop) is T2.4's build: a semantic
-violation at the final gate here raises `SemanticGateFailureError` rather than
-opening a repair unit, per this task's explicit scope boundary.
+placeholder tail -- that is T3.x's build.
+
+T2.4 scope (this task): the amendment mechanism -- unit mechanics (agent-origin via
+`amend_proposal`/`amend_complete`, system-origin from a failed approval gate), the
+frozen-only cascade (`artifacts.referencing_phases` union `semantic_violations`'s
+repair phases, restricted to frozen phases), the closure loop (`_advance_unit`,
+looping `AgentSession.request_repair` calls until a recompute adds nothing), one
+re-presentation per closure (`_present_amendment_once`), and outcome notification
+(`AgentSession.notify_amendment_outcome`). The final approval gate now opens a
+system-originated unit on a semantic violation instead of raising -- T2.3's
+`SemanticGateFailureError` placeholder is gone.
 
 The `Presenter` protocol below mirrors `cli.md`'s `TerminalPresenter` interface in
-full so `cli.TerminalPresenter` type-checks against it. `present_amendment` and
-`present_no_impact` have no caller yet (T2.4/T3.1's views); every other method,
-`CheckpointView` included, is exercised by the analyze phase engine.
+full so `cli.TerminalPresenter` type-checks against it. `present_no_impact` has no
+caller yet (T3.1's view); every other method, `CheckpointView` and `AmendmentView`
+included, is exercised by the analyze phase engine.
 """
 
 from __future__ import annotations
@@ -43,16 +50,20 @@ from blare.model import (
     BatchVerdict,
     BlareError,
     EditBatch,
+    EditOp,
     Phase,
     RunContext,
     RunControlAction,
     RunControlCall,
     RunControlVerdict,
     RunMode,
+    Violation,
 )
 
 __all__ = [
     "Abort",
+    "AmendmentOrigin",
+    "AmendmentPhaseSection",
     "AmendmentReply",
     "AmendmentView",
     "Approve",
@@ -71,7 +82,6 @@ __all__ = [
     "Reject",
     "RunFn",
     "RunSummary",
-    "SemanticGateFailureError",
     "StateDirectoryError",
     "WriteTimeRecheckError",
     "run",
@@ -143,9 +153,36 @@ class CheckpointView:
     removed: tuple[EntryChange, ...] = ()
 
 
+class AmendmentOrigin(Enum):
+    """Which of the amendment mechanism's two origins produced a unit (architecture:
+    "one mechanism, two origins")."""
+
+    AGENT = "agent"
+    SYSTEM = "system"
+
+
+@dataclass(frozen=True)
+class AmendmentPhaseSection:
+    """One involved phase's changed entries within an amendment unit (T2.4) -- the
+    same `EntryChange` shape `CheckpointView` uses, diffed against the unit's own
+    pre-amendment baseline rather than a phase's checkpoint-opening baseline."""
+
+    phase: Phase
+    added: tuple[EntryChange, ...] = ()
+    updated: tuple[EntryChange, ...] = ()
+    removed: tuple[EntryChange, ...] = ()
+
+
 @dataclass(frozen=True)
 class AmendmentView:
-    """An amendment unit's changed entries, grouped by phase. Fields land with T2.4."""
+    """An amendment unit's changed entries, grouped by phase (T2.4; architecture:
+    "the unit's changed entries grouped per involved phase, plus origin"). Always
+    reflects the *current* changed set: re-presented once per closure, so a
+    re-presentation following further chat-driven repairs carries a fresh view."""
+
+    origin: AmendmentOrigin
+    sections: tuple[AmendmentPhaseSection, ...]
+    gap_counts: artifacts.GapSummary
 
 
 @dataclass(frozen=True)
@@ -206,6 +243,13 @@ class Presenter(Protocol):
 
 RunFn = Callable[[RunMode, Path, Presenter], int]
 
+# A run-log sink bound to this run's `_RunState`/`presenter` (orchestrator.md,
+# Failure visibility: the run log records "amendment units, gate results"
+# alongside preflight/phase events) -- threaded into the amendment machinery
+# below so a unit opening, a cascade join, a unit's closure, and a gate check
+# are all as visible in the run log as an ordinary phase transition.
+_Log = Callable[[dict[str, object]], None]
+
 
 # --- Preflight-owned errors (orchestrator.md: steps 2, 3, 5, 8) ---------------------
 
@@ -241,16 +285,6 @@ class NonInteractiveError(BlareError):
 
 
 # --- Post-preflight errors (orchestrator.md: Approval gate, Write path) -------------
-
-
-class SemanticGateFailureError(BlareError):
-    """The final approval gate (orchestrator.md, Approval gate) found semantic-
-    invariant violations in the candidate set. Per architecture.md's Amendment
-    mechanism this should raise a system-originated amendment for the user to steer
-    (via chat) or abort -- building that repair loop is T2.4's task, out of this
-    task's scope. Rather than silently writing an invalid set or inventing amendment
-    machinery, this reports the violations found and fails the run (R20: nothing is
-    written before final confirmation, and this is never reached)."""
 
 
 class WriteTimeRecheckError(BlareError):
@@ -481,14 +515,16 @@ def _dispatch_artifacts(blare_root: Path, mode: RunMode) -> artifacts.ArtifactSe
     return artifacts.load(blare_root, mode)
 
 
-# --- Phase engine (T2.3): the pending edit set, the sink/control handlers, and
+# --- Phase engine: the pending edit set, the sink/control handlers, and
 # checkpoint-view rendering support ---------------------------------------------------
 
 
 class _PhaseStatus(Enum):
-    """A phase's state (architecture: "Phase states"). T2.3's analyze engine only
-    ever drives phases forward in order (unvisited -> open -> frozen); the amendment
-    mechanism that can re-open a frozen phase is T2.4's build."""
+    """A phase's state (architecture: "Phase states"): `unvisited -> open -> frozen`
+    in the ordinary run, or re-opened from either `frozen` or `unvisited` by the
+    amendment mechanism (T2.4), which is the only path that can move a phase
+    backwards (frozen -> open) or open one out of order (unvisited -> open ahead of
+    the run's position)."""
 
     UNVISITED = "unvisited"
     OPEN = "open"
@@ -505,12 +541,117 @@ class _CandidateHolder:
     current: artifacts.ArtifactSet
 
 
+@dataclass
+class _AmendmentUnit:
+    """One open amendment unit (T2.4; orchestrator.md, Amendments): tracks origin,
+    every phase it has opened (mapped to that phase's status *before* the unit
+    opened it -- frozen or unvisited, the restore/re-freeze target), the ids
+    changed by repairs landing in the unit's own phases (the reference half of the
+    blast-radius recompute), and the phases already told about via
+    `AgentSession.request_repair` (`announced`) so a later call only ever reports
+    the delta.
+
+    `baseline` is the *whole* candidate captured once, at unit inception, before
+    any phase was opened -- sufficient as the byte-for-byte restore/checkpoint
+    baseline for *every* phase the unit ever comes to include: a phase can only
+    join the unit from frozen or unvisited, both of which are untouchable by the
+    sink until they join, so none of them could have changed before `baseline` was
+    captured (see the design note this task's report carries in full).
+
+    `dirty` is set whenever something happens that a recompute might care about
+    (a batch lands in one of the unit's phases, or a phase joins) and consumed by
+    `_advance_unit`'s recompute step -- this is deliberately independent of
+    `amend_complete_received`: the latter only ever matters once, to detect
+    whether the *very first* driving turn already completed the repair itself
+    (agent.md's same-turn case) before this unit has ever been announced via
+    `request_repair`; every later recompute (including ones `_present_amendment_once`
+    triggers from re-presentation chat, which carries no `amend_complete` contract
+    at all) is driven by `dirty`, not by the completion signal.
+    """
+
+    origin: AmendmentOrigin
+    baseline: artifacts.ArtifactSet
+    opened_from: dict[Phase, _PhaseStatus] = dataclasses.field(default_factory=dict)
+    changed_ids: set[str] = dataclasses.field(default_factory=set)
+    announced: set[Phase] = dataclasses.field(default_factory=set)
+    amend_complete_received: bool = False
+    dirty: bool = False
+    # The violations that justified opening each not-yet-announced phase (empty
+    # for a phase opened by agent_proposal, or by cascade through pure reference
+    # invalidation) -- looked up, never recomputed, when a phase is finally
+    # announced, so a cascade round's violations survive regardless of unit
+    # origin (architecture.md: "violations carried when the join came from the
+    # invariant half, empty for pure reference invalidation" -- a rule about
+    # *how the phase joined*, not about who owns the unit).
+    pending_violations: dict[Phase, tuple[Violation, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+@dataclass
+class _UnitHolder:
+    """The run's at-most-one open amendment unit, mutated by replacement (mirrors
+    `_CandidateHolder`) -- shared by the sink, the control handler, and the phase
+    engine's own unit-resolution code."""
+
+    current: _AmendmentUnit | None = None
+
+
+def _mark_phase_open(
+    phase: Phase,
+    phase_status: dict[Phase, _PhaseStatus],
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+) -> None:
+    """Transition `phase` out of `unvisited`/`frozen` into `open`, capturing its
+    checkpoint-diff baseline the *first* time it ever leaves `unvisited` -- whether
+    that happens via the ordinary phase loop or the amendment mechanism naming it
+    ahead of the run's position. Re-opening an already-visited (frozen) phase never
+    touches `phase_baselines`: that phase's one ordinary `CheckpointView` already
+    fired and will not fire again: the amendment's own `AmendmentView` is what shows
+    its changes from here on."""
+    if phase not in phase_baselines:
+        phase_baselines[phase] = holder.current
+    phase_status[phase] = _PhaseStatus.OPEN
+
+
+def _batch_touched_ids(batch: EditBatch) -> set[str]:
+    """The id(s) one accepted `EditBatch` added, updated, or removed -- the
+    reference half of an amendment's blast-radius recompute needs exactly these,
+    not a before/after diff (`_phase_diff` computes content for display; this is
+    cheaper and is all `referencing_phases` needs)."""
+    ids: set[str] = set()
+    for edit in batch.edits:
+        if edit.entry_type == "coverage":
+            payload = edit.payload_or_id
+            if isinstance(payload, dict):
+                fm_id = payload.get("failure_mode_id")
+                if isinstance(fm_id, str):
+                    ids.add(fm_id)
+            continue
+        if edit.op is EditOp.REMOVE:
+            target = edit.payload_or_id
+            if isinstance(target, str):
+                ids.add(target)
+        else:
+            payload = edit.payload_or_id
+            if isinstance(payload, dict):
+                id_ = payload.get("id")
+                if isinstance(id_, str):
+                    ids.add(id_)
+    return ids
+
+
 def _make_sink(
-    holder: _CandidateHolder, phase_status: dict[Phase, _PhaseStatus]
+    holder: _CandidateHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
 ) -> agent.EditSink:
     """The edit sink (architecture: Edit-proposal protocol): enforces the phase-state
     rule (this module's own), then artifacts' per-batch content check; an accepted
-    batch's candidate replaces the holder's current set."""
+    batch's candidate replaces the holder's current set. When an amendment unit is
+    open and the batch targets one of *its* phases, the touched ids join the unit's
+    `changed_ids` -- the reference half of the next recompute (T2.4)."""
 
     def sink(batch: EditBatch) -> BatchVerdict:
         status = phase_status.get(batch.phase, _PhaseStatus.UNVISITED)
@@ -526,19 +667,104 @@ def _make_sink(
         if not verdict.ok:
             return verdict
         holder.current = artifacts.apply(holder.current, batch)
+        unit = unit_holder.current
+        if unit is not None and batch.phase in unit.opened_from:
+            unit.changed_ids.update(_batch_touched_ids(batch))
+            unit.dirty = True
         return verdict
 
     return sink
 
 
-def _make_control_handler(mode: RunMode) -> agent.RunControlHandler:
-    """The run-control handler (architecture: Run-control channel). T2.3's analyze
-    engine has no triage/no-impact verdicts to accept (diff-mode-only, R18) and no
-    amendment mechanism yet (T2.4) -- every call is rejected with a verdict naming
-    why, per the architecture's "Run-control handling is total" rule: never a raise,
-    always a verdict the model can act on."""
+def _handle_amend_proposal(
+    payload: Mapping[str, object],
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    log: _Log,
+) -> RunControlVerdict:
+    """`amend_proposal`: opens every named phase not already open, starting a unit
+    if none is open yet or joining the open one (architecture: "join-over-reject
+    precedence" -- an already-open named phase is simply a no-op within it).
+    Rejected as a verdict when *every* named phase is already open (orchestrator.md:
+    "those phases are open -- just edit them")."""
+    phases_raw = payload.get("phases")
+    if not isinstance(phases_raw, list) or not phases_raw:
+        return RunControlVerdict(
+            ok=False, message="amend_proposal requires a non-empty 'phases' list"
+        )
+    try:
+        phases = [Phase(int(p)) for p in phases_raw]
+    except (ValueError, TypeError):
+        return RunControlVerdict(
+            ok=False, message=f"amend_proposal names invalid phase(s): {phases_raw!r}"
+        )
+    non_open = [
+        p for p in phases if phase_status.get(p, _PhaseStatus.UNVISITED) is not _PhaseStatus.OPEN
+    ]
+    if not non_open:
+        return RunControlVerdict(
+            ok=False,
+            message=(
+                "named phase(s) are already open -- edit them directly instead of "
+                "proposing an amendment"
+            ),
+        )
+    unit = unit_holder.current
+    starting_unit = unit is None
+    if unit is None:
+        unit = _AmendmentUnit(origin=AmendmentOrigin.AGENT, baseline=holder.current)
+        unit_holder.current = unit
+    joined: list[Phase] = []
+    for p in phases:
+        if phase_status.get(p, _PhaseStatus.UNVISITED) is not _PhaseStatus.OPEN:
+            unit.opened_from[p] = phase_status.get(p, _PhaseStatus.UNVISITED)
+            _mark_phase_open(p, phase_status, phase_baselines, holder)
+            joined.append(p)
+    log(
+        {
+            "event": "amendment_unit_opened" if starting_unit else "amendment_phase_joined",
+            "origin": unit.origin.value,
+            "phases": [int(p) for p in joined],
+        }
+    )
+    return RunControlVerdict(ok=True, message="phase(s) opened for the amendment")
+
+
+def _handle_amend_complete(unit_holder: _UnitHolder) -> RunControlVerdict:
+    """`amend_complete`: rejected as a verdict when no unit is open; otherwise marks
+    the unit's current repair round complete, unblocking whichever
+    `AgentSession.request_repair` call is awaiting it and letting the phase
+    engine's closure loop (`_advance_unit`) run the next recompute."""
+    unit = unit_holder.current
+    if unit is None:
+        return RunControlVerdict(ok=False, message="amend_complete with no amendment unit open")
+    unit.amend_complete_received = True
+    return RunControlVerdict(ok=True, message="amend_complete acknowledged")
+
+
+def _make_control_handler(
+    mode: RunMode,
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    log: _Log,
+) -> agent.RunControlHandler:
+    """The run-control handler (architecture: Run-control channel). `amend_proposal`
+    and `amend_complete` are real (T2.4); `affected_verdict`/`no_impact` stay
+    rejected in analyze mode (diff-mode-only, R18) per the architecture's
+    "Run-control handling is total" rule: never a raise, always a verdict the model
+    can act on."""
 
     def control(call: RunControlCall) -> RunControlVerdict:
+        if call.action is RunControlAction.AMEND_PROPOSAL:
+            return _handle_amend_proposal(
+                call.payload, phase_status, unit_holder, phase_baselines, holder, log
+            )
+        if call.action is RunControlAction.AMEND_COMPLETE:
+            return _handle_amend_complete(unit_holder)
         if mode is RunMode.ANALYZE and call.action in (
             RunControlAction.AFFECTED_VERDICT,
             RunControlAction.NO_IMPACT,
@@ -553,13 +779,334 @@ def _make_control_handler(mode: RunMode) -> agent.RunControlHandler:
         return RunControlVerdict(
             ok=False,
             message=(
-                f"{call.action.value} is not supported in this build (the amendment "
-                "mechanism lands in a later task) -- continue proposing edits, or "
-                "state your conclusion in free text at the checkpoint"
+                f"{call.action.value} is not supported in this build -- continue "
+                "proposing edits, or state your conclusion in free text at the checkpoint"
             ),
         )
 
     return control
+
+
+def _advance_unit(
+    unit_holder: _UnitHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    session: agent.AgentSession,
+    log: _Log,
+) -> None:
+    """Drive the open unit to a state ready for presentation (orchestrator.md,
+    Amendments). Two independent conditions can each require another round:
+
+    - `pending` -- phases opened but never yet reported to the model via
+      `request_repair`. Non-empty exactly after a phase joins (initial open or
+      cascade), each carrying whatever violations justified its inclusion (see
+      `pending_violations` on `_AmendmentUnit`; empty for an agent proposal or a
+      pure-reference cascade join). The one exception is the unit's very first
+      round when the proposing turn already called `amend_complete` itself
+      before this ever ran (a legal same-turn propose-repair-complete sequence,
+      agent.md): the model already knows, having proposed it, so no
+      announcement is sent, only recorded as such. Announcing calls
+      `request_repair`, which itself guarantees `amend_complete` arrives before
+      returning (or raises) -- nothing here needs its own reminder/retry logic.
+    - `dirty` -- something changed since the last recompute (a batch landed in
+      one of the unit's phases, tracked independently of `amend_complete`
+      because re-presentation chat, which can also land batches, carries no
+      such completion contract at all). Consumed by the recompute: the union of
+      `artifacts.referencing_phases` over the unit's changed ids and the repair
+      phases of `artifacts.semantic_violations`, restricted to *frozen* phases,
+      opens any newly implicated phase (storing the violations that justified
+      it, if any) -- which then becomes `pending` again, looping back to
+      announce it.
+
+    Returns once neither condition holds -- the unit is ready for presentation.
+    A no-op if already ready (safe to call unconditionally after any driving
+    call or chat exchange, including a re-presentation chat that changed
+    nothing)."""
+    unit = unit_holder.current
+    assert unit is not None
+    while True:
+        pending = tuple(sorted(set(unit.opened_from) - unit.announced, key=int))
+        if pending:
+            same_turn_complete = not unit.announced and unit.amend_complete_received
+            unit.announced.update(pending)
+            if not same_turn_complete:
+                violations = [v for p in pending for v in unit.pending_violations.get(p, ())]
+                session.request_repair(list(pending), violations)
+            continue
+        if not unit.dirty:
+            return
+        unit.dirty = False
+        violations = artifacts.semantic_violations(holder.current)
+        ref_phases = artifacts.referencing_phases(holder.current, unit.changed_ids)
+        violation_phases = {v.phase for v in violations}
+        candidate_new = (ref_phases | violation_phases) - set(unit.opened_from)
+        new_phases = sorted(
+            (p for p in candidate_new if phase_status[p] is _PhaseStatus.FROZEN), key=int
+        )
+        if not new_phases:
+            return
+        for p in new_phases:
+            unit.opened_from[p] = phase_status[p]
+            unit.pending_violations[p] = tuple(v for v in violations if v.phase is p)
+            _mark_phase_open(p, phase_status, phase_baselines, holder)
+        log(
+            {
+                "event": "amendment_cascade_joined",
+                "phases": [int(p) for p in new_phases],
+                "violation_count": sum(len(unit.pending_violations[p]) for p in new_phases),
+            }
+        )
+        # loop: the phases just opened are now `pending` and get announced at
+        # the top, carrying the violations just stored for them.
+
+
+def _build_amendment_view(unit: _AmendmentUnit, current: artifacts.ArtifactSet) -> AmendmentView:
+    """The unit's current changed set, grouped per involved phase (T2.4), diffed
+    against the unit's own pre-amendment baseline via the same `_phase_diff` a
+    `CheckpointView` uses."""
+    sections = tuple(
+        AmendmentPhaseSection(
+            phase=phase,
+            added=added,
+            updated=updated,
+            removed=removed,
+        )
+        for phase in sorted(unit.opened_from, key=int)
+        for added, updated, removed in (_phase_diff(phase, unit.baseline, current),)
+    )
+    return AmendmentView(
+        origin=unit.origin, sections=sections, gap_counts=artifacts.gap_counts(current)
+    )
+
+
+def _restore_from_baseline(
+    current: artifacts.ArtifactSet,
+    baseline: artifacts.ArtifactSet,
+    opened_from: Mapping[Phase, _PhaseStatus],
+) -> artifacts.ArtifactSet:
+    """Byte-for-byte restore of every phase in `opened_from`'s owned entries back to
+    `baseline`, leaving every other phase's entries untouched (a rejected unit's
+    restore, T2.4). Coverage -- mechanical, spanning phases 3-4 by side -- is
+    reconciled afterward: its keys follow the (possibly-restored) failure-mode set,
+    and each side reverts to `baseline` only when its owning phase is in
+    `opened_from`, the other side kept at its current value."""
+    system_components = (
+        dict(baseline.system_components)
+        if Phase.SYSTEM_MAP in opened_from
+        else current.system_components
+    )
+    failure_modes = (
+        dict(baseline.failure_modes)
+        if Phase.FAILURE_MODES in opened_from
+        else current.failure_modes
+    )
+    restore_metric_side = Phase.METRIC_COVERAGE in opened_from
+    restore_alert_side = Phase.ALERT_RECOMMENDATIONS in opened_from
+    metrics = dict(baseline.metrics) if restore_metric_side else current.metrics
+    metric_recommendations = (
+        dict(baseline.metric_recommendations)
+        if restore_metric_side
+        else current.metric_recommendations
+    )
+    alert_recommendations = (
+        dict(baseline.alert_recommendations)
+        if restore_alert_side
+        else current.alert_recommendations
+    )
+    new_coverage: dict[str, artifacts.CoverageEntry] = {}
+    for fm_id in failure_modes:
+        base_entry = baseline.coverage.get(fm_id)
+        cur_entry = current.coverage.get(fm_id)
+        # A failure mode restored back into existence (removed by the unit, now
+        # reappearing because FAILURE_MODES is in opened_from) has no
+        # `cur_entry` at all -- mechanical coverage completeness deleted it
+        # alongside the removal. There is nothing "current" to preserve for
+        # either side in that case regardless of which phases are in
+        # opened_from: both sides must come from baseline, the only place its
+        # pre-amendment coverage still exists, or this restore would silently
+        # drop it instead of reviving it byte-for-byte.
+        if cur_entry is None:
+            metric_ids, metric_rec_ids = (
+                (base_entry.detecting_metric_ids, base_entry.metric_recommendation_ids)
+                if base_entry is not None
+                else ((), ())
+            )
+            alert_ids = base_entry.alert_ids if base_entry is not None else ()
+        else:
+            if restore_metric_side:
+                metric_ids, metric_rec_ids = (
+                    (base_entry.detecting_metric_ids, base_entry.metric_recommendation_ids)
+                    if base_entry is not None
+                    else ((), ())
+                )
+            else:
+                metric_ids, metric_rec_ids = (
+                    cur_entry.detecting_metric_ids,
+                    cur_entry.metric_recommendation_ids,
+                )
+            if restore_alert_side:
+                alert_ids = base_entry.alert_ids if base_entry is not None else ()
+            else:
+                alert_ids = cur_entry.alert_ids
+        new_coverage[fm_id] = artifacts.CoverageEntry(
+            failure_mode_id=fm_id,
+            detecting_metric_ids=metric_ids,
+            metric_recommendation_ids=metric_rec_ids,
+            alert_ids=alert_ids,
+        )
+    return dataclasses.replace(
+        current,
+        system_components=system_components,
+        failure_modes=failure_modes,
+        metrics=metrics,
+        metric_recommendations=metric_recommendations,
+        alert_recommendations=alert_recommendations,
+        coverage=new_coverage,
+    )
+
+
+def _close_unit(
+    unit_holder: _UnitHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    holder: _CandidateHolder,
+    session: agent.AgentSession,
+    log: _Log,
+    *,
+    approved: bool,
+) -> None:
+    """Close the open unit (T2.4): approval re-freezes exactly the phases that were
+    frozen when the unit opened (a phase opened from unvisited stays open, taking
+    its ordinary checkpoint later -- opening a phase for a repair never substitutes
+    for running it); rejection restores every phase's pre-amendment state and phase
+    status. Either way, `AgentSession.notify_amendment_outcome` closes the loop on
+    the model's side."""
+    unit = unit_holder.current
+    assert unit is not None
+    restored: list[Phase] = []
+    if approved:
+        for p, prior in unit.opened_from.items():
+            if prior is _PhaseStatus.FROZEN:
+                phase_status[p] = _PhaseStatus.FROZEN
+    else:
+        holder.current = _restore_from_baseline(holder.current, unit.baseline, unit.opened_from)
+        for p, prior in unit.opened_from.items():
+            phase_status[p] = prior
+            restored.append(p)
+    unit_holder.current = None
+    log(
+        {
+            "event": "amendment_unit_closed",
+            "origin": unit.origin.value,
+            "approved": approved,
+            "phases": [int(p) for p in sorted(unit.opened_from, key=int)],
+            "restored_phases": sorted(int(p) for p in restored),
+        }
+    )
+    session.notify_amendment_outcome(approved=approved, restored_phases=sorted(restored, key=int))
+
+
+def _present_amendment_once(
+    unit_holder: _UnitHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    holder: _CandidateHolder,
+    session: agent.AgentSession,
+    presenter: Presenter,
+    log: _Log,
+) -> None:
+    """Present the (closure-ready) unit once and drive its reply to a terminal
+    outcome: Approve/Reject close it (`_close_unit`); Abort unwinds via
+    `_AbortRun`; Chat routes through `session.chat`, and if that turn actually
+    changed anything (a batch landed in a unit phase, or a further phase joined),
+    returns *without* closing so the caller's closure loop
+    (`_resolve_unit_to_presentation`) can recompute and re-present a fresh view --
+    "once" means once per closure, never a mid-chat redraw of the same view."""
+    unit = unit_holder.current
+    assert unit is not None
+    rejectable = unit.origin is AmendmentOrigin.AGENT
+    view = _build_amendment_view(unit, holder.current)
+    reply: AmendmentReply = presenter.present_amendment(view, rejectable)
+    while True:
+        if isinstance(reply, Approve):
+            _close_unit(unit_holder, phase_status, holder, session, log, approved=True)
+            return
+        if isinstance(reply, Abort):
+            raise _AbortRun
+        if isinstance(reply, Reject):
+            if not rejectable:
+                raise AssertionError(
+                    "Reject returned for a non-rejectable (system-originated) "
+                    "amendment prompt -- a protocol violation"
+                )
+            _close_unit(unit_holder, phase_status, holder, session, log, approved=False)
+            return
+        if isinstance(reply, Chat):
+            before_phases = set(unit.opened_from)
+            chat_reply_text = session.chat(reply.text)
+            kind = PromptKind.REJECTABLE_AMENDMENT if rejectable else PromptKind.AMENDMENT
+            next_reply = presenter.show_chat_reply(chat_reply_text, kind)
+            assert next_reply is not None, (
+                "an amendment prompt was given (not None); show_chat_reply must "
+                "re-offer it and return the next reply"
+            )
+            if unit.dirty or set(unit.opened_from) != before_phases:
+                # A batch landed in a unit phase, or a fresh amend_proposal
+                # joined another one (architecture.md: "accepted batches and
+                # joining proposals return the unit to the closure loop") --
+                # hand back to `_resolve_unit_to_presentation`, which
+                # re-advances and re-presents a fresh view; a plain
+                # conversational reply with neither falls through to just
+                # re-offering this same prompt below.
+                return
+            reply = next_reply
+            continue
+        raise AssertionError(f"unexpected amendment reply {reply!r}")  # pragma: no cover
+
+
+def _resolve_unit_to_presentation(
+    unit_holder: _UnitHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    session: agent.AgentSession,
+    presenter: Presenter,
+    log: _Log,
+) -> None:
+    """Drive any open unit through the closure loop and its (possibly repeated)
+    re-presentation until it closes (T2.4; orchestrator.md: "An open unit defers
+    everything downstream of it"). A no-op if no unit is open."""
+    while unit_holder.current is not None:
+        _advance_unit(unit_holder, phase_status, phase_baselines, holder, session, log)
+        _present_amendment_once(unit_holder, phase_status, holder, session, presenter, log)
+
+
+def _open_system_unit(
+    violations: list[Violation],
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    log: _Log,
+) -> None:
+    """Open a system-originated unit for a failed approval gate (architecture:
+    Amendment mechanism), naming every violation's repair phase. In analyze mode
+    this only ever fires once every phase has already run (the gate's own
+    precondition), so every named phase is frozen, never unvisited."""
+    assert unit_holder.current is None
+    unit = _AmendmentUnit(origin=AmendmentOrigin.SYSTEM, baseline=holder.current)
+    for p in sorted({v.phase for v in violations}, key=int):
+        unit.opened_from[p] = phase_status[p]
+        unit.pending_violations[p] = tuple(v for v in violations if v.phase is p)
+        _mark_phase_open(p, phase_status, phase_baselines, holder)
+    unit_holder.current = unit
+    log(
+        {
+            "event": "amendment_unit_opened",
+            "origin": AmendmentOrigin.SYSTEM.value,
+            "phases": sorted(int(p) for p in unit.opened_from),
+            "violation_count": len(violations),
+        }
+    )
 
 
 # Which entry-based `ArtifactSet` fields each phase owns, for checkpoint-view diffing
@@ -655,22 +1202,48 @@ def _overall_counts(
     return EntryCounts(added=added, updated=updated, removed=removed)
 
 
+class _AbortRun(Exception):
+    """Internal control-flow signal only: any `Abort` reply during the phase
+    engine or amendment handling unwinds here, so the analyze block has exactly
+    one abort-summary/exit path regardless of where the abort happened (an
+    ordinary checkpoint, an amendment re-presentation, or a system amendment's).
+    Never escapes `_execute`."""
+
+
 def _run_checkpoint(
-    session: agent.AgentSession, presenter: Presenter, view: CheckpointView
-) -> bool:
-    """Present one checkpoint and drive its chat loop to a terminal reply (architecture:
-    "Checkpoint loop"). Returns `True` on approval, `False` on abort. The view is
-    presented exactly once; a `Chat` reply routes through `session.chat` and
-    `presenter.show_chat_reply`, which itself reads and returns the next reply -- the
-    view is never redrawn (cli.md)."""
+    session: agent.AgentSession,
+    presenter: Presenter,
+    build_view: Callable[[], CheckpointView],
+    unit_holder: _UnitHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    log: _Log,
+) -> None:
+    """Present one checkpoint and drive its chat loop to approval (architecture:
+    "Checkpoint loop"); raises `_AbortRun` on abort. An `amend_proposal` arising
+    during chat defers the checkpoint (orchestrator.md): the chat reply still
+    renders (via `prompt=None`, mooting the in-progress prompt), the unit is
+    resolved to closure and re-presentation, and the checkpoint re-presents fresh
+    afterward via `build_view` -- so a mid-run amendment's repairs (if any touched
+    this phase's own entries) are visible in the re-presented view too."""
+    view = build_view()
     reply: CheckpointReply | AmendmentReply | None = presenter.present_checkpoint(view)
     while True:
         if isinstance(reply, Approve):
-            return True
+            return
         if isinstance(reply, Abort):
-            return False
+            raise _AbortRun
         if isinstance(reply, Chat):
             chat_reply_text = session.chat(reply.text)
+            if unit_holder.current is not None:
+                presenter.show_chat_reply(chat_reply_text, None)
+                _resolve_unit_to_presentation(
+                    unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+                )
+                view = build_view()
+                reply = presenter.present_checkpoint(view)
+                continue
             reply = presenter.show_chat_reply(chat_reply_text, PromptKind.CHECKPOINT)
             assert reply is not None, (
                 "a checkpoint prompt was given (not None); show_chat_reply must "
@@ -893,8 +1466,19 @@ def _execute(
     run_state.holder = holder
     run_state.initial_set = artifact_set
     phase_status: dict[Phase, _PhaseStatus] = dict.fromkeys(Phase, _PhaseStatus.UNVISITED)
-    sink = _make_sink(holder, phase_status)
-    control = _make_control_handler(mode)
+    # Per-phase checkpoint-diff baselines (T2.4): populated the first time a phase
+    # ever leaves `unvisited`, whether via the ordinary loop below or the amendment
+    # mechanism naming it ahead of the run's position -- see `_mark_phase_open`.
+    phase_baselines: dict[Phase, artifacts.ArtifactSet] = {}
+    unit_holder = _UnitHolder()
+    sink = _make_sink(holder, phase_status, unit_holder)
+
+    def _log_event(event: dict[str, object]) -> None:
+        _log(run_state, presenter, event)
+
+    control = _make_control_handler(
+        mode, phase_status, unit_holder, phase_baselines, holder, _log_event
+    )
 
     transcript = _RealTranscriptWriter(
         state_dir / _TRANSCRIPTS_DIRNAME / f"{run_id}.jsonl"
@@ -935,63 +1519,77 @@ def _execute(
         )
         return 0
 
-    # --- The analyze phase engine (T2.3): four phases in order, a checkpoint after
-    # each, the final approval gate, then the write path. Wrapped in try/finally so
+    # --- The analyze phase engine: four phases in order, a checkpoint after each,
+    # the amendment mechanism (T2.4) interleaved wherever it arises, the final
+    # approval gate (looping system-originated amendments until it passes), then
+    # the write path. Wrapped in try/except/finally: `_AbortRun` (any Abort reply,
+    # ordinary checkpoint or amendment) renders the one abort summary and exits 3;
     # `session.close()` runs on every exit from here on -- approval, abort, or any
-    # exception (SemanticGateFailureError, WriteTimeRecheckError, a WriteError from
-    # a write primitive, or an AgentSessionError from the session itself) -- not
-    # only the approval and abort paths that used to close it explicitly. `close`
-    # is idempotent and safe after any error (agent.md), which is what makes an
-    # unconditional `finally` here correct rather than merely convenient.
+    # other exception (WriteTimeRecheckError, a WriteError from a write primitive,
+    # or an AgentSessionError from the session itself). `close` is idempotent and
+    # safe after any error (agent.md), which is what makes an unconditional
+    # `finally` here correct rather than merely convenient.
     try:
         for phase in _ANALYZE_PHASES:
-            phase_status[phase] = _PhaseStatus.OPEN
-            baseline = holder.current
+            _mark_phase_open(phase, phase_status, phase_baselines, holder)
             session.run_phase(phase)
             _log(run_state, presenter, {"event": "phase_run", "phase": int(phase)})
 
-            added, updated, removed = _phase_diff(phase, baseline, holder.current)
-            view = CheckpointView(
-                phase=phase,
-                gap_counts=artifacts.gap_counts(holder.current),
-                added=added,
-                updated=updated,
-                removed=removed,
-            )
-            approved = _run_checkpoint(session, presenter, view)
-            if not approved:
-                counts = _overall_counts(artifact_set, holder.current)
-                presenter.summary(
-                    RunSummary(
-                        outcome="aborted",
-                        transcript_path=transcript.path,
-                        gap_counts=artifacts.gap_counts(holder.current),
-                        entry_counts=counts,
-                        discarded=True,
-                    )
+            if unit_holder.current is not None:
+                # orchestrator.md, Approval gate: "an amendment unit open when
+                # run_phase returns... the orchestrator immediately resumes the
+                # unit via request_repair... and only then presents the pending
+                # checkpoint."
+                _resolve_unit_to_presentation(
+                    unit_holder, phase_status, phase_baselines, holder, session, presenter,
+                    _log_event,
                 )
-                return 3
+
+            def _build_checkpoint_view(phase: Phase = phase) -> CheckpointView:
+                # `phase: Phase = phase` binds the enclosing loop iteration's
+                # value at definition time (not by reference) -- safe either way,
+                # since `_run_checkpoint` only ever calls this within the same
+                # iteration that defines it, but this also satisfies the linter's
+                # general loop-closure check.
+                added, updated, removed = _phase_diff(phase, phase_baselines[phase], holder.current)
+                return CheckpointView(
+                    phase=phase,
+                    gap_counts=artifacts.gap_counts(holder.current),
+                    added=added,
+                    updated=updated,
+                    removed=removed,
+                )
+
+            _run_checkpoint(
+                session, presenter, _build_checkpoint_view, unit_holder, phase_status,
+                phase_baselines, holder, _log_event,
+            )
             phase_status[phase] = _PhaseStatus.FROZEN
             _log(run_state, presenter, {"event": "phase_frozen", "phase": int(phase)})
 
-        # Approval gate (orchestrator.md, Approval gate): the queue is empty and no
-        # amendment unit is open (T2.3 never opens one), so this approval is final
-        # confirmation, gated on the semantic check.
-        violations = artifacts.semantic_violations(holder.current)
-        if violations:
-            described = "; ".join(
-                f"{violation.kind.value} ({', '.join(violation.entry_ids)})"
-                for violation in violations
+        # Approval gate (orchestrator.md, Approval gate): every phase is frozen and
+        # no amendment unit is open, so this is final confirmation, gated on the
+        # semantic check -- looped, since approving a system-originated unit
+        # re-evaluates the gate, and a residual violation opens another one.
+        while True:
+            violations = artifacts.semantic_violations(holder.current)
+            if not violations:
+                break
+            _log(
+                run_state,
+                presenter,
+                {
+                    "event": "gate_failed",
+                    "violation_count": len(violations),
+                    "kinds": [v.kind.value for v in violations],
+                },
             )
-            raise SemanticGateFailureError(
-                cause=(
-                    "the final approval gate found semantic-invariant violations that "
-                    f"the amendment mechanism would ordinarily repair: {described}"
-                ),
-                next_action=(
-                    "This build does not yet implement automatic repair (a later task); "
-                    "adjust the run's guidance and re-run blare analyze."
-                ),
+            _open_system_unit(
+                violations, phase_status, unit_holder, phase_baselines, holder, _log_event
+            )
+            _resolve_unit_to_presentation(
+                unit_holder, phase_status, phase_baselines, holder, session, presenter,
+                _log_event,
             )
         _log(run_state, presenter, {"event": "gate_passed"})
 
@@ -1049,6 +1647,18 @@ def _execute(
         sigint_deferred = _write_with_sigint_masked(_do_write)
         if sigint_deferred:
             _log(run_state, presenter, {"event": "sigint_deferred_during_write"})
+    except _AbortRun:
+        counts = _overall_counts(artifact_set, holder.current)
+        presenter.summary(
+            RunSummary(
+                outcome="aborted",
+                transcript_path=transcript.path,
+                gap_counts=artifacts.gap_counts(holder.current),
+                entry_counts=counts,
+                discarded=True,
+            )
+        )
+        return 3
     finally:
         session.close()
 
@@ -1107,11 +1717,12 @@ def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
     raised: `0` success (including R7 up-to-date); `1` refusal -- any `BlareError`
     raised before preflight completes (step 9's auth check succeeding); `2` -- a
     `BlareError` raised after preflight completes (the analyze phase engine's own
-    `SemanticGateFailureError`/`WriteTimeRecheckError`, an `AgentSessionError` mid-
-    phase, or a `WriteError` from a write primitive all land here) or any
-    unexpected (non-`BlareError`) exception, whatever stage it strikes (the
-    architecture's non-module carve-out); `3` a user abort (SIGINT, or an `Abort`
-    reply at a checkpoint -- the phase engine returns 3 directly for the latter,
+    `WriteTimeRecheckError`, an `AgentSessionError` mid-phase, a `WriteError` from a
+    write primitive, or a protocol-violation exception such as an unexpected
+    `Reject` all land here) or any unexpected (non-`BlareError`) exception,
+    whatever stage it strikes (the architecture's non-module carve-out); `3` a user
+    abort (SIGINT, or an `Abort` reply at a checkpoint or amendment presentation --
+    the phase engine's own `_AbortRun` handler returns 3 directly for the latter,
     never via this exception handler). Argparse usage errors are cli's own
     carve-out, not this function's concern.
 
