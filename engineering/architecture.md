@@ -231,7 +231,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   `init_inspection`, `read`-path config and stack resolution, structural validation (every
   R19 clause), semantic check with repair-phase attribution, `gap_counts`. Traces: R19, R23,
   R24 (as unit/integration; e2e lands with T2.2).
-- [ ] **T1.5 artifacts, write side**: `batch_check`, `apply` with mechanical coverage
+- [x] **T1.5 artifacts, write side**: `batch_check`, `apply` with mechanical coverage
   completeness, `referencing_phases`, deterministic rendering, surgical write primitives,
   `raw_bytes_match`, `empty_set`. Traces: R9, R10 (unit/integration level; R10's e2e lands
   with T2.3, R9's with T2.5 and T3.1).
