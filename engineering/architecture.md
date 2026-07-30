@@ -227,7 +227,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 - [x] **T1.3 stack**: registry, `supported_stacks`, the Prometheus implementation with pinned
   `promql-parser`, both hint fragments, both validators, rule shape; full test plan. No e2e
   of its own: it surfaces through T2.2's R23 refusals and T2.3's alert validation.
-- [ ] **T1.4 artifacts, read side**: schemas and entry types, `state_exists`,
+- [x] **T1.4 artifacts, read side**: schemas and entry types, `state_exists`,
   `init_inspection`, `read`-path config and stack resolution, structural validation (every
   R19 clause), semantic check with repair-phase attribution, `gap_counts`. Traces: R19, R23,
   R24 (as unit/integration; e2e lands with T2.2).
