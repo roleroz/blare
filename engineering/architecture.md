@@ -262,7 +262,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T3 — Diff mode
 
-- [ ] **T3.1 update core**: triage, verdict seeding, the R7 short-circuit, no-impact flow,
+- [x] **T3.1 update core**: triage, verdict seeding, the R7 short-circuit, no-impact flow,
   SHA-only advance; e2e per criterion. Traces: R6, R7, R8, R9, R18.
 - [ ] **T3.2 update edges**: dynamic expansion (ahead and behind), load-seeded violation
   repairs, redirect at the no-impact confirmation, R15's refusals with both recovery

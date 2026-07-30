@@ -199,8 +199,13 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl` (unchanged
   conclusions) and `tests/fixtures/claude-sdk/analyze-reanalysis-update/scenario.jsonl`
   (one entry changed); a release-suite capture still supersedes both
-- update with an affected subset of phases
-- update no-impact conclusion (R18), and its chat-redirected variant
+- update with an affected subset of phases — T3.1 hand-authored provisional instances at
+  `tests/fixtures/claude-sdk/update-happy-path/scenario.jsonl` and
+  `update-multi-commit/scenario.jsonl` (R8's multi-commit delta); a release-suite capture
+  still supersedes both
+- update no-impact conclusion (R18) — T3.1 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; its chat-redirected variant
+  is still needed (T3.2's build); a release-suite capture still supersedes both
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
   a behind-position phase
 - checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
