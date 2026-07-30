@@ -98,3 +98,31 @@ contain it, and diff mode inherits the error).
 **Why**: the artifacts are recommendations and the checkpoint model makes review the acceptance
 step, so the commit belongs to the user; refusing on dirt outside `.blare/` is what keeps the
 recorded SHA an honest statement of what was analyzed.
+
+## 2026-07-29 — CLI commands: `blare analyze` and `blare update`
+
+**Chosen**: `blare analyze` for full analysis, `blare update` for diff mode — the names the
+spec used provisionally.
+**Rejected**: `blare init` / `blare refresh`, which emphasize lifecycle over action.
+**Why**: analyze and update are the operator verbs for what each command does, and renaming
+before release is free while renaming after is a breaking change.
+
+## 2026-07-29 — No personal configuration file in the MVP
+
+**Chosen**: the MVP ships no `~/.config/blare/`; it is created only when a real personal
+setting first exists. Transcripts and the run lock live under `$XDG_STATE_HOME/blare/`
+(machine-managed state, not configuration), and auth is fully delegated to the Claude Code
+login. This closes the question the spec deferred to the architecture phase.
+**Rejected**: creating the personal config file now to reserve the mechanism.
+**Why**: there is nothing to put in it; an empty config file is a promise of settings that do
+not exist.
+
+## 2026-07-29 — One agent session per run
+
+**Chosen**: a full run — all four phases plus all checkpoint chat — happens in one continuous
+Claude Agent SDK session.
+**Rejected**: one session per phase with artifact hand-off between them (cheaper in context,
+degrades more gracefully on very large codebases).
+**Why**: the amendment mechanism depends on cross-phase reasoning — phase 4 needs to see why
+phase 2 concluded what it did; the orchestrator/agent boundary is where per-phase sessions
+slot in later if context limits demand it.
