@@ -8,12 +8,11 @@ This section contains only open items — the absence of a topic means it is set
 **No open items.** All decisions raised by this document (D6 command names, D7 personal
 configuration, D8 agent session structure) are settled and logged in
 `engineering/decisions.md`; D6 and D7 close the two items the spec deferred to this phase.
-This document has not yet been approved. Changes in this revision (fifth review round, the
-last — it found no contradictions): the per-batch content check applies R19's structural
-rules to the resulting candidate set (acyclicity, reference integrity including removals),
-guaranteeing every written set passes its own next load; system-originated amendments offer
-no rejection — the options at that gate are steering the repair through chat or aborting —
-closing the livelock the unit-rejection rule would otherwise compose into.
+
+Changes since last approval: the Tasks section below is new (the pipeline's task phase —
+fourteen tasks in four delivery stages, awaiting delta approval); the module-design-docs note
+reflects their approval. Everything above the Tasks section is as approved, including the
+amendment-re-freeze delta approved separately.
 
 ---
 
@@ -198,10 +197,85 @@ suites: fast = `--test_tag_filters=-e2e,-live` preceded by lint (`ruff check`, `
 ## Module design docs
 
 One per module under `engineering/modules/`: `cli.md`, `orchestrator.md`, `gitrepo.md`,
-`artifacts.md`, `agent.md`, `stack.md` — written after this document is approved.
+`artifacts.md`, `agent.md`, `stack.md` — all approved.
 
-## Task list
+## Tasks
 
-Written after the module design docs are approved. Cross-module tasks will be listed here, per
-the pipeline rules; the first is the walking skeleton (CLI entry point through orchestrator to
-a stubbed agent, one green end-to-end test, `.claude/test-commands.json`).
+Each task is one branch delivering one reviewable change, built test-first from its named
+end-to-end criteria, executed by a coding agent per the development process, and done when
+its e2e tests exist and pass, the fast and full suites are green at the branch tip, and its
+code review loop has approved. Sections order delivery; tasks within a section are sequential
+unless noted. Every task hand-authors the provisional replay fixtures its own e2e scenarios
+need and reports them; the main session records any new entries in agent.md's provisional
+list (a coding agent never edits design docs). T4.1 is where captures replace them.
+
+### T1 — Foundation
+
+- [ ] **T1.1 Walking skeleton**: Bazel workspace, pinned `requirements.txt`, package layout;
+  `blare` entry point wired cli → orchestrator → a stubbed SDK client through the fixture
+  seam; the PTY e2e harness; two green e2e tests that together touch every wired layer —
+  the R11 refusal (outside a git repository, exit 1), and a seam-through run in a minimal
+  temp repo with a handshake-only replay fixture that reaches session start and exits 0
+  with a placeholder no-op summary (skeleton behavior, superseded by T2.2/T2.3);
+  `.claude/test-commands.json` declaring the fast/full/release commands as Bazel tag
+  filters, and the repo's `PreToolUse` merge gate running the full command. Traces: R11
+  (first clause), R13.
+- [ ] **T1.2 gitrepo**: the module complete per `gitrepo.md` — interface, answer sets,
+  `--no-renames` semantics, contract and failure tests (real git; stub executables). No e2e
+  of its own: its behaviour surfaces end-to-end through T2.2's refusals and T3.1's deltas,
+  so the done-criterion's e2e clause is satisfied by its design doc's test plan alone.
+- [ ] **T1.3 stack**: registry, `supported_stacks`, the Prometheus implementation with pinned
+  `promql-parser`, both hint fragments, both validators, rule shape; full test plan. No e2e
+  of its own: it surfaces through T2.2's R23 refusals and T2.3's alert validation.
+- [ ] **T1.4 artifacts, read side**: schemas and entry types, `state_exists`,
+  `init_inspection`, `read`-path config and stack resolution, structural validation (every
+  R19 clause), semantic check with repair-phase attribution, `gap_counts`. Traces: R19, R23,
+  R24 (as unit/integration; e2e lands with T2.2).
+- [ ] **T1.5 artifacts, write side**: `batch_check`, `apply` with mechanical coverage
+  completeness, `referencing_phases`, deterministic rendering, surgical write primitives,
+  `raw_bytes_match`, `empty_set`. Traces: R9, R10 (unit/integration level; R10's e2e lands
+  with T2.3, R9's with T2.5 and T3.1).
+
+### T2 — Full analysis
+
+- [ ] **T2.1 agent**: session lifecycle, the two tools over injected handlers, prompt
+  templates, `create_client` with replay/record clients and normalization, transcripts,
+  error taxonomy; hand-authored provisional fixtures for the analyze happy path. Traces:
+  R12 (unit level; its e2e is T2.2's auth refusal) and R14 (unit level; e2e with T2.3).
+- [ ] **T2.2 orchestrator preflight**: the nine-step sequence (the update-only steps 5–6
+  are wired here but exercised end-to-end in T3.x), lock, run log, exit-code taxonomy,
+  refusal e2e tests one per criterion — R1's inverse refusal (orphaned canonical files)
+  and R19's structural-validation refusal included. Traces: R11, R12, R17, R19, R21, R22,
+  R23, R24, R13; R15's code lands here with its e2e in T3.2.
+- [ ] **T2.3 analyze happy path**: phase engine, checkpoints, cli presenter with the full
+  rendering rules, chat loop, final gate, write path with re-checks; e2e over replay
+  fixtures: fresh analyze (R1), checkpoint interaction (R2), chains (R3), coverage and
+  alerts (R4, R5), abort paths (R20), summaries (R13, R14), and derived-doc discipline
+  (R10: generated header present; a derived doc edited *during a checkpoint pause of the
+  same run* — the single-run construction that dodges R1's inverse refusal — is restored
+  at final confirmation, and the abort variant of the same setup shows no restoration).
+- [ ] **T2.4 amendments**: unit mechanics, frozen-only cascade, system amendments, the
+  closure loop, outcome notification; e2e per the amendment scenarios. Traces: R2
+  (amendment clauses), R3–R5 invariants at the gate.
+- [ ] **T2.5 re-analysis**: `blare analyze` over an existing state file, ID and byte
+  stability. Traces: R16, R9.
+
+### T3 — Diff mode
+
+- [ ] **T3.1 update core**: triage, verdict seeding, the R7 short-circuit, no-impact flow,
+  SHA-only advance; e2e per criterion. Traces: R6, R7, R8, R9, R18.
+- [ ] **T3.2 update edges**: dynamic expansion (ahead and behind), load-seeded violation
+  repairs, redirect at the no-impact confirmation, R15's refusals with both recovery
+  options. Traces: R15, R18 (dynamic clauses).
+
+### T4 — Release readiness
+
+- [ ] **T4.1 release suite**: the scripted PTY scenarios against
+  `~/external_git/miniflux_v2` in record mode — one per entry on agent.md's provisional
+  list, which is the binding enumeration (analyze and re-analyze runs, every update
+  variant, chat alterations, all amendment variants including cascade and rejection, the
+  diff-mode redirect, the logged-out auth capture); captured fixtures replace the
+  provisional set, and emptying that list is this task's definition of done, per the
+  global rule that it gates the first release.
+- [ ] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
+  to use and not, install, quick start), written to the brand voice.
