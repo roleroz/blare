@@ -77,6 +77,8 @@ class FakePresenter:
     amendment_views: list[AmendmentView] = field(default_factory=list)
     amendment_rejectable_seen: list[bool] = field(default_factory=list)
     amendment_replies: list[AmendmentReply] = field(default_factory=list)
+    no_impact_views: list[NoImpactView] = field(default_factory=list)
+    no_impact_replies: list[CheckpointReply] = field(default_factory=list)
 
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
         self.checkpoint_views.append(view)
@@ -92,7 +94,10 @@ class FakePresenter:
         return orchestrator.Approve()
 
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
-        raise NotImplementedError
+        self.no_impact_views.append(view)
+        if self.no_impact_replies:
+            return self.no_impact_replies.pop(0)
+        return orchestrator.Approve()
 
     def show_chat_reply(
         self, text: str, prompt: PromptKind | None
@@ -205,8 +210,16 @@ class FakeAgentSession:
     # acknowledges completion immediately, since the resume-retry mechanics are
     # agent.py's own unit-level concern (test_agent.py), not this module's.
     withhold_amend_complete: bool = False
+    # Scripted run_control calls to issue (via the real control handler) when
+    # `triage` is called (T3.1) -- models the agent's triage turn(s) without
+    # re-simulating real turn boundaries (like every other `*_calls_by_*` field
+    # here, this fake applies them all in one shot rather than one per drained
+    # turn -- the turn-by-turn reminder/raise mechanics are agent.py's own unit
+    # concern, test_agent.py).
+    triage_run_control_calls: list[RunControlCall] = field(default_factory=list)
     started_with: tuple[RunMode, RunContext] | None = field(default=None, init=False)
     ran_phases: list[Phase] = field(default_factory=list, init=False)
+    triage_called: bool = field(default=False, init=False)
     chat_calls: list[str] = field(default_factory=list, init=False)
     rejected_batches: list[BatchVerdict] = field(default_factory=list, init=False)
     run_control_verdicts: list[RunControlVerdict] = field(default_factory=list, init=False)
@@ -269,7 +282,11 @@ class FakeAgentSession:
         return self.transcript.path  # type: ignore[attr-defined,no-any-return]
 
     def triage(self) -> None:
-        raise NotImplementedError("analyze mode never calls triage")
+        self.triage_called = True
+        self._write_transcript("outbound", {"type": "triage"})
+        for call in self.triage_run_control_calls:
+            self.run_control_verdicts.append(self.control(call))
+        self._write_transcript("inbound", {"type": "turn_end"})
 
     def request_repair(self, phases: list[Phase], violations: list[Violation]) -> None:
         key = tuple(sorted(phases, key=int))
@@ -308,6 +325,7 @@ def _ready_session(
     repair_edits_by_phases: dict[tuple[Phase, ...], list[EditBatch]] | None = None,
     repair_run_control_by_phases: dict[tuple[Phase, ...], list[RunControlCall]] | None = None,
     withhold_amend_complete: bool = False,
+    triage_run_control_calls: list[RunControlCall] | None = None,
 ) -> list[FakeAgentSession]:
     """Patch `agent.create_client` and `agent.AgentSession` so the phase engine runs
     against a scripted `FakeAgentSession` instead of real SDK wire replay -- what
@@ -325,6 +343,7 @@ def _ready_session(
     scripted_chat_run_control = chat_run_control_by_text or {}
     scripted_repair_edits = repair_edits_by_phases or {}
     scripted_repair_run_control = repair_run_control_by_phases or {}
+    scripted_triage_run_control = list(triage_run_control_calls or [])
     sessions: list[FakeAgentSession] = []
 
     def _factory(
@@ -349,6 +368,7 @@ def _ready_session(
             repair_edits_by_phases=scripted_repair_edits,
             repair_run_control_by_phases=scripted_repair_run_control,
             withhold_amend_complete=withhold_amend_complete,
+            triage_run_control_calls=list(scripted_triage_run_control),
         )
         sessions.append(session)
         return session
@@ -417,6 +437,62 @@ def _write_default_config(repo: Path) -> None:
     _write_yaml_file(_blare_root(repo) / "config.yaml", "stack: prometheus\n")
 
 
+def _write_valid_update_state(repo: Path, analyzed_sha: str) -> None:
+    """A structurally *and* semantically valid `.blare/` for update-mode tests: one
+    excluded failure mode (trivially satisfies every R3-R5 invariant with no
+    metrics/alerts needed), plus a default config -- what every update happy-path
+    test starts from so step 7's semantic check seeds nothing (T3.1)."""
+    _write_minimal_analyzed_state(repo, analyzed_sha)
+    root = _blare_root(repo)
+    _write_yaml_file(
+        root / "failure-modes.yaml",
+        "- id: fm-timeout\n"
+        "  title: upstream timeout\n"
+        "  description: a call to an upstream service times out\n"
+        "  severity: warning\n"
+        "  user_visible: false\n"
+        "  caused_by: []\n"
+        "  coverage_status: excluded\n"
+        "  exclusion_reason: not independently detectable\n",
+    )
+    _write_yaml_file(
+        root / "coverage.yaml",
+        "- failure_mode_id: fm-timeout\n"
+        "  detecting_metric_ids: []\n"
+        "  metric_recommendation_ids: []\n"
+        "  alert_ids: []\n",
+    )
+    _write_default_config(repo)
+
+
+def _write_update_state_with_semantic_violation(repo: Path, analyzed_sha: str) -> None:
+    """A structurally valid but semantically *violating* `.blare/`: one non-excluded
+    failure mode with no alert coverage -- step 7's semantic check seeds its repair
+    phase (`ViolationKind.UNMAPPED_FAILURE_MODE` repairs in phase 4, per
+    `model._REPAIR_PHASE`) -- for testing that R18's no_impact rejection accounts
+    for load-seeded violations, not just triage-opened phases (T3.1)."""
+    _write_minimal_analyzed_state(repo, analyzed_sha)
+    root = _blare_root(repo)
+    _write_yaml_file(
+        root / "failure-modes.yaml",
+        "- id: fm-orphan\n"
+        "  title: an unmapped failure\n"
+        "  description: has a coverage status but no alert coverage\n"
+        "  severity: warning\n"
+        "  user_visible: false\n"
+        "  caused_by: []\n"
+        "  coverage_status: alertable\n",
+    )
+    _write_yaml_file(
+        root / "coverage.yaml",
+        "- failure_mode_id: fm-orphan\n"
+        "  detecting_metric_ids: []\n"
+        "  metric_recommendation_ids: []\n"
+        "  alert_ids: []\n",
+    )
+    _write_default_config(repo)
+
+
 def _isolate_state_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point `XDG_STATE_HOME` at a private tmp directory so lock/run-log/transcript
     files never touch the real user's state directory during tests."""
@@ -431,6 +507,18 @@ def _ready_client(monkeypatch: pytest.MonkeyPatch, ready: bool = True) -> None:
 
 def repo_head(repo: Path) -> str:
     return gitrepo.GitRepo.discover(repo).head_sha()
+
+
+def commit_file_update(repo: Path, relative_path: str, content: str) -> str:
+    """Write `content` to `relative_path` (outside `.blare/`) and commit it --
+    T3.1's update-mode tests use this to give a run a genuine non-empty effective
+    delta between the recorded `analyzed_sha` and HEAD."""
+    path = repo / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    _run_git(["add", relative_path], repo)
+    _run_git(["commit", "--quiet", "-m", f"update {relative_path}"], repo)
+    return repo_head(repo)
 
 
 # --- Happy path: analyze, fresh repo -------------------------------------------------
@@ -3343,3 +3431,709 @@ def test_contract_error_types_are_blare_errors() -> None:
         NonInteractiveError,
     ):
         assert issubclass(exc_type, BlareError)
+
+
+# ==== T3.1: update core -- triage, verdict seeding, no-impact flow, SHA-only
+# advance =============================================================================
+
+
+def test_contract_update_triage_affected_verdict_seeds_named_phases_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """triage's affected_verdict seeds exactly the named phase(s); unaffected
+    phases never pause (R18): only phase 3's checkpoint is presented, and only
+    phase 3's own artifacts change."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    before = {
+        name: (_blare_root(repo) / name).read_bytes()
+        for name in ("system-map.yaml", "failure-modes.yaml", "coverage.yaml")
+    }
+    second_sha = commit_file_update(repo, "src/metrics.py", "# add a metric\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+        ],
+        edits_by_phase={
+            Phase.METRIC_COVERAGE: [
+                EditBatch(
+                    phase=Phase.METRIC_COVERAGE,
+                    edits=(
+                        Edit(
+                            EditOp.ADD,
+                            "metrics",
+                            {
+                                "id": "mx-new",
+                                "name": "http_requests_total",
+                                "type": "counter",
+                                "labels": [],
+                                "emitted_at": ["src/metrics.py:1"],
+                                "description": "d",
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.triage_called
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+    assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
+    assert not presenter.no_impact_views
+
+    root = _blare_root(repo)
+    loaded = artifacts.load(root, RunMode.UPDATE)
+    assert loaded.analyzed_sha == second_sha
+    assert set(loaded.metrics) == {"mx-new"}
+    # Unaffected phases' files are untouched (R9): system map and failure modes
+    # keep their exact bytes; coverage keeps its mechanical shape unchanged too.
+    assert (root / "system-map.yaml").read_bytes() == before["system-map.yaml"]
+    assert (root / "failure-modes.yaml").read_bytes() == before["failure-modes.yaml"]
+    assert (root / "coverage.yaml").read_bytes() == before["coverage.yaml"]
+
+
+def test_contract_update_no_impact_empty_queue_confirms_sha_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no_impact conclusion with an empty queue is presented for confirmation;
+    approval is the final confirmation for the run and changes exactly the state
+    SHA (plus any derived-doc restoration) -- no entry file changes (R18)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    before = {
+        name: (_blare_root(repo) / name).read_bytes()
+        for name in (
+            "system-map.yaml",
+            "failure-modes.yaml",
+            "metrics.yaml",
+            "metric-recommendations.yaml",
+            "alert-recommendations.yaml",
+            "coverage.yaml",
+        )
+    }
+    before_config = (_blare_root(repo) / "config.yaml").read_bytes()
+    second_sha = commit_file_update(repo, "README.md", "unrelated doc change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "docs-only change"})
+        ],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.triage_called
+    assert session.ran_phases == []
+    assert not presenter.checkpoint_views
+    assert len(presenter.no_impact_views) == 1
+    view = presenter.no_impact_views[0]
+    assert view.conclusion == "docs-only change"
+    assert view.delta_file_count == 1
+    assert view.delta_files == ("README.md",)
+
+    root = _blare_root(repo)
+    loaded = artifacts.load(root, RunMode.UPDATE)
+    assert loaded.analyzed_sha == second_sha
+    for name, content in before.items():
+        assert (root / name).read_bytes() == content, f"{name} changed on a no-impact run"
+    assert (root / "config.yaml").read_bytes() == before_config
+    summary = presenter.summaries[0]
+    assert summary.entry_counts == orchestrator.EntryCounts(added=0, updated=0, removed=0)
+
+
+def test_contract_update_no_impact_rejected_when_triage_seeded_phase_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no_impact conclusion is rejected as a verdict while the queue is non-empty
+    from the agent's own affected_verdict earlier in the same triage turn (R18:
+    "the seeded phases still need work")."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]}),
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing else needed"}),
+        ],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert [v.ok for v in session.run_control_verdicts] == [True, False]
+    assert "still need" in (session.run_control_verdicts[1].message or "")
+    assert not presenter.no_impact_views
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+
+
+def test_contract_update_no_impact_rejected_when_load_seeded_violation_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no_impact conclusion is rejected when step 7's semantic check already
+    seeded a repair phase from a load-time invariant violation (R18) -- even
+    though triage itself opened nothing yet. The model then retries with an
+    affected_verdict naming the repair phase, which the run completes normally."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_update_state_with_semantic_violation(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing to do"}),
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [4]}),
+        ],
+        edits_by_phase={
+            Phase.ALERT_RECOMMENDATIONS: [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-orphan", ["fm-orphan"], severity="warning"),
+                        _coverage_alert_edit("fm-orphan", ["ar-orphan"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert [v.ok for v in session.run_control_verdicts] == [False, True]
+    assert not presenter.no_impact_views
+    assert session.ran_phases == [Phase.ALERT_RECOMMENDATIONS]
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_contract_update_gate_opens_system_unit_for_unvisited_repair_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load-seeded violation whose repair phase the model never names (it
+    settles on some other affected phase instead) is caught by
+    `_finalize_and_write`'s own gate, exactly as it would be in analyze mode --
+    except here the repair phase is still `unvisited`, never `frozen`, when the
+    system-originated unit opens it (`_open_system_unit`'s note). The unit's own
+    approval leaves that phase open, and `_finalize_and_write` drains the queue
+    again afterward: the phase still gets its own ordinary checkpoint before the
+    write -- "opening a phase for a repair never substitutes for running it"
+    holds at the gate too, not only during the ordinary phase loop."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_update_state_with_semantic_violation(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing to do"}),
+            # Settles on phase 2 -- not the violation's own repair phase (4) --
+            # so the violation survives phase 2's checkpoint and is only ever
+            # caught at the gate.
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]}),
+        ],
+        repair_edits_by_phases={
+            (Phase.ALERT_RECOMMENDATIONS,): [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-orphan", ["fm-orphan"], severity="warning"),
+                        _coverage_alert_edit("fm-orphan", ["ar-orphan"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # Phase 2 ran normally first (settled by the verdict); phase 4 only ran
+    # afterward, once the gate's system unit opened it.
+    assert session.ran_phases == [Phase.FAILURE_MODES, Phase.ALERT_RECOMMENDATIONS]
+    assert [v.phase for v in presenter.checkpoint_views] == [
+        Phase.FAILURE_MODES,
+        Phase.ALERT_RECOMMENDATIONS,
+    ]
+    # The gate-driven amendment was presented (system origin, non-rejectable)
+    # in addition to phase 4's own ordinary checkpoint above.
+    assert len(presenter.amendment_views) == 1
+    assert presenter.amendment_views[0].origin is orchestrator.AmendmentOrigin.SYSTEM
+    assert session.notify_outcomes == [(True, ())]
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert artifacts.semantic_violations(loaded) == []
+    assert set(loaded.alert_recommendations) == {"ar-orphan"}
+
+
+def test_contract_update_affected_verdict_naming_open_phase_is_noop_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An affected_verdict naming an already-open phase is acknowledged as a
+    no-op (architecture.md's run-control totality) -- it neither duplicates the
+    phase in the queue nor causes a second checkpoint."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+        ],
+        run_control_calls_by_phase={
+            Phase.METRIC_COVERAGE: [
+                RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert session.run_control_verdicts[-1].ok is True
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+    assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
+
+
+def test_contract_update_affected_verdict_naming_frozen_phase_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An affected_verdict naming an already-frozen phase is rejected, directing
+    the agent to amend_proposal instead (orchestrator.md, Amendments)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3, 4]})
+        ],
+        run_control_calls_by_phase={
+            Phase.ALERT_RECOMMENDATIONS: [
+                RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    rejected = session.run_control_verdicts[-1]
+    assert rejected.ok is False
+    assert "amend_proposal" in (rejected.message or "")
+    assert session.ran_phases == [Phase.METRIC_COVERAGE, Phase.ALERT_RECOMMENDATIONS]
+
+
+def test_contract_update_amendment_ahead_phase_gets_ordinary_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The phase engine's queue is genuinely dynamic in update mode too: an
+    amendment proposed mid-run naming an unvisited phase not in triage's original
+    queue still gets its own ordinary checkpoint once the queue reaches it (reusing
+    T2.4's amendment machinery rather than a parallel implementation)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        # Triage names only phase 2; phase 4 is opened later, mid-run, by an
+        # agent-proposed amendment -- it was never in the original queue.
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]})
+        ],
+        edits_by_phase={
+            Phase.FAILURE_MODES: [
+                EditBatch(
+                    phase=Phase.FAILURE_MODES,
+                    edits=(
+                        _fm_edit(
+                            "fm-503",
+                            severity="critical",
+                            user_visible=True,
+                            coverage_status="alertable",
+                        ),
+                    ),
+                )
+            ],
+        },
+        run_control_calls_by_phase={
+            Phase.FAILURE_MODES: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [4]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.ALERT_RECOMMENDATIONS,): [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-503", ["fm-503"]),
+                        _coverage_alert_edit("fm-503", ["ar-503"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # Phase 4 was never named by triage, yet its ordinary checkpoint still fires
+    # once the (dynamically recomputed) queue reaches it -- "opening a phase for a
+    # repair never substitutes for running it" holds in update mode too.
+    assert session.ran_phases == [Phase.FAILURE_MODES, Phase.ALERT_RECOMMENDATIONS]
+    assert [v.phase for v in presenter.checkpoint_views] == [
+        Phase.FAILURE_MODES,
+        Phase.ALERT_RECOMMENDATIONS,
+    ]
+    assert session.notify_outcomes == [(True, ())]
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert set(loaded.alert_recommendations) == {"ar-503"}
+
+
+def test_contract_update_r6_r8_r9_multi_commit_delta_only_affected_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R6/R8/R9: a delta spanning multiple commits is handled as one delta (not
+    per-commit); only the triage-affected phase's artifacts change; the recorded
+    SHA is the delta's end commit captured at run start."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    before = {
+        name: (_blare_root(repo) / name).read_bytes()
+        for name in ("system-map.yaml", "metrics.yaml", "coverage.yaml")
+    }
+    commit_file_update(repo, "src/a.py", "# change a\n")
+    final_sha = commit_file_update(repo, "src/b.py", "# change b\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]})
+        ],
+        edits_by_phase={
+            Phase.FAILURE_MODES: [
+                EditBatch(
+                    phase=Phase.FAILURE_MODES,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "failure_modes",
+                            {
+                                "id": "fm-timeout",
+                                "title": "upstream timeout (revised)",
+                                "description": "a call to an upstream service times out",
+                                "severity": "warning",
+                                "user_visible": False,
+                                "caused_by": [],
+                                "coverage_status": "excluded",
+                                "exclusion_reason": "not independently detectable",
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # R8: gitrepo computed one delta over both new commits -- triage saw one
+    # message naming both changed files, not two separate triage calls.
+    assert session.started_with is not None
+    _, context = session.started_with
+    assert set(context.delta_files) == {"src/a.py", "src/b.py"}
+
+    root = _blare_root(repo)
+    loaded = artifacts.load(root, RunMode.UPDATE)
+    # R6: the recorded SHA is the delta's end commit captured at run start.
+    assert loaded.analyzed_sha == final_sha
+    assert loaded.failure_modes["fm-timeout"].title == "upstream timeout (revised)"
+    # R9: every other phase's artifacts are untouched.
+    for name, content in before.items():
+        assert (root / name).read_bytes() == content, f"{name} changed unexpectedly"
+
+
+def test_contract_update_r7_empty_delta_still_exits_0_with_no_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R7's own e2e proof at the unit level: an empty effective delta (same commit
+    as recorded) exits 0, produces zero diff, and never constructs a session --
+    `agent.create_client`/`agent.AgentSession` are never touched (T2.2's
+    already-written short-circuit; T3.1 supplies the missing proof)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    before = (_blare_root(repo) / "failure-modes.yaml").read_bytes()
+    _isolate_state_home(monkeypatch, tmp_path)
+
+    def _boom() -> None:
+        raise AssertionError("agent.create_client must never be called on the R7 path")
+
+    monkeypatch.setattr(agent, "create_client", _boom)
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    summary = presenter.summaries[0]
+    assert summary.outcome == "up to date"
+    assert summary.transcript_path is None
+    assert (_blare_root(repo) / "failure-modes.yaml").read_bytes() == before
+    state = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert state.analyzed_sha == first_sha
+
+
+def test_contract_update_no_impact_rejected_when_unit_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no_impact conclusion is rejected as a verdict while an amendment unit is
+    open (orchestrator.md: "a no_impact verdict arriving while any unit is open
+    is rejected as a verdict... close the unit first")."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [2]}),
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing else"}),
+        ],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert [v.ok for v in session.run_control_verdicts] == [True, False]
+    assert "close it" in (session.run_control_verdicts[1].message or "")
+    assert not presenter.no_impact_views
+
+
+def test_contract_update_affected_verdict_unvisited_phase_rejected_when_unit_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An affected_verdict naming an unvisited phase is rejected as a verdict
+    while an amendment unit is open (orchestrator.md: "while a unit is open...
+    an affected_verdict naming an unvisited phase are both rejected as
+    verdicts... close the unit first")."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [2]}),
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]}),
+        ],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert [v.ok for v in session.run_control_verdicts] == [True, False]
+    assert "close it" in (session.run_control_verdicts[1].message or "")
+    # Phase 3 was never opened -- the rejected verdict named it, nothing else did.
+    assert Phase.METRIC_COVERAGE not in session.ran_phases
+
+
+def test_contract_update_no_impact_chat_reopening_a_phase_still_gets_its_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a run_control call issued mid-chat during the no-impact
+    confirmation -- before approval -- must not be silently skipped. A phase
+    opened that way still gets its own ordinary checkpoint before anything is
+    written; approving the (now stale) no-impact prompt must never bypass that
+    review (R2, R18)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    reconsider_text = "actually, does this affect metric coverage?"
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing obvious"})
+        ],
+        chat_run_control_by_text={
+            reconsider_text: [
+                RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+            ]
+        },
+        edits_by_phase={
+            Phase.METRIC_COVERAGE: [
+                EditBatch(
+                    phase=Phase.METRIC_COVERAGE,
+                    edits=(
+                        Edit(
+                            EditOp.ADD,
+                            "metrics",
+                            {
+                                "id": "mx-late",
+                                "name": "late_metric_total",
+                                "type": "counter",
+                                "labels": [],
+                                "emitted_at": ["src/x.py:1"],
+                                "description": "d",
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.no_impact_replies = [orchestrator.Chat(reconsider_text)]
+    presenter.chat_reply_script = [orchestrator.Approve()]
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # The phase opened mid-chat still got its own real turn and checkpoint --
+    # never silently written without review.
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+    assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert set(loaded.metrics) == {"mx-late"}
+
+
+def test_contract_update_no_impact_chat_opening_amendment_still_gets_presented(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an amend_proposal (plus its repair edit) issued mid-chat
+    during the no-impact confirmation still gets its amendment re-presented,
+    and the phase it opened (from unvisited) still gets its own ordinary
+    checkpoint afterward -- neither is written without going through its own
+    presentation, whatever the no-impact prompt's own reply was (R2)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    reconsider_text = "let's double check phase 3"
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing obvious"})
+        ],
+        chat_run_control_by_text={
+            reconsider_text: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [3]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.METRIC_COVERAGE,): [
+                EditBatch(
+                    phase=Phase.METRIC_COVERAGE,
+                    edits=(
+                        Edit(
+                            EditOp.ADD,
+                            "metrics",
+                            {
+                                "id": "mx-sneaky",
+                                "name": "sneaky_metric_total",
+                                "type": "counter",
+                                "labels": [],
+                                "emitted_at": ["src/x.py:1"],
+                                "description": "d",
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.no_impact_replies = [orchestrator.Chat(reconsider_text)]
+    presenter.chat_reply_script = [orchestrator.Approve()]
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # The amendment was genuinely presented and approved -- never silently
+    # written alongside the no-impact approval.
+    assert len(presenter.amendment_views) == 1
+    assert session.notify_outcomes == [(True, ())]
+    # Phase 3 was opened from unvisited by the amendment: it stays open and
+    # takes its own ordinary checkpoint afterward (opening a phase for a repair
+    # never substitutes for running it).
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+    assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert set(loaded.metrics) == {"mx-sneaky"}

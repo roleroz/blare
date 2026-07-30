@@ -1,8 +1,7 @@
 """Unit tests for blare.agent: T2.1 scope (session lifecycle, the two-tool dispatch
 over injected handlers, prompt templates, `create_client`'s replay/record branches,
 transcripts, and the error taxonomy) plus T2.4's `request_repair` and
-`notify_amendment_outcome`. `triage` is diff-mode-only (T3.1's scope) and is not
-tested here.
+`notify_amendment_outcome`; T3.1 adds `triage` (diff mode's first step, R18).
 
 Contract tests cover what this module promises while its dependencies behave;
 failure-mode tests cover one per dependency failure mode (agent.md's Test plan):
@@ -1464,3 +1463,188 @@ def test_contract_analyze_happy_path_fixture_replays_all_four_phases(
 
     assert [batch.phase for batch in sink.calls] == list(Phase)
     assert len(sink.calls) == 4
+
+
+# ==== update mode: triage (T3.1) ===================================================
+
+
+@dataclass
+class SequencedControl:
+    """Returns one scripted verdict per call, in order -- for asserting that a
+    *rejected* run_control call does not satisfy triage's verdict requirement,
+    unlike `RecordingControl`'s single fixed verdict."""
+
+    verdicts: list[RunControlVerdict]
+    calls: list[RunControlCall] = field(default_factory=list)
+
+    def __call__(self, call: RunControlCall) -> RunControlVerdict:
+        self.calls.append(call)
+        return self.verdicts.pop(0)
+
+
+def test_contract_triage_sends_delta_files_patch_text_and_verdict_contract(
+    tmp_path: Path,
+) -> None:
+    """triage sends the effective delta's file list, patch text, and the verdict
+    contract in one outbound message (agent.md: "the delta travels in the triage
+    message, not in phase prompts")."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "affected_verdict", "payload": {"phases": [3]}},
+                }
+            ]
+        ]
+    )
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(
+        RunMode.UPDATE,
+        RunContext(
+            worktree_root=tmp_path,
+            delta_files=("a.py", "b.py"),
+            patch_text="diff --git a/a.py b/a.py\n+x\n",
+        ),
+    )
+
+    session.triage()
+    session.close()
+
+    sent = fake.sent_events[0]
+    assert sent["type"] == "triage"
+    assert sent["delta_files"] == ["a.py", "b.py"]
+    assert sent["patch_text"] == "diff --git a/a.py b/a.py\n+x\n"
+    text = sent["text"]
+    assert isinstance(text, str)
+    assert "affected_verdict" in text
+    assert "no_impact" in text
+
+
+def test_contract_triage_returns_after_affected_verdict(tmp_path: Path) -> None:
+    """triage returns (does not raise, sends no reminder) once an affected_verdict
+    is accepted during the turn."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "affected_verdict", "payload": {"phases": [2]}},
+                }
+            ]
+        ]
+    )
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.UPDATE, RunContext(worktree_root=tmp_path))
+
+    session.triage()  # must not raise
+    session.close()
+
+    outbound = [e for e in fake.sent_events if e.get("type") in ("triage", "triage_reminder")]
+    assert len(outbound) == 1
+
+
+def test_contract_triage_returns_after_no_impact(tmp_path: Path) -> None:
+    """triage returns once a no_impact conclusion is accepted during the turn."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "no_impact", "payload": {"reasoning": "docs only"}},
+                }
+            ]
+        ]
+    )
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.UPDATE, RunContext(worktree_root=tmp_path))
+
+    session.triage()  # must not raise
+    session.close()
+
+    outbound = [e for e in fake.sent_events if e.get("type") in ("triage", "triage_reminder")]
+    assert len(outbound) == 1
+
+
+def test_contract_triage_rejected_verdict_does_not_count_as_arrived(tmp_path: Path) -> None:
+    """A rejected run_control call (ok=False) does not satisfy triage's verdict
+    requirement -- only a subsequent *accepted* affected_verdict/no_impact does,
+    and no reminder is needed when that acceptance still happens within the same
+    turn."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "run_control",
+                    "input": {"action": "no_impact", "payload": {"reasoning": "x"}},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "t2",
+                    "name": "run_control",
+                    "input": {"action": "affected_verdict", "payload": {"phases": [3]}},
+                },
+            ]
+        ]
+    )
+    control = SequencedControl(
+        verdicts=[
+            RunControlVerdict(ok=False, message="seeded phases still need work"),
+            RunControlVerdict(ok=True, message="noted"),
+        ]
+    )
+    transcript = FakeTranscriptWriter(tmp_path / "t.jsonl")
+    session = AgentSession(fake, RecordingSink(), control, PrometheusStack(), transcript)
+    session.start(RunMode.UPDATE, RunContext(worktree_root=tmp_path))
+
+    session.triage()  # must not raise
+    session.close()
+
+    assert len(control.calls) == 2
+    outbound = [e for e in fake.sent_events if e.get("type") in ("triage", "triage_reminder")]
+    assert len(outbound) == 1  # resolved within the same turn -- no reminder sent
+
+
+def test_failure_triage_reminds_once_then_raises_without_verdict(tmp_path: Path) -> None:
+    """triage reminds the model once via a follow-up message, then raises
+    AgentSessionError if a second turn also ends without an accepted
+    affected_verdict/no_impact -- mirroring request_repair's own reminder/raise
+    pattern (agent.md)."""
+    fake = FakeSDKClient(turns=[[{"type": "text", "text": "still thinking"}]])
+    fake.queue_turn([{"type": "text", "text": "still thinking again"}])
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.UPDATE, RunContext(worktree_root=tmp_path))
+
+    with pytest.raises(AgentSessionError) as exc_info:
+        session.triage()
+
+    assert "verdict" in exc_info.value.cause.lower()
+    outbound = [e for e in fake.sent_events if e.get("type") in ("triage", "triage_reminder")]
+    assert len(outbound) == 2
+
+
+def test_contract_phase_prompts_never_carry_the_delta(tmp_path: Path) -> None:
+    """Phase prompts do not carry the effective delta -- only triage's own message
+    does (agent.md)."""
+    fake = FakeSDKClient(turns=[[{"type": "text", "text": "ok"}]])
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(
+        RunMode.UPDATE,
+        RunContext(worktree_root=tmp_path, delta_files=("a.py",), patch_text="diff"),
+    )
+
+    session.run_phase(Phase.FAILURE_MODES)
+    session.close()
+
+    sent = fake.sent_events[0]
+    assert sent["type"] == "phase_prompt"
+    assert "delta_files" not in sent
+    assert "patch_text" not in sent

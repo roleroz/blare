@@ -8,9 +8,12 @@ the error taxonomy.
 
 T2.4 scope: `request_repair` (the channel for every system-initiated repair and for
 resuming an agent-proposed amendment whose turn ended before `amend_complete`) and
-`notify_amendment_outcome` (closes the loop on every amendment unit). `triage` is
-diff-mode-only (T3.1's scope) and stays unbuilt. The live (`unset`) SDK client is out
-of scope for this task too — `create_client` keeps T1.1's `NotImplementedError` for
+`notify_amendment_outcome` (closes the loop on every amendment unit).
+
+T3.1 scope: `triage` (diff mode's first step, R18) -- sends the effective delta plus
+the verdict contract and returns once an `affected_verdict`/`no_impact` verdict is
+accepted, reminding once then raising on a verdict-less turn. The live (`unset`) SDK
+client stays out of scope -- `create_client` keeps T1.1's `NotImplementedError` for
 that branch.
 
 Design note on the client/wire boundary: the real `claude_agent_sdk.ClaudeSDKClient`
@@ -621,6 +624,26 @@ def _system_prompt(mode: RunMode) -> str:
     return _ANALYZE_SYSTEM_PROMPT if mode is RunMode.ANALYZE else _UPDATE_SYSTEM_PROMPT
 
 
+# `triage`'s message (T3.1) -- the delta travels here, never in a phase prompt
+# (agent.md). Kept as one fixed constant (not re-derived from RunContext) so its
+# exact bytes are stable for the replaying client's byte-exact comparison.
+_TRIAGE_MESSAGE = (
+    "Diff-mode triage: review the effective delta's file list and patch text "
+    "(above) and decide which phase(s) need work as a result -- system map (1), "
+    "failure modes (2), metric coverage (3), alert recommendations (4). Report "
+    "your conclusion through the run_control tool before ending your turn: call "
+    "it with action \"affected_verdict\" and payload {\"phases\": [<phase "
+    "numbers>]} naming every phase that needs work, or with action \"no_impact\" "
+    "and payload {\"reasoning\": \"<why the delta needs no artifact changes>\"} "
+    "if none do."
+)
+
+_TRIAGE_REMINDER = (
+    "Please call run_control with affected_verdict or no_impact before ending "
+    "your turn."
+)
+
+
 # ---- tool-payload parsing (malformed input -> soft error verdict, never a raise) --
 
 
@@ -673,8 +696,7 @@ class AgentSession:
 
     T2.1 built `start`, `run_phase`, `chat`, `close`, and `transcript_path` in full,
     plus the two-tool dispatch over the injected `sink`/`control` handlers. T2.4 adds
-    `request_repair` and `notify_amendment_outcome`. `triage` is diff-mode-only
-    (T3.1's scope, per architecture.md's Tasks section) and stays unbuilt.
+    `request_repair` and `notify_amendment_outcome`. T3.1 adds `triage`.
     """
 
     def __init__(
@@ -703,6 +725,12 @@ class AgentSession:
         # the drained turn.
         self._unresolved_amend_proposal = False
         self._awaiting_amend_complete = False
+        # T3.1: `triage`'s own remind-once-then-raise state, and the delta context
+        # `start` captures for `triage` to send later (the delta travels in the
+        # triage message, not at `start` time as a wire event -- agent.md).
+        self._triage_verdict_received = False
+        self._delta_files: tuple[str, ...] = ()
+        self._patch_text = ""
 
     def start(self, mode: RunMode, context: RunContext) -> None:
         """Handshake, then configure the client for this run.
@@ -714,6 +742,8 @@ class AgentSession:
         """
         self._current_driving_call = "start"
         self._current_phase = None
+        self._delta_files = context.delta_files
+        self._patch_text = context.patch_text
         result = self._call_client(self._client.handshake)
         if not result.ready:
             # Close proactively: unlike an `AgentSessionError` (whose every raise
@@ -750,6 +780,44 @@ class AgentSession:
                 "delta_files": list(context.delta_files),
                 "patch_text": context.patch_text,
             },
+        )
+
+    def triage(self) -> None:
+        """Diff mode's first step (agent.md, R18): send the effective delta's file
+        list and patch text -- captured from `RunContext` at `start`, never in a
+        phase prompt -- plus the verdict contract, then drain the turn. Returns
+        once an `affected_verdict` or `no_impact` conclusion has been *accepted*
+        by the injected run-control handler during the turn; reminds once via a
+        follow-up message when a turn ends without one, then raises
+        `AgentSessionError` after a second verdict-less turn -- the same
+        remind-once-then-raise shape `request_repair` uses for `amend_complete`.
+        A *rejected* run_control call (e.g. a `no_impact` bounced back because
+        seeded phases still need work) does not count as arrived: the model's
+        turn is expected to continue with another attempt, and only an accepted
+        verdict flips `_triage_verdict_received` (set in `_dispatch_run_control`).
+        """
+        self._current_driving_call = "triage"
+        self._current_phase = None
+        self._triage_verdict_received = False
+        self._send(
+            {
+                "type": "triage",
+                "delta_files": list(self._delta_files),
+                "patch_text": self._patch_text,
+                "text": _TRIAGE_MESSAGE,
+            }
+        )
+        self._drain_turn()
+        if self._triage_verdict_received:
+            return
+        self._send({"type": "triage_reminder", "text": _TRIAGE_REMINDER})
+        self._drain_turn()
+        if self._triage_verdict_received:
+            return
+        self._raise_error(
+            "triage turn ended without an accepted affected_verdict or no_impact "
+            "verdict after a reminder",
+            False,
         )
 
     def run_phase(self, phase: Phase) -> None:
@@ -1022,4 +1090,9 @@ class AgentSession:
             elif call.action is RunControlAction.AMEND_COMPLETE:
                 self._unresolved_amend_proposal = False
                 self._awaiting_amend_complete = False
+            elif call.action in (
+                RunControlAction.AFFECTED_VERDICT,
+                RunControlAction.NO_IMPACT,
+            ):
+                self._triage_verdict_received = True
         return {"ok": verdict.ok, "message": verdict.message}

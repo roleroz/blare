@@ -1,8 +1,7 @@
 """Unit tests for blare.cli: T1.1's parse_args/main wiring and error/summary/notice
 rendering, T2.3's checkpoint screen and the chat loop (`show_chat_reply`, kind-aware
 for every `PromptKind`), and the full `RunSummary` rendering (entry counts, gap
-counts); T2.4's `present_amendment` screen. `present_no_impact` stays stubbed
-(T3.1's view)."""
+counts); T2.4's `present_amendment` screen; T3.1's `present_no_impact` screen."""
 
 from __future__ import annotations
 
@@ -24,6 +23,7 @@ from blare.orchestrator import (
     CheckpointView,
     EntryChange,
     EntryCounts,
+    NoImpactView,
     Presenter,
     PromptKind,
     Reject,
@@ -638,3 +638,66 @@ def test_failure_show_chat_reply_kind_none_render_swallows_os_error() -> None:
 
     presenter = TerminalPresenter(io.StringIO(), _OSErrorStream(), io.StringIO())
     assert presenter.show_chat_reply("x", None) is None
+
+
+# ==== present_no_impact (T3.1) ======================================================
+
+
+def _fixed_no_impact_view() -> NoImpactView:
+    """One fixed `NoImpactView` for byte-exact rendering assertions."""
+    return NoImpactView(
+        delta_file_count=2,
+        delta_files=("src/web.py", "src/worker.py"),
+        conclusion="Both changes are comments-only; no artifact updates needed.",
+    )
+
+
+_FIXED_NO_IMPACT_LINES = (
+    "no changes needed",
+    "",
+    "2 file(s) changed:",
+    "  src/web.py",
+    "  src/worker.py",
+    "",
+    "Both changes are comments-only; no artifact updates needed.",
+    "$ approve · abort · anything else is chat",
+)
+
+
+def test_contract_no_impact_screen_renders_byte_exact() -> None:
+    """No-impact screen: header, changed-file summary, conclusion text, checkpoint
+    prompt -- asserted byte-exact for a fixed view (cli.md)."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+
+    reply = presenter.present_no_impact(_fixed_no_impact_view())
+
+    assert reply == Approve()
+    expected = "".join(line + "\n" for line in _FIXED_NO_IMPACT_LINES)
+    assert stdout.getvalue() == expected
+
+
+def test_contract_no_impact_replies_per_checkpoint_convention() -> None:
+    """Replies at the no-impact confirmation follow the same reserved-word
+    convention as an ordinary checkpoint (cli.md: "replies per the checkpoint
+    convention")."""
+    presenter = TerminalPresenter(io.StringIO("abort\n"), io.StringIO(), io.StringIO())
+    assert presenter.present_no_impact(_fixed_no_impact_view()) == Abort()
+
+    presenter = TerminalPresenter(
+        io.StringIO("what about worker.py?\n"), io.StringIO(), io.StringIO()
+    )
+    assert presenter.present_no_impact(_fixed_no_impact_view()) == Chat("what about worker.py?")
+
+
+def test_failure_present_no_impact_stdout_broken_pipe_is_abort() -> None:
+    """A `BrokenPipeError` rendering the no-impact view (a reply-pending method)
+    returns `Abort` rather than raising."""
+    presenter = TerminalPresenter(io.StringIO("approve\n"), _BrokenPipeStream(), io.StringIO())
+    assert presenter.present_no_impact(_fixed_no_impact_view()) == Abort()
+
+
+def test_failure_present_no_impact_stdin_eof_is_abort() -> None:
+    """stdin EOF at the no-impact confirmation's prompt returns `Abort`."""
+    presenter = TerminalPresenter(_RaisingStream(EOFError()), io.StringIO(), io.StringIO())
+    assert presenter.present_no_impact(_fixed_no_impact_view()) == Abort()

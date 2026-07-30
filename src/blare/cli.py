@@ -4,10 +4,11 @@ T1.1 built `parse_args`, `main`, and `error`/`summary`/`notice`/`is_interactive`
 T2.3 built the rest of `cli.md`'s presenter contract: `present_checkpoint`, the
 chat loop's `show_chat_reply` (kind-aware for every `PromptKind`, including the
 amendment kinds -- it only needed the kind, never the amendment view itself), and
-`summary`'s full R13 content (entry counts, gap counts). T2.4 builds
+`summary`'s full R13 content (entry counts, gap counts). T2.4 built
 `present_amendment`: the amendment screen (origin line, one section per involved
-phase, the reply alphabet including `reject` when rejectable). `present_no_impact`
-stays stubbed (`NotImplementedError`): that view lands with T3.1.
+phase, the reply alphabet including `reject` when rejectable). T3.1 builds
+`present_no_impact`: the R18 no-impact screen (header, changed-file summary, the
+agent's conclusion text, then the ordinary checkpoint prompt).
 """
 
 from __future__ import annotations
@@ -130,8 +131,7 @@ def main(argv: list[str], run: orchestrator.RunFn = orchestrator.run) -> int:
 class TerminalPresenter:
     """Renders the orchestrator's reports and forwards what the user types.
 
-    Implements `orchestrator.Presenter` in full; `present_amendment` and
-    `present_no_impact` stay stubbed pending T2.4/T3.1's views.
+    Implements `orchestrator.Presenter` in full.
     """
 
     def __init__(self, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> None:
@@ -165,7 +165,15 @@ class TerminalPresenter:
         return reply
 
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
-        raise NotImplementedError("no-impact rendering lands in T3.1")
+        if not self._write_lines(self._stdout, self._no_impact_lines(view)):
+            return orchestrator.Abort()
+        reply = self._prompt_and_read(_CHECKPOINT_PROMPT, rejectable=False)
+        if reply is None:
+            return orchestrator.Abort()
+        assert not isinstance(reply, orchestrator.Reject), (
+            "reject is never reserved at the no-impact checkpoint prompt"
+        )
+        return reply
 
     def show_chat_reply(
         self, text: str, prompt: PromptKind | None
@@ -257,6 +265,14 @@ class TerminalPresenter:
                         lines.append(f"    {self._render_field(name, value)}")
             lines.append("")
         lines.append(self._gap_line(view.gap_counts))
+        return lines
+
+    def _no_impact_lines(self, view: NoImpactView) -> list[str]:
+        lines = ["no changes needed", "", f"{view.delta_file_count} file(s) changed:"]
+        for path in view.delta_files:
+            lines.append(f"  {path}")
+        lines.append("")
+        lines.append(view.conclusion)
         return lines
 
     def _render_field(self, name: str, value: str) -> str:

@@ -2,31 +2,42 @@
 
 T2.2 scope (`engineering/modules/orchestrator.md`): the full nine-step preflight
 sequence, the lock, the run log, and the exit-code taxonomy. Steps 5-6 (update-only:
-SHA ancestry, the R7 empty-delta short-circuit) are wired for real here but their e2e
-coverage is T3.x's.
+SHA ancestry, the R7 empty-delta short-circuit) are wired for real here; T3.1 supplies
+their e2e coverage alongside the rest of update mode.
 
 T2.3 scope: the analyze-mode phase engine -- four phases in order, each opening a
 phase, running it via `AgentSession.run_phase`, presenting a `CheckpointView` and
 looping chat to a terminal reply -- the final approval gate
 (`artifacts.semantic_violations`), and the write path (the R20 re-check, then the
-three write primitives in order, state last). Diff mode's post-preflight flow
-(triage, the phase engine over the R18-seeded queue) is unchanged from T2.2's
-placeholder tail -- that is T3.x's build.
+three write primitives in order, state last).
 
-T2.4 scope (this task): the amendment mechanism -- unit mechanics (agent-origin via
+T2.4 scope: the amendment mechanism -- unit mechanics (agent-origin via
 `amend_proposal`/`amend_complete`, system-origin from a failed approval gate), the
 frozen-only cascade (`artifacts.referencing_phases` union `semantic_violations`'s
 repair phases, restricted to frozen phases), the closure loop (`_advance_unit`,
 looping `AgentSession.request_repair` calls until a recompute adds nothing), one
 re-presentation per closure (`_present_amendment_once`), and outcome notification
-(`AgentSession.notify_amendment_outcome`). The final approval gate now opens a
-system-originated unit on a semantic violation instead of raising -- T2.3's
-`SemanticGateFailureError` placeholder is gone.
+(`AgentSession.notify_amendment_outcome`). The final approval gate opens a
+system-originated unit on a semantic violation instead of raising.
+
+T3.1 scope (this task): diff mode's post-preflight flow -- `AgentSession.triage`
+consumes the effective delta and answers with an `affected_verdict` (seeding the
+queue) or a `no_impact` conclusion (`_handle_affected_verdict`/`_handle_no_impact`);
+`_drain_phase_queue` runs exactly the queue's phases, in phase order, reusing
+`_run_checkpoint` and the amendment machinery rather than a parallel
+implementation; `_run_no_impact_checkpoint` presents the R18 no-impact
+confirmation; `_finalize_and_write` (the approval gate plus the write path,
+factored out of what was previously only the analyze tail) drains the queue
+again at the top of its own gate loop -- so a phase a gate-opened system unit
+leaves `open` (joined from `unvisited`) still gets its ordinary checkpoint
+before the write -- and is shared by both modes' final confirmation, which is
+what makes R18's SHA-only advance the *same*
+write path over an unchanged candidate rather than a separate one. Dynamic
+queue growth via a *revised* verdict or a load-seeded violation's repair is
+T3.2's build (architecture.md's Tasks section).
 
 The `Presenter` protocol below mirrors `cli.md`'s `TerminalPresenter` interface in
-full so `cli.TerminalPresenter` type-checks against it. `present_no_impact` has no
-caller yet (T3.1's view); every other method, `CheckpointView` and `AmendmentView`
-included, is exercised by the analyze phase engine.
+full so `cli.TerminalPresenter` type-checks against it.
 """
 
 from __future__ import annotations
@@ -187,7 +198,13 @@ class AmendmentView:
 
 @dataclass(frozen=True)
 class NoImpactView:
-    """The R18 no-impact conclusion's delta summary. Fields land with T3.1."""
+    """The R18 no-impact conclusion's delta summary and the agent's conclusion
+    text (T3.1; cli.md: "the delta summary from NoImpactView (changed-file count
+    and list), the agent's conclusion text")."""
+
+    delta_file_count: int
+    delta_files: tuple[str, ...]
+    conclusion: str
 
 
 @dataclass(frozen=True)
@@ -597,6 +614,17 @@ class _UnitHolder:
     current: _AmendmentUnit | None = None
 
 
+@dataclass
+class _NoImpactHolder:
+    """T3.1: the run's standing `no_impact` conclusion, if the control handler has
+    accepted one (`orchestrator.md`'s "No-impact flow (R18)"). `None` until
+    accepted; read by the update-mode driver right after `AgentSession.triage`
+    returns to decide whether to present the no-impact confirmation or run the
+    phase engine over the (then necessarily non-empty) queue."""
+
+    conclusion: str | None = None
+
+
 def _mark_phase_open(
     phase: Phase,
     phase_status: dict[Phase, _PhaseStatus],
@@ -744,6 +772,111 @@ def _handle_amend_complete(unit_holder: _UnitHolder) -> RunControlVerdict:
     return RunControlVerdict(ok=True, message="amend_complete acknowledged")
 
 
+def _handle_affected_verdict(
+    payload: Mapping[str, object],
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    log: _Log,
+) -> RunControlVerdict:
+    """`affected_verdict` (update mode; R18): seeds the queue with every named
+    phase that is still unvisited -- architecture.md's "a run-control verdict
+    marking an unvisited phase affected" -- via the same `_mark_phase_open` the
+    ordinary phase loop and the amendment mechanism both use, so a triage-seeded
+    phase's checkpoint baseline is captured exactly like an amendment-opened
+    ahead phase's. Total per orchestrator.md's run-control rules: a named phase
+    already open is a no-op acknowledgment; one already frozen is rejected,
+    directing the agent to `amend_proposal` instead; naming an unvisited phase
+    while a unit is open is rejected too (close the unit first -- unit tracking
+    stays free of concurrent non-unit openings)."""
+    phases_raw = payload.get("phases")
+    if not isinstance(phases_raw, list) or not phases_raw:
+        return RunControlVerdict(
+            ok=False, message="affected_verdict requires a non-empty 'phases' list"
+        )
+    try:
+        phases = [Phase(int(p)) for p in phases_raw]
+    except (ValueError, TypeError):
+        return RunControlVerdict(
+            ok=False, message=f"affected_verdict names invalid phase(s): {phases_raw!r}"
+        )
+    frozen_named = [
+        p for p in phases if phase_status.get(p, _PhaseStatus.UNVISITED) is _PhaseStatus.FROZEN
+    ]
+    if frozen_named:
+        names = ", ".join(str(int(p)) for p in sorted(frozen_named, key=int))
+        return RunControlVerdict(
+            ok=False,
+            message=(
+                f"phase(s) {names} are already frozen -- use amend_proposal to "
+                "reopen them instead of affected_verdict"
+            ),
+        )
+    unvisited_named = [
+        p for p in phases if phase_status.get(p, _PhaseStatus.UNVISITED) is _PhaseStatus.UNVISITED
+    ]
+    if unit_holder.current is not None and unvisited_named:
+        return RunControlVerdict(
+            ok=False,
+            message=(
+                "an amendment unit is open -- call amend_complete to close it "
+                "before revising the affected-phase verdict"
+            ),
+        )
+    for p in unvisited_named:
+        _mark_phase_open(p, phase_status, phase_baselines, holder)
+    log(
+        {
+            "event": "affected_verdict",
+            "phases": [int(p) for p in phases],
+            "opened": [int(p) for p in unvisited_named],
+        }
+    )
+    return RunControlVerdict(ok=True, message="phase(s) noted as affected")
+
+
+def _handle_no_impact(
+    payload: Mapping[str, object],
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    load_seeded_violations: list[Violation],
+    no_impact_holder: _NoImpactHolder,
+    log: _Log,
+) -> RunControlVerdict:
+    """`no_impact` (update mode; R18): accepted -- recording the conclusion for
+    the R18 confirmation the update driver presents once `triage` returns -- only
+    when no unit is open and the affected-phase queue is empty, where "empty"
+    counts both a triage-opened phase *and* a load-time semantic-violation seed
+    from preflight step 7 (orchestrator.md: "a no_impact conclusion with a
+    non-empty queue... is rejected back to the agent... the seeded phases still
+    need work"). Actually opening and repairing a load-seeded violation's phase
+    is T3.2's build; here the seed only has to make the queue non-empty for this
+    check."""
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning:
+        return RunControlVerdict(
+            ok=False, message="no_impact requires a non-empty 'reasoning' string"
+        )
+    if unit_holder.current is not None:
+        return RunControlVerdict(
+            ok=False,
+            message="an amendment unit is open -- call amend_complete to close it first",
+        )
+    queue_nonempty = any(status is _PhaseStatus.OPEN for status in phase_status.values())
+    if queue_nonempty or load_seeded_violations:
+        return RunControlVerdict(
+            ok=False,
+            message=(
+                "phase(s) are already queued and still need work -- address them "
+                "(or call affected_verdict) instead of concluding no impact"
+            ),
+        )
+    no_impact_holder.conclusion = reasoning
+    log({"event": "no_impact_accepted"})
+    return RunControlVerdict(ok=True, message="no-impact conclusion recorded")
+
+
 def _make_control_handler(
     mode: RunMode,
     phase_status: dict[Phase, _PhaseStatus],
@@ -751,12 +884,14 @@ def _make_control_handler(
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     holder: _CandidateHolder,
     log: _Log,
+    no_impact_holder: _NoImpactHolder,
+    load_seeded_violations: list[Violation],
 ) -> agent.RunControlHandler:
     """The run-control handler (architecture: Run-control channel). `amend_proposal`
-    and `amend_complete` are real (T2.4); `affected_verdict`/`no_impact` stay
-    rejected in analyze mode (diff-mode-only, R18) per the architecture's
-    "Run-control handling is total" rule: never a raise, always a verdict the model
-    can act on."""
+    and `amend_complete` are real (T2.4); `affected_verdict`/`no_impact` are real in
+    update mode (T3.1) and stay rejected in analyze mode (diff-mode-only, R18) per
+    the architecture's "Run-control handling is total" rule: never a raise, always
+    a verdict the model can act on."""
 
     def control(call: RunControlCall) -> RunControlVerdict:
         if call.action is RunControlAction.AMEND_PROPOSAL:
@@ -765,23 +900,37 @@ def _make_control_handler(
             )
         if call.action is RunControlAction.AMEND_COMPLETE:
             return _handle_amend_complete(unit_holder)
-        if mode is RunMode.ANALYZE and call.action in (
-            RunControlAction.AFFECTED_VERDICT,
-            RunControlAction.NO_IMPACT,
-        ):
-            return RunControlVerdict(
-                ok=False,
-                message=(
-                    f"{call.action.value} is a diff-mode verdict (R18); this is a "
-                    "full analysis run -- work through all four phases instead"
-                ),
+        if call.action is RunControlAction.AFFECTED_VERDICT:
+            if mode is RunMode.ANALYZE:
+                return RunControlVerdict(
+                    ok=False,
+                    message=(
+                        "affected_verdict is a diff-mode verdict (R18); this is a "
+                        "full analysis run -- work through all four phases instead"
+                    ),
+                )
+            return _handle_affected_verdict(
+                call.payload, phase_status, unit_holder, phase_baselines, holder, log
             )
-        return RunControlVerdict(
-            ok=False,
-            message=(
-                f"{call.action.value} is not supported in this build -- continue "
-                "proposing edits, or state your conclusion in free text at the checkpoint"
-            ),
+        if call.action is RunControlAction.NO_IMPACT:
+            if mode is RunMode.ANALYZE:
+                return RunControlVerdict(
+                    ok=False,
+                    message=(
+                        "no_impact is a diff-mode verdict (R18); this is a full "
+                        "analysis run -- work through all four phases instead"
+                    ),
+                )
+            return _handle_no_impact(
+                call.payload,
+                phase_status,
+                unit_holder,
+                load_seeded_violations,
+                no_impact_holder,
+                log,
+            )
+        return RunControlVerdict(  # pragma: no cover - every action handled above
+            ok=False, message=f"{call.action.value} is not a recognized run-control action"
         )
 
     return control
@@ -1091,7 +1240,14 @@ def _open_system_unit(
     """Open a system-originated unit for a failed approval gate (architecture:
     Amendment mechanism), naming every violation's repair phase. In analyze mode
     this only ever fires once every phase has already run (the gate's own
-    precondition), so every named phase is frozen, never unvisited."""
+    precondition), so every named phase is frozen, never unvisited. In update
+    mode (T3.1) this is no longer guaranteed: the queue can empty (and the gate
+    fire) with a phase still `unvisited` if no triage verdict or amendment ever
+    named it -- e.g. a load-seeded violation (step 7) whose repair phase the
+    model never named. `_finalize_and_write`'s own loop accounts for this: it
+    drains the phase queue again after this unit closes, so an unvisited-opened
+    phase still gets its ordinary checkpoint before the write, never only the
+    amendment's."""
     assert unit_holder.current is None
     unit = _AmendmentUnit(origin=AmendmentOrigin.SYSTEM, baseline=holder.current)
     for p in sorted({v.phase for v in violations}, key=int):
@@ -1257,6 +1413,198 @@ def _run_checkpoint(
         raise AssertionError(f"unexpected checkpoint reply {reply!r}")  # pragma: no cover
 
 
+def _run_no_impact_checkpoint(
+    session: agent.AgentSession,
+    presenter: Presenter,
+    view: NoImpactView,
+) -> None:
+    """Present the R18 no-impact conclusion as a checkpoint -- approve/abort/chat,
+    the same reply convention `_run_checkpoint` drives (cli.md: "replies per the
+    checkpoint convention"); raises `_AbortRun` on abort. T3.1's scope is this
+    basic loop; a mid-chat verdict or amend_proposal that withdraws the
+    conclusion (the "redirect") is T3.2's build (architecture.md's Tasks section
+    assigns "redirect at the no-impact confirmation" there, alongside the rest of
+    R18's dynamic clauses) -- this loop does not defer or moot the prompt, it
+    simply re-offers it after each chat exchange like an ordinary checkpoint.
+    Chat can still legally open a unit or a phase through the ordinary
+    run-control handlers during that exchange (run-control totality is not
+    scoped to this prompt); this function returning on `Approve` does not by
+    itself mean nothing was opened -- the caller re-checks `phase_status` and
+    `unit_holder` afterward and routes any such work through its own
+    presentation before writing, so a stale approval can never silently skip
+    it (see the call site in `_execute`)."""
+    reply: CheckpointReply | AmendmentReply | None = presenter.present_no_impact(view)
+    while True:
+        if isinstance(reply, Approve):
+            return
+        if isinstance(reply, Abort):
+            raise _AbortRun
+        if isinstance(reply, Chat):
+            chat_reply_text = session.chat(reply.text)
+            reply = presenter.show_chat_reply(chat_reply_text, PromptKind.NO_IMPACT)
+            assert reply is not None, (
+                "a no-impact prompt was given (not None); show_chat_reply must "
+                "re-offer it and return the next reply"
+            )
+            assert not isinstance(reply, Reject), (
+                "Reject is never returnable at the no-impact confirmation (cli.md)"
+            )
+            continue
+        raise AssertionError(f"unexpected no-impact reply {reply!r}")  # pragma: no cover
+
+
+def _drain_phase_queue(
+    session: agent.AgentSession,
+    presenter: Presenter,
+    holder: _CandidateHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    unit_holder: _UnitHolder,
+    log: _Log,
+) -> None:
+    """Run exactly the queue's phases, in phase order (T3.1; architecture: update
+    mode's phase engine over the R18-seeded queue) -- reusing the analyze phase
+    engine's own machinery (`_run_checkpoint`, the "resume any open unit before
+    proceeding" rule) rather than a parallel implementation. The queue is
+    re-read from `phase_status` at the top of every iteration rather than
+    snapshotted once after triage: a phase opened *mid-run* (an ahead phase
+    named by an agent-proposed amendment, or -- T3.2's build -- a revised
+    verdict) must still get its own ordinary checkpoint once the phases ahead of
+    it have been processed, "opening a phase for a repair never substitutes for
+    running it" (orchestrator.md) -- analyze mode gets this for free from its
+    fixed four-phase loop; update mode's queue is not fixed, so this loop
+    recomputes it instead. Returns once no phase is left `open` -- a no-op when
+    called with an already-empty queue, which is what lets `_finalize_and_write`
+    call this unconditionally from both modes (a no-op in analyze mode, where
+    the queue is always already empty by the time the gate runs)."""
+    while True:
+        queue = sorted((p for p in Phase if phase_status[p] is _PhaseStatus.OPEN), key=int)
+        if not queue:
+            return
+        phase = queue[0]
+        session.run_phase(phase)
+        log({"event": "phase_run", "phase": int(phase)})
+
+        if unit_holder.current is not None:
+            # orchestrator.md, Approval gate: any driving call returning with a
+            # unit open resumes it immediately before anything else proceeds.
+            _resolve_unit_to_presentation(
+                unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+            )
+
+        def _build_checkpoint_view(phase: Phase = phase) -> CheckpointView:
+            added, updated, removed = _phase_diff(phase, phase_baselines[phase], holder.current)
+            return CheckpointView(
+                phase=phase,
+                gap_counts=artifacts.gap_counts(holder.current),
+                added=added,
+                updated=updated,
+                removed=removed,
+            )
+
+        _run_checkpoint(
+            session, presenter, _build_checkpoint_view, unit_holder, phase_status,
+            phase_baselines, holder, log,
+        )
+        phase_status[phase] = _PhaseStatus.FROZEN
+        log({"event": "phase_frozen", "phase": int(phase)})
+
+
+def _finalize_and_write(
+    holder: _CandidateHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    session: agent.AgentSession,
+    presenter: Presenter,
+    log: _Log,
+    repo: gitrepo.GitRepo,
+    end_sha: str,
+    blare_root: Path,
+) -> None:
+    """Final confirmation (architecture: "the checkpoint approval at which the
+    phase queue is empty and the semantic check passes") and the write path
+    (orchestrator.md, Write path): the approval gate looped until *both* the
+    phase queue is empty *and* the semantic check passes -- a failure opens a
+    system-originated amendment unit, which can itself leave a phase `open`
+    (one it joined from `unvisited`, per `_open_system_unit`'s note); draining
+    the queue again at the top of every iteration is what gives that phase its
+    own ordinary checkpoint before the write, rather than only the amendment's
+    -- then the write-time re-check and the three write primitives in order,
+    state last. Shared by analyze's phase-4 checkpoint approval and update
+    mode's own final checkpoint (whichever queued phase's, or the no-impact
+    confirmation's): R18's SHA-only advance is this exact path run over an
+    unchanged candidate, not a separate code path. In analyze mode the queue
+    is always already empty here (its fixed four-phase loop guarantees it), so
+    draining it is a no-op there."""
+    while True:
+        _drain_phase_queue(
+            session, presenter, holder, phase_status, phase_baselines, unit_holder, log
+        )
+        violations = artifacts.semantic_violations(holder.current)
+        if not violations:
+            break
+        log(
+            {
+                "event": "gate_failed",
+                "violation_count": len(violations),
+                "kinds": [v.kind.value for v in violations],
+            }
+        )
+        _open_system_unit(violations, phase_status, unit_holder, phase_baselines, holder, log)
+        _resolve_unit_to_presentation(
+            unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+        )
+    log({"event": "gate_passed"})
+
+    if not repo.tree_matches(end_sha, ".blare"):
+        raise WriteTimeRecheckError(
+            cause=(
+                "the working tree outside .blare/ changed since this run started; "
+                "what was analyzed no longer matches the repository"
+            ),
+            next_action="Re-run blare against the current commit.",
+        )
+    if not artifacts.raw_bytes_match(blare_root, holder.current):
+        raise WriteTimeRecheckError(
+            cause="the canonical YAML under .blare/ changed since this run loaded it",
+            next_action="Re-run blare; do not hand-edit .blare/ during a run.",
+        )
+
+    def _do_write() -> None:
+        report = artifacts.write_entries_and_config(blare_root, holder.current)
+        log(
+            {
+                "event": "write_report",
+                "primitive": "write_entries_and_config",
+                "written": [str(p) for p in report.written],
+                "skipped": [str(p) for p in report.skipped],
+            }
+        )
+        report = artifacts.write_docs(blare_root, holder.current)
+        log(
+            {
+                "event": "write_report",
+                "primitive": "write_docs",
+                "written": [str(p) for p in report.written],
+                "skipped": [str(p) for p in report.skipped],
+            }
+        )
+        report = artifacts.write_state(blare_root, holder.current, end_sha)
+        log(
+            {
+                "event": "write_report",
+                "primitive": "write_state",
+                "written": [str(p) for p in report.written],
+                "skipped": [str(p) for p in report.skipped],
+            }
+        )
+
+    sigint_deferred = _write_with_sigint_masked(_do_write)
+    if sigint_deferred:
+        log({"event": "sigint_deferred_during_write"})
+
+
 # The four full-analysis phases, in run order (spec, Scope).
 _ANALYZE_PHASES: tuple[Phase, ...] = (
     Phase.SYSTEM_MAP,
@@ -1325,9 +1673,9 @@ def _log(run_state: _RunState, presenter: Presenter, event: dict[str, object]) -
         presenter.notice(f"could not write the run log at {run_state.run_log.path}: {exc}")
 
 
-# --- The nine-step preflight sequence, then the analyze phase engine and write
-# path (update mode still ends in T2.2's placeholder tail; see the mode check
-# below) ------------------------------------------------------------------------
+# --- The nine-step preflight sequence, then either mode's post-preflight flow:
+# update mode's triage-driven phase engine (T3.1), or analyze mode's fixed
+# four-phase engine (T2.3/T2.4); see the mode check below -----------------------
 
 
 def _execute(
@@ -1437,9 +1785,12 @@ def _execute(
         )
 
     # Step 7: semantic check on the loaded set -> violations seed the affected-phase
-    # queue (R18). T2.2 computes this (so the ordering rule "(7,8) semantic seeds
-    # never terminate the run" holds structurally) but nothing yet consumes the
-    # resulting queue -- the phase engine that would is T2.3/T2.4's build.
+    # queue (R18). Computed here so the ordering rule "(7,8) semantic seeds never
+    # terminate the run" holds structurally. In update mode this list also feeds
+    # `_handle_no_impact`'s queue-emptiness check below (T3.1): a no_impact
+    # conclusion is rejected while it is non-empty. Actually opening and driving
+    # repairs into these phases via `request_repair` is T3.2's build
+    # ("load-seeded violation repairs").
     violations = artifacts.semantic_violations(artifact_set)
     _log(
         run_state,
@@ -1472,12 +1823,20 @@ def _execute(
     phase_baselines: dict[Phase, artifacts.ArtifactSet] = {}
     unit_holder = _UnitHolder()
     sink = _make_sink(holder, phase_status, unit_holder)
+    # T3.1: the standing no_impact conclusion (if any) the control handler
+    # accepts, and step 7's semantic-violation seeds -- both feed the update
+    # driver's no-impact decision below (`violations` is step 7's own list,
+    # already computed above and untouched since; a later local reassignment of
+    # that name inside the analyze/update gate loops rebinds it, never mutates
+    # this list).
+    no_impact_holder = _NoImpactHolder()
 
     def _log_event(event: dict[str, object]) -> None:
         _log(run_state, presenter, event)
 
     control = _make_control_handler(
-        mode, phase_status, unit_holder, phase_baselines, holder, _log_event
+        mode, phase_status, unit_holder, phase_baselines, holder, _log_event,
+        no_impact_holder, violations,
     )
 
     transcript = _RealTranscriptWriter(
@@ -1509,13 +1868,96 @@ def _execute(
     run_state.transcript_path = transcript.path
     _log(run_state, presenter, {"event": "preflight_step", "step": 9, "detail": "auth_ready"})
 
-    if mode is not RunMode.ANALYZE:
-        # Diff mode's post-preflight flow (triage, the phase engine over the seeded
-        # queue) is T3.x's build; this placeholder tail is unchanged from T2.2.
-        session.close()
-        gaps = artifacts.gap_counts(artifact_set)
+    if mode is RunMode.UPDATE:
+        # --- T3.1: diff mode's post-preflight flow. AgentSession.triage seeds the
+        # queue (an affected_verdict) or concludes no_impact; the phase engine
+        # then runs exactly the seeded queue's phases, in phase order -- the same
+        # amendment/checkpoint machinery T2.3/T2.4 built for analyze mode, reused
+        # rather than reimplemented (`_drain_phase_queue`,
+        # `_run_checkpoint`). Final confirmation is either the last queued
+        # phase's ordinary checkpoint or the no-impact confirmation's approval
+        # (R18's SHA-only advance) -- both funnel into the same
+        # `_finalize_and_write` the analyze tail below uses. Wrapped exactly like
+        # analyze's own try/except/finally (see that block's comment for the
+        # abort/close rationale).
+        try:
+            session.triage()
+            _log(run_state, presenter, {"event": "triage_complete"})
+
+            if unit_holder.current is not None:
+                # agent.md lists `triage` among the driving calls whose return
+                # with a unit still open must resume it immediately
+                # (orchestrator.md, Approval gate).
+                _resolve_unit_to_presentation(
+                    unit_holder, phase_status, phase_baselines, holder, session, presenter,
+                    _log_event,
+                )
+
+            if no_impact_holder.conclusion is not None:
+                view = NoImpactView(
+                    delta_file_count=len(delta_files),
+                    delta_files=delta_files,
+                    conclusion=no_impact_holder.conclusion,
+                )
+                _run_no_impact_checkpoint(session, presenter, view)
+                # T3.1 does not build R18's full redirect UX (mooting the
+                # in-flight prompt via prompt=None, re-presenting the
+                # conclusion after a rejected unit -- T3.2's build). But
+                # approving what may now be a *stale* conclusion must never
+                # silently skip real review: chat during the confirmation can
+                # still open a unit or a phase through the ordinary
+                # run-control handlers, and those must go through their own
+                # checkpoint/amendment presentation before anything is
+                # written, exactly like every other path into
+                # `_finalize_and_write`. This is the same
+                # resume-then-run-the-queue sequence already used right after
+                # `triage()` returns, not a parallel mechanism.
+                if unit_holder.current is not None:
+                    _resolve_unit_to_presentation(
+                        unit_holder, phase_status, phase_baselines, holder, session, presenter,
+                        _log_event,
+                    )
+                # `_drain_phase_queue` is a no-op over an empty queue, so this
+                # unconditional call is exactly the guard it used to be,
+                # phrased the same way `_finalize_and_write` itself drains the
+                # queue at its own gate.
+                _drain_phase_queue(
+                    session, presenter, holder, phase_status, phase_baselines, unit_holder,
+                    _log_event,
+                )
+            else:
+                _drain_phase_queue(
+                    session, presenter, holder, phase_status, phase_baselines, unit_holder,
+                    _log_event,
+                )
+
+            _finalize_and_write(
+                holder, phase_status, unit_holder, phase_baselines, session, presenter,
+                _log_event, repo, end_sha, blare_root,
+            )
+        except _AbortRun:
+            counts = _overall_counts(artifact_set, holder.current)
+            presenter.summary(
+                RunSummary(
+                    outcome="aborted",
+                    transcript_path=transcript.path,
+                    gap_counts=artifacts.gap_counts(holder.current),
+                    entry_counts=counts,
+                    discarded=True,
+                )
+            )
+            return 3
+        finally:
+            session.close()
+
+        counts = _overall_counts(artifact_set, holder.current)
         presenter.summary(
-            RunSummary(outcome="no changes", transcript_path=transcript.path, gap_counts=gaps)
+            RunSummary(
+                outcome="update complete",
+                transcript_path=transcript.path,
+                gap_counts=artifacts.gap_counts(holder.current),
+                entry_counts=counts,
+            )
         )
         return 0
 
@@ -1567,86 +2009,14 @@ def _execute(
             phase_status[phase] = _PhaseStatus.FROZEN
             _log(run_state, presenter, {"event": "phase_frozen", "phase": int(phase)})
 
-        # Approval gate (orchestrator.md, Approval gate): every phase is frozen and
-        # no amendment unit is open, so this is final confirmation, gated on the
-        # semantic check -- looped, since approving a system-originated unit
-        # re-evaluates the gate, and a residual violation opens another one.
-        while True:
-            violations = artifacts.semantic_violations(holder.current)
-            if not violations:
-                break
-            _log(
-                run_state,
-                presenter,
-                {
-                    "event": "gate_failed",
-                    "violation_count": len(violations),
-                    "kinds": [v.kind.value for v in violations],
-                },
-            )
-            _open_system_unit(
-                violations, phase_status, unit_holder, phase_baselines, holder, _log_event
-            )
-            _resolve_unit_to_presentation(
-                unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                _log_event,
-            )
-        _log(run_state, presenter, {"event": "gate_passed"})
-
-        # Write path (R20): the write-time re-check, then the three write
-        # primitives in order, state last.
-        if not repo.tree_matches(end_sha, ".blare"):
-            raise WriteTimeRecheckError(
-                cause=(
-                    "the working tree outside .blare/ changed since this run started; "
-                    "what was analyzed no longer matches the repository"
-                ),
-                next_action="Re-run blare analyze against the current commit.",
-            )
-        if not artifacts.raw_bytes_match(blare_root, holder.current):
-            raise WriteTimeRecheckError(
-                cause="the canonical YAML under .blare/ changed since this run loaded it",
-                next_action="Re-run blare analyze; do not hand-edit .blare/ during a run.",
-            )
-
-        def _do_write() -> None:
-            report = artifacts.write_entries_and_config(blare_root, holder.current)
-            _log(
-                run_state,
-                presenter,
-                {
-                    "event": "write_report",
-                    "primitive": "write_entries_and_config",
-                    "written": [str(p) for p in report.written],
-                    "skipped": [str(p) for p in report.skipped],
-                },
-            )
-            report = artifacts.write_docs(blare_root, holder.current)
-            _log(
-                run_state,
-                presenter,
-                {
-                    "event": "write_report",
-                    "primitive": "write_docs",
-                    "written": [str(p) for p in report.written],
-                    "skipped": [str(p) for p in report.skipped],
-                },
-            )
-            report = artifacts.write_state(blare_root, holder.current, end_sha)
-            _log(
-                run_state,
-                presenter,
-                {
-                    "event": "write_report",
-                    "primitive": "write_state",
-                    "written": [str(p) for p in report.written],
-                    "skipped": [str(p) for p in report.skipped],
-                },
-            )
-
-        sigint_deferred = _write_with_sigint_masked(_do_write)
-        if sigint_deferred:
-            _log(run_state, presenter, {"event": "sigint_deferred_during_write"})
+        # Approval gate, write-time re-check, and the three write primitives in
+        # order, state last (orchestrator.md, Approval gate / Write path) --
+        # shared with update mode's own final checkpoint via `_finalize_and_write`
+        # (T3.1) rather than a duplicated implementation.
+        _finalize_and_write(
+            holder, phase_status, unit_holder, phase_baselines, session, presenter,
+            _log_event, repo, end_sha, blare_root,
+        )
     except _AbortRun:
         counts = _overall_counts(artifact_set, holder.current)
         presenter.summary(
