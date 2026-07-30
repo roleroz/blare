@@ -204,6 +204,12 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   repaired via `request_repair`
 - auth-failure handshake shape (R12) — captured by a dedicated logged-out release
   scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials
+- the minimal handshake fixture T1.1 hand-authored to reach session start
+  (`tests/fixtures/claude-sdk/handshake/handshake.jsonl`, marked provisional in the file):
+  a metadata line plus one `session_ready` handshake event, this task's own guess at the
+  format below; T2.1 may reshape it once the real SDK handshake shape is known — it
+  supersedes this entry rather than adding to the release-capture list, since the full
+  analyze-happy-path fixture (already listed above) subsumes a bare handshake
 
 The transport-error and rate/overload shapes are deliberately *not* fixture entries: both
 are typed exception classes of the pinned SDK, verified by unit tests importing those

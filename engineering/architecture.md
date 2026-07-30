@@ -211,7 +211,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T1 — Foundation
 
-- [ ] **T1.1 Walking skeleton**: Bazel workspace, pinned `requirements.txt`, package layout;
+- [x] **T1.1 Walking skeleton**: Bazel workspace, pinned `requirements.txt`, package layout;
   `blare` entry point wired cli → orchestrator → a stubbed SDK client through the fixture
   seam; the PTY e2e harness; two green e2e tests that together touch every wired layer —
   the R11 refusal (outside a git repository, exit 1), and a seam-through run in a minimal
