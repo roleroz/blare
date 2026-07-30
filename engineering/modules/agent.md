@@ -199,7 +199,9 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
 - update no-impact conclusion (R18), and its chat-redirected variant
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
   a behind-position phase
-- checkpoint chat that alters results (R2)
+- checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/analyze-checkpoint-chat/scenario.jsonl`; a release-suite
+  capture still supersedes it
 - agent-proposed amendment, approved; and rejected (restore)
 - amendment cascade: a unit spanning multiple phases, approved; and rejected as one unit
 - system-originated amendment (semantic violation at the approval gate)
@@ -210,13 +212,6 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   T2.2 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/auth-required/scenario.jsonl` for its R12 refusal e2e test;
   a release-suite capture still supersedes it
-- the minimal handshake fixture T1.1 hand-authored to reach session start
-  (`tests/fixtures/claude-sdk/handshake/scenario.jsonl`, renamed by T2.1 from
-  `handshake.jsonl` — a scenario is a whole session, not only a handshake; still marked
-  provisional in the file): a metadata line plus one `session_ready` handshake event; it
-  supersedes this entry rather than adding to the release-capture list, since the full
-  analyze-happy-path fixture (already listed above) subsumes a bare handshake
-
 The transport-error and rate/overload shapes are deliberately *not* fixture entries: both
 are typed exception classes of the pinned SDK, verified by unit tests importing those
 classes from the real package — the fakes script the SDK's own types, so there is no wire

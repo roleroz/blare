@@ -247,7 +247,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   refusal e2e tests one per criterion — R1's inverse refusal (orphaned canonical files)
   and R19's structural-validation refusal included. Traces: R11, R12, R17, R19, R21, R22,
   R23, R24, R13; R15's code lands here with its e2e in T3.2.
-- [ ] **T2.3 analyze happy path**: phase engine, checkpoints, cli presenter with the full
+- [x] **T2.3 analyze happy path**: phase engine, checkpoints, cli presenter with the full
   rendering rules, chat loop, final gate, write path with re-checks; e2e over replay
   fixtures: fresh analyze (R1), checkpoint interaction (R2), chains (R3), coverage and
   alerts (R4, R5), abort paths (R20), summaries (R13, R14), and derived-doc discipline
