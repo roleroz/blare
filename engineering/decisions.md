@@ -126,3 +126,34 @@ degrades more gracefully on very large codebases).
 **Why**: the amendment mechanism depends on cross-phase reasoning — phase 4 needs to see why
 phase 2 concluded what it did; the orchestrator/agent boundary is where per-phase sessions
 slot in later if context limits demand it.
+
+## 2026-07-29 — Checkpoint input: reserved words
+
+**Chosen**: at a checkpoint prompt, a line that is exactly `approve` or exactly `abort` acts;
+any other input is chat passed to the agent. The prompt names the two verbs.
+**Rejected**: slash commands (collision-free but adds syntax to a plain conversation); a keyed
+menu (unambiguous but modal, interrupting conversational flow).
+**Why**: the checkpoint is a conversation; two exact-match verbs keep it one, and the
+collision window is a single bare word.
+
+## 2026-07-29 — PromQL validation via the pinned promql-parser package
+
+**Chosen**: the Prometheus stack validates alert expressions with the `promql-parser` PyPI
+package (Rust promql-parser bindings), pinned in `requirements.txt`.
+**Rejected**: shelling out to `promtool check rules` (authoritative but a system binary
+outside requirements tracking, absent on most machines, version-drifty); internal sanity
+checks (weak enough to pass garbage, giving R4's language clause false confidence).
+**Why**: real grammar validation that stays hermetic and pinned; the lag behind upstream
+PromQL is acceptable for validating expressions Blare itself writes.
+
+## 2026-07-29 — Amendment approval re-freezes only previously frozen phases
+
+**Chosen**: amending the architecture's amendment mechanism: unit approval re-freezes
+exactly the phases that were frozen when the unit opened; a phase the unit opened from
+unvisited stays open, keeps its repairs as pending edits, and takes its ordinary checkpoint
+when the run reaches it.
+**Rejected**: the original wording, "approval re-freezes every involved phase" — for a
+named-unvisited phase (a system repair target) it would freeze a phase whose mandatory
+checkpoint never fired, letting repairs reach the write without the phase ever running.
+**Why**: discovered during the orchestrator design's review loop; opening a phase for a
+repair must never substitute for running it (R18's checkpoint requirement).

@@ -123,8 +123,11 @@ The spec assigns the exact `.blare/` layout to this document:
   recomputes references and invariants over the candidate set to find further invalidated
   frozen phases, which join the amendment and are re-opened in turn — blast radius is
   mechanical, never the agent's judgment. At closure the amendment's full changed set is
-  re-presented and approved or rejected as one unit (R2): approval re-freezes every involved
-  phase; rejection restores each one's pre-amendment results. A system-originated amendment
+  re-presented and approved or rejected as one unit (R2): approval re-freezes every phase
+  that was frozen when the unit opened, while a phase the unit opened from unvisited stays
+  open and takes its ordinary checkpoint when the run reaches it — opening a phase for a
+  repair never substitutes for running it; rejection restores each involved phase's
+  pre-amendment results. A system-originated amendment
   offers no rejection — rejecting the repair of an invariant violation would restore a
   violating set and livelock the approval gate; the user's options there are steering the
   repair through chat or aborting the run (R20, nothing written).
