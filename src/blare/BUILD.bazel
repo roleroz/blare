@@ -1,0 +1,101 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load("@rules_python//python:py_library.bzl", "py_library")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+py_library(
+    name = "blare_lib",
+    srcs = [
+        "__init__.py",
+        "agent.py",
+        "cli.py",
+        "gitrepo.py",
+        "model.py",
+        "orchestrator.py",
+    ],
+    imports = [".."],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "blare",
+    srcs = ["__main__.py"],
+    legacy_create_init = False,
+    main = "__main__.py",
+    visibility = ["//visibility:public"],
+    deps = [":blare_lib"],
+)
+
+py_test(
+    name = "test_model",
+    srcs = [
+        "test_model.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_model.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    deps = [
+        ":blare_lib",
+        "@pip//pytest_bazel",
+    ],
+)
+
+py_test(
+    name = "test_gitrepo",
+    srcs = [
+        "test_gitrepo.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_gitrepo.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    deps = [
+        ":blare_lib",
+        "@pip//pytest_bazel",
+    ],
+)
+
+py_test(
+    name = "test_agent",
+    srcs = [
+        "test_agent.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_agent.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    deps = [
+        ":blare_lib",
+        "@pip//pytest_bazel",
+    ],
+)
+
+py_test(
+    name = "test_orchestrator",
+    srcs = [
+        "test_orchestrator.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_orchestrator.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    deps = [
+        ":blare_lib",
+        "@pip//pytest_bazel",
+    ],
+)
+
+py_test(
+    name = "test_cli",
+    srcs = [
+        "test_cli.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_cli.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    deps = [
+        ":blare_lib",
+        "@pip//pytest_bazel",
+    ],
+)

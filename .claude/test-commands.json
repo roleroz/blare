@@ -1,0 +1,5 @@
+{
+  "fast": ".venv/bin/ruff check src tests pytest_main.py && .venv/bin/mypy --strict src tests pytest_main.py && bazel test --test_tag_filters=-e2e,-live //...",
+  "full": ".venv/bin/ruff check src tests pytest_main.py && .venv/bin/mypy --strict src tests pytest_main.py && bazel test --test_tag_filters=-live //...",
+  "release": "bazel test --test_tag_filters=live //..."
+}

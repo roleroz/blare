@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["bazel-*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+exclude = "^bazel-"
+
+[[tool.mypy.overrides]]
+# pytest_bazel ships no py.typed marker; python.runfiles is a Bazel-provided
+# source dependency (@rules_python//python/runfiles), not a pip package this
+# venv installs, so mypy can't resolve it outside a Bazel-driven run.
+module = ["pytest_bazel", "pytest_bazel.*", "python.runfiles", "python.runfiles.*"]
+ignore_missing_imports = true
