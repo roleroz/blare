@@ -3,29 +3,36 @@
 T2.2 scope (`engineering/modules/orchestrator.md`): the full nine-step preflight
 sequence, the lock, the run log, and the exit-code taxonomy. Steps 5-6 (update-only:
 SHA ancestry, the R7 empty-delta short-circuit) are wired for real here but their e2e
-coverage is T3.x's; step 7's semantic-violation seeding is computed here but nothing
-yet consumes the resulting queue (T2.3/T2.4's phase engine); the analyze/update
-happy-path phase engine, checkpoints, amendments, and the write path are NOT built
-here -- after preflight completes, this module still ends in a placeholder no-op
-summary (the same shape T1.1 established), superseded by T2.3.
+coverage is T3.x's.
+
+T2.3 scope (this task): the analyze-mode phase engine -- four phases in order, each
+opening a phase, running it via `AgentSession.run_phase`, presenting a
+`CheckpointView` and looping chat to a terminal reply -- the final approval gate
+(`artifacts.semantic_violations`), and the write path (the R20 re-check, then the
+three write primitives in order, state last). Diff mode's post-preflight flow
+(triage, the phase engine over the R18-seeded queue) is unchanged from T2.2's
+placeholder tail -- that is T3.x's build. The amendment mechanism (unit tracking,
+cascade, system-originated amendments' repair loop) is T2.4's build: a semantic
+violation at the final gate here raises `SemanticGateFailureError` rather than
+opening a repair unit, per this task's explicit scope boundary.
 
 The `Presenter` protocol below mirrors `cli.md`'s `TerminalPresenter` interface in
-full so `cli.TerminalPresenter` type-checks against it; only the methods this
-module's flow actually calls (`error`, `notice`, `summary`, `is_interactive`) have
-callers today. The view/reply types (`CheckpointView`, `AmendmentView`,
-`NoImpactView`, `CheckpointReply`, `AmendmentReply`, `PromptKind`) are placeholders
-whose fields land with the phase engine (T2.3/T2.4).
+full so `cli.TerminalPresenter` type-checks against it. `present_amendment` and
+`present_no_impact` have no caller yet (T2.4/T3.1's views); every other method,
+`CheckpointView` included, is exercised by the analyze phase engine.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as _dt
 import json
 import os
+import signal
 import traceback
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -36,7 +43,9 @@ from blare.model import (
     BatchVerdict,
     BlareError,
     EditBatch,
+    Phase,
     RunContext,
+    RunControlAction,
     RunControlCall,
     RunControlVerdict,
     RunMode,
@@ -51,6 +60,8 @@ __all__ = [
     "CheckpointReply",
     "CheckpointView",
     "DirtyWorkingTreeError",
+    "EntryChange",
+    "EntryCounts",
     "LockHeldError",
     "NoImpactView",
     "NonAncestorSHAError",
@@ -60,7 +71,9 @@ __all__ = [
     "Reject",
     "RunFn",
     "RunSummary",
+    "SemanticGateFailureError",
     "StateDirectoryError",
+    "WriteTimeRecheckError",
     "run",
 ]
 
@@ -101,8 +114,33 @@ class PromptKind(Enum):
 
 
 @dataclass(frozen=True)
+class EntryChange:
+    """One entry's content for checkpoint/amendment display (T2.3).
+
+    `fields` is an ordered `(field_name, rendered_value)` sequence built generically
+    from the entry's dataclass fields (`dataclasses.fields`, skipping the id field) so
+    this module never hardcodes per-entry-type formatting and cli never needs to import
+    artifacts' entry dataclasses to render them (architecture: cli -> orchestrator
+    only) -- it just prints the pairs it is handed.
+    """
+
+    entry_type: str
+    id: str
+    fields: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class CheckpointView:
-    """A phase's results at its checkpoint. Fields land with T2.3."""
+    """A phase's results at its checkpoint (T2.3): the entries that phase's edits
+    added/updated/removed since the phase opened, with their content, and the gap
+    summary over the whole candidate set (architecture: "phase, entries
+    added/updated/removed with their content, gap summary")."""
+
+    phase: Phase
+    gap_counts: artifacts.GapSummary
+    added: tuple[EntryChange, ...] = ()
+    updated: tuple[EntryChange, ...] = ()
+    removed: tuple[EntryChange, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -116,19 +154,32 @@ class NoImpactView:
 
 
 @dataclass(frozen=True)
+class EntryCounts:
+    """R13's exact entry-count split for a `RunSummary` (T2.3)."""
+
+    added: int
+    updated: int
+    removed: int
+
+
+@dataclass(frozen=True)
 class RunSummary:
     """What a run reports at its end (R13).
 
-    T2.2 populates `outcome`, `transcript_path`, and `gap_counts` -- the two
-    sessionless/placeholder endings this task builds (R7's up-to-date exit, and the
-    post-preflight placeholder) both have a real artifact set to count gaps over. The
-    entry-count split (added/updated/removed, or "discarded" at a non-writing ending)
-    has nothing to report until edits exist, so it lands with T2.3.
+    `entry_counts` is `None` only for the sessionless R7 up-to-date ending (cli.md:
+    "the sessionless R7-style summary renders 'no changes' with gap counts and no
+    transcript line"); every session-bearing ending (success, abort, failure) carries
+    real counts, even if all zero. `discarded` is true at a non-writing ending (abort,
+    or a post-preflight failure before the write completed) -- R20 guarantees nothing
+    landed, so the counts describe what was discarded, not applied (cli.md's rendering
+    rule).
     """
 
     outcome: str
     transcript_path: Path | None = None
     gap_counts: artifacts.GapSummary | None = None
+    entry_counts: EntryCounts | None = None
+    discarded: bool = False
 
 
 class Presenter(Protocol):
@@ -187,6 +238,26 @@ class NonInteractiveError(BlareError):
     """Step 8: stdin is not a TTY, so checkpoints cannot be presented (R22). Fires
     only once checkpoints would actually be needed -- after the R7 short-circuit and
     any earlier refusal, per the preflight's fail-fast ordering."""
+
+
+# --- Post-preflight errors (orchestrator.md: Approval gate, Write path) -------------
+
+
+class SemanticGateFailureError(BlareError):
+    """The final approval gate (orchestrator.md, Approval gate) found semantic-
+    invariant violations in the candidate set. Per architecture.md's Amendment
+    mechanism this should raise a system-originated amendment for the user to steer
+    (via chat) or abort -- building that repair loop is T2.4's task, out of this
+    task's scope. Rather than silently writing an invalid set or inventing amendment
+    machinery, this reports the violations found and fails the run (R20: nothing is
+    written before final confirmation, and this is never reached)."""
+
+
+class WriteTimeRecheckError(BlareError):
+    """R20's write-time re-check (orchestrator.md, Write path): the working tree
+    outside `.blare/` no longer matches the commit captured at run start, or the
+    canonical YAML no longer matches what this run loaded -- the repository changed
+    mid-run. Aborts before writing anything."""
 
 
 _R15_NEXT_ACTION = (
@@ -410,17 +481,236 @@ def _dispatch_artifacts(blare_root: Path, mode: RunMode) -> artifacts.ArtifactSe
     return artifacts.load(blare_root, mode)
 
 
-# --- Placeholder agent handlers (T2.2 never runs a phase, so neither is ever
-# actually called; the real sink/control handlers -- phase-state rule, artifacts'
-# content check -- land with T2.3's phase engine) -----------------------------------
+# --- Phase engine (T2.3): the pending edit set, the sink/control handlers, and
+# checkpoint-view rendering support ---------------------------------------------------
 
 
-def _noop_sink(batch: EditBatch) -> BatchVerdict:
-    return BatchVerdict(ok=True, message=None)
+class _PhaseStatus(Enum):
+    """A phase's state (architecture: "Phase states"). T2.3's analyze engine only
+    ever drives phases forward in order (unvisited -> open -> frozen); the amendment
+    mechanism that can re-open a frozen phase is T2.4's build."""
+
+    UNVISITED = "unvisited"
+    OPEN = "open"
+    FROZEN = "frozen"
 
 
-def _noop_control(call: RunControlCall) -> RunControlVerdict:
-    return RunControlVerdict(ok=True, message=None)
+@dataclass
+class _CandidateHolder:
+    """The run's one pending candidate `ArtifactSet`, mutated (by replacement -- the
+    field is reassigned, `apply` itself is pure) as accepted edit batches land. A
+    plain mutable holder rather than a nonlocal variable because the sink closure and
+    the phase loop both need to read and update the same cell."""
+
+    current: artifacts.ArtifactSet
+
+
+def _make_sink(
+    holder: _CandidateHolder, phase_status: dict[Phase, _PhaseStatus]
+) -> agent.EditSink:
+    """The edit sink (architecture: Edit-proposal protocol): enforces the phase-state
+    rule (this module's own), then artifacts' per-batch content check; an accepted
+    batch's candidate replaces the holder's current set."""
+
+    def sink(batch: EditBatch) -> BatchVerdict:
+        status = phase_status.get(batch.phase, _PhaseStatus.UNVISITED)
+        if status is not _PhaseStatus.OPEN:
+            return BatchVerdict(
+                ok=False,
+                message=(
+                    f"phase {batch.phase.value} is {status.value}, not open -- edits "
+                    "are only accepted for the currently open phase"
+                ),
+            )
+        verdict = artifacts.batch_check(holder.current, batch)
+        if not verdict.ok:
+            return verdict
+        holder.current = artifacts.apply(holder.current, batch)
+        return verdict
+
+    return sink
+
+
+def _make_control_handler(mode: RunMode) -> agent.RunControlHandler:
+    """The run-control handler (architecture: Run-control channel). T2.3's analyze
+    engine has no triage/no-impact verdicts to accept (diff-mode-only, R18) and no
+    amendment mechanism yet (T2.4) -- every call is rejected with a verdict naming
+    why, per the architecture's "Run-control handling is total" rule: never a raise,
+    always a verdict the model can act on."""
+
+    def control(call: RunControlCall) -> RunControlVerdict:
+        if mode is RunMode.ANALYZE and call.action in (
+            RunControlAction.AFFECTED_VERDICT,
+            RunControlAction.NO_IMPACT,
+        ):
+            return RunControlVerdict(
+                ok=False,
+                message=(
+                    f"{call.action.value} is a diff-mode verdict (R18); this is a "
+                    "full analysis run -- work through all four phases instead"
+                ),
+            )
+        return RunControlVerdict(
+            ok=False,
+            message=(
+                f"{call.action.value} is not supported in this build (the amendment "
+                "mechanism lands in a later task) -- continue proposing edits, or "
+                "state your conclusion in free text at the checkpoint"
+            ),
+        )
+
+    return control
+
+
+# Which entry-based `ArtifactSet` fields each phase owns, for checkpoint-view diffing
+# (architecture: "Each artifact belongs to the phase that produces it"). The coverage
+# mapping spans phases 3-4 by side (metric side / alert side) rather than by whole
+# entries, so it is deliberately not attributed to a single phase here and is not
+# shown in per-phase checkpoint sections -- its effect is already visible through the
+# gap-count summary every checkpoint carries.
+_PHASE_ENTRY_TYPES: dict[Phase, tuple[str, ...]] = {
+    Phase.SYSTEM_MAP: ("system_components",),
+    Phase.FAILURE_MODES: ("failure_modes",),
+    Phase.METRIC_COVERAGE: ("metrics", "metric_recommendations"),
+    Phase.ALERT_RECOMMENDATIONS: ("alert_recommendations",),
+}
+
+# Every entry-based field on `ArtifactSet`, for the run-level entry-count summary
+# (R13) -- unlike `_PHASE_ENTRY_TYPES` above, this includes "coverage" since the
+# overall count legitimately covers every entry Blare writes, mechanical or not.
+_ALL_ENTRY_TYPES: tuple[str, ...] = (
+    "system_components",
+    "failure_modes",
+    "metrics",
+    "metric_recommendations",
+    "alert_recommendations",
+    "coverage",
+)
+
+
+def _format_field_value(value: object) -> str:
+    """Render one entry field's value as display text -- generic over every entry
+    type's field shapes (str, bool, tuple of ids, or a str->str mapping), so this
+    module never special-cases a specific entry dataclass."""
+    if isinstance(value, tuple):
+        return ", ".join(str(item) for item in value) if value else "(none)"
+    if isinstance(value, Mapping):
+        rendered = ", ".join(f"{key}={val}" for key, val in value.items())
+        return rendered if rendered else "(none)"
+    return str(value)
+
+
+def _entry_change(entry_type: str, entry_id: str, entry: object) -> EntryChange:
+    """Build one `EntryChange` from an artifacts entry dataclass instance, via
+    `dataclasses.fields` rather than hardcoding each entry type's field names (so
+    cli, which renders these generically, never needs to import artifacts' entry
+    types -- architecture: cli -> orchestrator only)."""
+    rendered_fields: list[tuple[str, str]] = []
+    for entry_field in dataclasses.fields(entry):  # type: ignore[arg-type]
+        if entry_field.name in ("id", "failure_mode_id"):
+            continue
+        rendered_fields.append(
+            (entry_field.name, _format_field_value(getattr(entry, entry_field.name)))
+        )
+    return EntryChange(entry_type=entry_type, id=entry_id, fields=tuple(rendered_fields))
+
+
+def _phase_diff(
+    phase: Phase, baseline: artifacts.ArtifactSet, current: artifacts.ArtifactSet
+) -> tuple[tuple[EntryChange, ...], tuple[EntryChange, ...], tuple[EntryChange, ...]]:
+    """Added/updated/removed entries for `phase`'s owned entry type(s), comparing the
+    candidate as it stood when the phase opened (`baseline`) to `current` -- the
+    content a `CheckpointView` reports for that phase."""
+    added: list[EntryChange] = []
+    updated: list[EntryChange] = []
+    removed: list[EntryChange] = []
+    for entry_type in _PHASE_ENTRY_TYPES[phase]:
+        before: dict[str, object] = getattr(baseline, entry_type)
+        after: dict[str, object] = getattr(current, entry_type)
+        for entry_id in sorted(set(after) - set(before)):
+            added.append(_entry_change(entry_type, entry_id, after[entry_id]))
+        for entry_id in sorted(set(after) & set(before)):
+            if after[entry_id] != before[entry_id]:
+                updated.append(_entry_change(entry_type, entry_id, after[entry_id]))
+        for entry_id in sorted(set(before) - set(after)):
+            removed.append(_entry_change(entry_type, entry_id, before[entry_id]))
+    return tuple(added), tuple(updated), tuple(removed)
+
+
+def _overall_counts(
+    initial: artifacts.ArtifactSet, final: artifacts.ArtifactSet
+) -> EntryCounts:
+    """The whole-run entry-count split (R13) across every entry-based field, comparing
+    the set the run started from to its current candidate -- used for both the
+    write-path success summary and a discarded-edits summary at abort/failure."""
+    added = updated = removed = 0
+    for entry_type in _ALL_ENTRY_TYPES:
+        before: dict[str, object] = getattr(initial, entry_type)
+        after: dict[str, object] = getattr(final, entry_type)
+        added += len(set(after) - set(before))
+        removed += len(set(before) - set(after))
+        updated += sum(
+            1 for entry_id in set(after) & set(before) if after[entry_id] != before[entry_id]
+        )
+    return EntryCounts(added=added, updated=updated, removed=removed)
+
+
+def _run_checkpoint(
+    session: agent.AgentSession, presenter: Presenter, view: CheckpointView
+) -> bool:
+    """Present one checkpoint and drive its chat loop to a terminal reply (architecture:
+    "Checkpoint loop"). Returns `True` on approval, `False` on abort. The view is
+    presented exactly once; a `Chat` reply routes through `session.chat` and
+    `presenter.show_chat_reply`, which itself reads and returns the next reply -- the
+    view is never redrawn (cli.md)."""
+    reply: CheckpointReply | AmendmentReply | None = presenter.present_checkpoint(view)
+    while True:
+        if isinstance(reply, Approve):
+            return True
+        if isinstance(reply, Abort):
+            return False
+        if isinstance(reply, Chat):
+            chat_reply_text = session.chat(reply.text)
+            reply = presenter.show_chat_reply(chat_reply_text, PromptKind.CHECKPOINT)
+            assert reply is not None, (
+                "a checkpoint prompt was given (not None); show_chat_reply must "
+                "re-offer it and return the next reply"
+            )
+            assert not isinstance(reply, Reject), (
+                "Reject is only returnable at a rejectable-amendment continuation, "
+                "never at a plain checkpoint (cli.md)"
+            )
+            continue
+        raise AssertionError(f"unexpected checkpoint reply {reply!r}")  # pragma: no cover
+
+
+# The four full-analysis phases, in run order (spec, Scope).
+_ANALYZE_PHASES: tuple[Phase, ...] = (
+    Phase.SYSTEM_MAP,
+    Phase.FAILURE_MODES,
+    Phase.METRIC_COVERAGE,
+    Phase.ALERT_RECOMMENDATIONS,
+)
+
+
+def _write_with_sigint_masked(write: Callable[[], None]) -> bool:
+    """Run `write` (the three write primitives, in order) with SIGINT masked
+    (orchestrator.md, Write path: "SIGINT is masked from final confirmation until the
+    write completes"). Returns whether a SIGINT arrived during the window -- the
+    caller logs it, but the run is reported as what it is: completed, never aborted,
+    since honoring the signal here would contradict a write that already succeeded."""
+    deferred = False
+
+    def _defer(signum: int, frame: object) -> None:
+        nonlocal deferred
+        deferred = True
+
+    previous_handler = signal.signal(signal.SIGINT, _defer)
+    try:
+        write()
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+    return deferred
 
 
 # --- Run state (tracked across the try/except in `run()` for cleanup and the
@@ -440,6 +730,13 @@ class _RunState:
     # included) rather than the pre-session `aborted` notice, per orchestrator.md's
     # Error handling section.
     transcript_path: Path | None = None
+    # Set once the phase engine's pending edit set exists (T2.3): lets `run()`'s
+    # exception handler render a post-preflight failure's summary (discarded counts,
+    # gap counts) even though the failure unwound through an exception rather than a
+    # normal return (orchestrator.md, Error handling: "Every exit-2 session-bearing
+    # ending then renders the summary").
+    holder: _CandidateHolder | None = None
+    initial_set: artifacts.ArtifactSet | None = None
 
 
 def _log(run_state: _RunState, presenter: Presenter, event: dict[str, object]) -> None:
@@ -455,7 +752,9 @@ def _log(run_state: _RunState, presenter: Presenter, event: dict[str, object]) -
         presenter.notice(f"could not write the run log at {run_state.run_log.path}: {exc}")
 
 
-# --- The nine-step preflight sequence, plus the placeholder post-preflight ending --
+# --- The nine-step preflight sequence, then the analyze phase engine and write
+# path (update mode still ends in T2.2's placeholder tail; see the mode check
+# below) ------------------------------------------------------------------------
 
 
 def _execute(
@@ -586,15 +885,25 @@ def _execute(
 
     # Step 9: auth preflight via AgentSession.start (R12). This is also where the
     # transcript is first created -- runs ending before this point write no
-    # transcript (R14).
+    # transcript (R14). The pending edit set (holder/phase_status) and the real
+    # sink/control handlers are built here, before the session, since the session
+    # needs them at construction time regardless of mode; only ANALYZE mode's phase
+    # engine (below) actually drives phases through them in this task.
+    holder = _CandidateHolder(artifact_set)
+    run_state.holder = holder
+    run_state.initial_set = artifact_set
+    phase_status: dict[Phase, _PhaseStatus] = dict.fromkeys(Phase, _PhaseStatus.UNVISITED)
+    sink = _make_sink(holder, phase_status)
+    control = _make_control_handler(mode)
+
     transcript = _RealTranscriptWriter(
         state_dir / _TRANSCRIPTS_DIRNAME / f"{run_id}.jsonl"
     )
     client = agent.create_client()
     session = agent.AgentSession(
         client,
-        sink=_noop_sink,
-        control=_noop_control,
+        sink=sink,
+        control=control,
         stack=artifact_set.stack,
         transcript=transcript,
     )
@@ -616,14 +925,179 @@ def _execute(
     run_state.transcript_path = transcript.path
     _log(run_state, presenter, {"event": "preflight_step", "step": 9, "detail": "auth_ready"})
 
-    # --- Placeholder post-preflight ending (T1.1's pattern, extended with real gap
-    # counts): the phase engine, checkpoints, and the write path are T2.3 onward.
-    session.close()
-    gaps = artifacts.gap_counts(artifact_set)
+    if mode is not RunMode.ANALYZE:
+        # Diff mode's post-preflight flow (triage, the phase engine over the seeded
+        # queue) is T3.x's build; this placeholder tail is unchanged from T2.2.
+        session.close()
+        gaps = artifacts.gap_counts(artifact_set)
+        presenter.summary(
+            RunSummary(outcome="no changes", transcript_path=transcript.path, gap_counts=gaps)
+        )
+        return 0
+
+    # --- The analyze phase engine (T2.3): four phases in order, a checkpoint after
+    # each, the final approval gate, then the write path. Wrapped in try/finally so
+    # `session.close()` runs on every exit from here on -- approval, abort, or any
+    # exception (SemanticGateFailureError, WriteTimeRecheckError, a WriteError from
+    # a write primitive, or an AgentSessionError from the session itself) -- not
+    # only the approval and abort paths that used to close it explicitly. `close`
+    # is idempotent and safe after any error (agent.md), which is what makes an
+    # unconditional `finally` here correct rather than merely convenient.
+    try:
+        for phase in _ANALYZE_PHASES:
+            phase_status[phase] = _PhaseStatus.OPEN
+            baseline = holder.current
+            session.run_phase(phase)
+            _log(run_state, presenter, {"event": "phase_run", "phase": int(phase)})
+
+            added, updated, removed = _phase_diff(phase, baseline, holder.current)
+            view = CheckpointView(
+                phase=phase,
+                gap_counts=artifacts.gap_counts(holder.current),
+                added=added,
+                updated=updated,
+                removed=removed,
+            )
+            approved = _run_checkpoint(session, presenter, view)
+            if not approved:
+                counts = _overall_counts(artifact_set, holder.current)
+                presenter.summary(
+                    RunSummary(
+                        outcome="aborted",
+                        transcript_path=transcript.path,
+                        gap_counts=artifacts.gap_counts(holder.current),
+                        entry_counts=counts,
+                        discarded=True,
+                    )
+                )
+                return 3
+            phase_status[phase] = _PhaseStatus.FROZEN
+            _log(run_state, presenter, {"event": "phase_frozen", "phase": int(phase)})
+
+        # Approval gate (orchestrator.md, Approval gate): the queue is empty and no
+        # amendment unit is open (T2.3 never opens one), so this approval is final
+        # confirmation, gated on the semantic check.
+        violations = artifacts.semantic_violations(holder.current)
+        if violations:
+            described = "; ".join(
+                f"{violation.kind.value} ({', '.join(violation.entry_ids)})"
+                for violation in violations
+            )
+            raise SemanticGateFailureError(
+                cause=(
+                    "the final approval gate found semantic-invariant violations that "
+                    f"the amendment mechanism would ordinarily repair: {described}"
+                ),
+                next_action=(
+                    "This build does not yet implement automatic repair (a later task); "
+                    "adjust the run's guidance and re-run blare analyze."
+                ),
+            )
+        _log(run_state, presenter, {"event": "gate_passed"})
+
+        # Write path (R20): the write-time re-check, then the three write
+        # primitives in order, state last.
+        if not repo.tree_matches(end_sha, ".blare"):
+            raise WriteTimeRecheckError(
+                cause=(
+                    "the working tree outside .blare/ changed since this run started; "
+                    "what was analyzed no longer matches the repository"
+                ),
+                next_action="Re-run blare analyze against the current commit.",
+            )
+        if not artifacts.raw_bytes_match(blare_root, holder.current):
+            raise WriteTimeRecheckError(
+                cause="the canonical YAML under .blare/ changed since this run loaded it",
+                next_action="Re-run blare analyze; do not hand-edit .blare/ during a run.",
+            )
+
+        def _do_write() -> None:
+            report = artifacts.write_entries_and_config(blare_root, holder.current)
+            _log(
+                run_state,
+                presenter,
+                {
+                    "event": "write_report",
+                    "primitive": "write_entries_and_config",
+                    "written": [str(p) for p in report.written],
+                    "skipped": [str(p) for p in report.skipped],
+                },
+            )
+            report = artifacts.write_docs(blare_root, holder.current)
+            _log(
+                run_state,
+                presenter,
+                {
+                    "event": "write_report",
+                    "primitive": "write_docs",
+                    "written": [str(p) for p in report.written],
+                    "skipped": [str(p) for p in report.skipped],
+                },
+            )
+            report = artifacts.write_state(blare_root, holder.current, end_sha)
+            _log(
+                run_state,
+                presenter,
+                {
+                    "event": "write_report",
+                    "primitive": "write_state",
+                    "written": [str(p) for p in report.written],
+                    "skipped": [str(p) for p in report.skipped],
+                },
+            )
+
+        sigint_deferred = _write_with_sigint_masked(_do_write)
+        if sigint_deferred:
+            _log(run_state, presenter, {"event": "sigint_deferred_during_write"})
+    finally:
+        session.close()
+
+    counts = _overall_counts(artifact_set, holder.current)
     presenter.summary(
-        RunSummary(outcome="no changes", transcript_path=transcript.path, gap_counts=gaps)
+        RunSummary(
+            outcome="analysis complete",
+            transcript_path=transcript.path,
+            gap_counts=artifacts.gap_counts(holder.current),
+            entry_counts=counts,
+        )
     )
     return 0
+
+
+@dataclass(frozen=True)
+class _DiscardedSummaryFields:
+    """The three `RunSummary` fields `_discarded_summary_fields` computes, bundled so
+    its caller can splice them into a `RunSummary(...)` call without an untyped
+    `**dict` (which mypy --strict cannot check against the dataclass's field types)."""
+
+    gap_counts: artifacts.GapSummary | None
+    entry_counts: EntryCounts | None
+    discarded: bool
+
+
+def _discarded_summary_fields(run_state: _RunState) -> _DiscardedSummaryFields:
+    """`gap_counts`/`entry_counts`/`discarded=True` for a non-writing ending's summary
+    (abort or a post-preflight failure), when the phase engine had already built a
+    pending candidate to count -- absent otherwise (a pre-session ending has no
+    candidate and renders no summary at all, per the caller). Computing the counts
+    is best-effort: this runs from inside an exception handler already reporting a
+    failure or an abort (a `KeyboardInterrupt` included -- another one arriving while
+    merely computing diagnostic counts, e.g. a second signal, is exactly the kind of
+    second fault this must survive), and it must never itself crash that reporting
+    path or replace the original event with an unrelated one; it degrades to a bare
+    `discarded` summary instead. Catching `BaseException` rather than `Exception` is
+    deliberate here for that reason, not an oversight.
+    """
+    if run_state.holder is None or run_state.initial_set is None:
+        return _DiscardedSummaryFields(gap_counts=None, entry_counts=None, discarded=False)
+    try:
+        return _DiscardedSummaryFields(
+            gap_counts=artifacts.gap_counts(run_state.holder.current),
+            entry_counts=_overall_counts(run_state.initial_set, run_state.holder.current),
+            discarded=True,
+        )
+    except BaseException:  # noqa: BLE001 - best-effort diagnostic counts, never fatal here
+        return _DiscardedSummaryFields(gap_counts=None, entry_counts=None, discarded=True)
 
 
 def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
@@ -631,33 +1105,45 @@ def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
 
     Exit-code taxonomy (orchestrator.md), assigned by run stage, not by which module
     raised: `0` success (including R7 up-to-date); `1` refusal -- any `BlareError`
-    raised before preflight completes (step 9's auth check succeeding); `2` -- an
-    `BlareError` raised after preflight completes (none of T2.2's own code paths
-    produce one, since the post-preflight placeholder cannot fail this way, but the
-    stage-based check is written generally so T2.3's phase engine can raise into it
-    without this function changing shape) or any unexpected (non-`BlareError`)
-    exception, whatever stage it strikes (the architecture's non-module carve-out);
-    `3` a user abort (SIGINT). Argparse usage errors are cli's own carve-out, not
-    this function's concern.
+    raised before preflight completes (step 9's auth check succeeding); `2` -- a
+    `BlareError` raised after preflight completes (the analyze phase engine's own
+    `SemanticGateFailureError`/`WriteTimeRecheckError`, an `AgentSessionError` mid-
+    phase, or a `WriteError` from a write primitive all land here) or any
+    unexpected (non-`BlareError`) exception, whatever stage it strikes (the
+    architecture's non-module carve-out); `3` a user abort (SIGINT, or an `Abort`
+    reply at a checkpoint -- the phase engine returns 3 directly for the latter,
+    never via this exception handler). Argparse usage errors are cli's own
+    carve-out, not this function's concern.
 
-    T2.2 does not yet build checkpoints, so a SIGINT here is never a mid-checkpoint
-    abort (that variant, with discarded edit counts, needs a checkpoint to abort
-    *at* -- T2.3's build). Two variants still apply, distinguished by whether a
-    session had started (R14's own definition of "a session ran", step 9
-    succeeding): pre-session, rendered as a single `aborted` notice with no summary
-    and no error, since no artifacts or counts exist to summarize; and
-    session-bearing (a SIGINT during the placeholder tail after step 9), which
-    renders a summary naming the transcript path instead, per orchestrator.md:
-    "Abort exits 3, writing nothing (R20), the summary still naming the transcript
-    path (R14 -- a session ran)."
+    A SIGINT reaching this handler is distinguished by whether a session had
+    started (R14's own definition of "a session ran", step 9 succeeding):
+    pre-session, rendered as a single `aborted` notice with no summary and no
+    error, since no artifacts or counts exist to summarize; and session-bearing
+    (during preflight's step 9 auth call, or during the analyze phase engine
+    outside the write path's masked window -- see `_write_with_sigint_masked`),
+    which renders a summary naming the transcript path and, once the phase engine
+    has built a pending candidate, real discarded entry/gap counts (via
+    `_discarded_summary_fields`), per orchestrator.md: "Abort exits 3, writing
+    nothing (R20), the summary still naming the transcript path (R14 -- a session
+    ran)." A checkpoint reply of `Abort` is a distinct path from a SIGINT here: it
+    is handled inline in the phase engine (never raised as `KeyboardInterrupt`),
+    which is why this handler's own summary-building can only ever see the
+    SIGINT variant.
     """
     run_state = _RunState()
     try:
         return _execute(mode, repo_path, presenter, run_state)
     except KeyboardInterrupt:
         if run_state.transcript_path is not None:
+            fields = _discarded_summary_fields(run_state)
             presenter.summary(
-                RunSummary(outcome="aborted", transcript_path=run_state.transcript_path)
+                RunSummary(
+                    outcome="aborted",
+                    transcript_path=run_state.transcript_path,
+                    gap_counts=fields.gap_counts,
+                    entry_counts=fields.entry_counts,
+                    discarded=fields.discarded,
+                )
             )
         else:
             presenter.notice("aborted")
@@ -666,6 +1152,20 @@ def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
         presenter.error(cause=exc.cause, next_action=exc.next_action)
         stage = "failure" if run_state.preflight_complete else "refusal"
         _log(run_state, presenter, {"event": stage, "cause": exc.cause})
+        if run_state.preflight_complete:
+            # orchestrator.md, Error handling: "Every exit-2 session-bearing ending
+            # then renders the summary -- outcome failed, discarded counts,
+            # transcript path".
+            fields = _discarded_summary_fields(run_state)
+            presenter.summary(
+                RunSummary(
+                    outcome="failed",
+                    transcript_path=run_state.transcript_path,
+                    gap_counts=fields.gap_counts,
+                    entry_counts=fields.entry_counts,
+                    discarded=fields.discarded,
+                )
+            )
         return 2 if run_state.preflight_complete else 1
     except Exception as exc:  # noqa: BLE001 - the architecture's non-module carve-out
         detail = traceback.format_exc()

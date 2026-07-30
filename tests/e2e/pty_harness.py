@@ -2,10 +2,11 @@
 
 Checkpoints are interactive by spec (R22): stdin must be a TTY or Blare refuses
 before presenting any of them. A plain subprocess pipe makes stdin non-interactive,
-so e2e tests drive `blare` through a real pseudo-terminal instead. This harness is
-deliberately minimal — T1.1's two scenarios never reach a checkpoint prompt, so
-there is nothing here yet for scripted approve/abort/chat replies beyond a raw
-line send; the interactive scenarios T2.3 onward need extend this file.
+so e2e tests drive `blare` through a real pseudo-terminal instead. T1.1's two
+scenarios never reached a checkpoint prompt; T2.3 extends this file with
+`read_until` (wait for a specific line of output -- a phase header or the
+checkpoint prompt -- before sending the next scripted reply), which is what makes
+a genuinely interactive multi-checkpoint scenario drivable.
 """
 
 from __future__ import annotations
@@ -47,6 +48,38 @@ class PtyProcess:
     def send_line(self, line: str) -> None:
         """Write one line (with a trailing newline) to the process's stdin."""
         os.write(self._master_fd, (line + "\n").encode())
+
+    def read_until(self, pattern: str, occurrence: int = 1, timeout: float = 10.0) -> str:
+        """Block until `pattern` has appeared at least `occurrence` times in the
+        output read so far (counting from the start of this process's output, so
+        a pattern that repeats across checkpoints -- the prompt text itself -- can
+        still be waited on precisely by occurrence), returning that output.
+
+        Raises `TimeoutError` naming the output collected so far if `pattern`
+        never appears (whether because `timeout` elapsed or the process exited
+        first) -- this is a test-authoring aid, so a stuck scenario fails fast and
+        legibly rather than hanging until pytest's own timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            text = self._output.decode(errors="replace")
+            if text.count(pattern) >= occurrence:
+                return text
+            remaining = deadline - time.monotonic()
+            process_done = self._process.poll() is not None
+            if remaining <= 0 or process_done:
+                raise TimeoutError(
+                    f"pattern {pattern!r} (occurrence {occurrence}) did not appear "
+                    f"(process exited: {process_done}); output so far:\n{text}"
+                )
+            ready, _, _ = select.select([self._master_fd], [], [], min(remaining, 0.2))
+            if ready:
+                try:
+                    chunk = os.read(self._master_fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    self._output.extend(chunk)
 
     def read_all_until_exit(self, timeout: float = 10.0) -> PtyResult:
         """Drain output until the process exits, then return its exit code and output.

@@ -1,14 +1,16 @@
-"""Unit tests for blare.orchestrator (T2.2: the nine-step preflight sequence, the
-lock, the run log, and the exit-code taxonomy).
+"""Unit tests for blare.orchestrator: T2.2's nine-step preflight sequence, the lock,
+the run log, and the exit-code taxonomy; T2.3's phase engine, checkpoints, the
+approval gate, and the write path.
 
 Fakes per orchestrator.md's test plan: `FakeSDKClient` (a scripted `agent.SDKClient`
-stand-in) and `FakePresenter` (records what the orchestrator reports). gitrepo and
-artifacts are real, exercised over temporary git repositories -- matching the design
-doc's "gitrepo and artifacts are real, over temp repos".
+stand-in, used only by tests that exercise the real `agent.AgentSession`'s own auth
+handshake), `FakeAgentSession` (a scripted `agent.AgentSession` stand-in -- phase edit
+batches, chat replies -- for every test that needs the phase engine to actually run),
+and `FakePresenter` (scripted replies, records every `CheckpointView` presented).
+gitrepo and artifacts are real, exercised over temporary git repositories -- matching
+the design doc's "gitrepo and artifacts are real, over temp repos".
 
-The phase engine, checkpoints, amendments, and the write path are T2.3 onward and are
-not covered here; this file's scope is exactly the nine preflight steps (5-6 wired
-but their happy-path e2e coverage is T3.x's), the lock, the run log, and exit codes.
+Amendments (T2.4) and the diff-mode phase engine (T3.x) are out of this file's scope.
 """
 
 from __future__ import annotations
@@ -22,7 +24,18 @@ from pathlib import Path
 import pytest
 
 from blare import agent, artifacts, gitrepo, orchestrator
-from blare.model import RunMode
+from blare.model import (
+    BatchVerdict,
+    Edit,
+    EditBatch,
+    EditOp,
+    Phase,
+    RunContext,
+    RunControlAction,
+    RunControlCall,
+    RunControlVerdict,
+    RunMode,
+)
 from blare.orchestrator import (
     AmendmentReply,
     AmendmentView,
@@ -41,15 +54,27 @@ from blare.orchestrator import (
 
 @dataclass
 class FakePresenter:
-    """Records what the orchestrator reports; the unit-level stand-in for a TTY."""
+    """Records what the orchestrator reports; the unit-level stand-in for a TTY.
+
+    `checkpoint_replies` scripts `present_checkpoint`'s replies in order (defaulting
+    to auto-approve once exhausted, which is what every preflight-focused test
+    wants); `chat_reply_script` does the same for `show_chat_reply`.
+    """
 
     interactive: bool = True
     notices: list[str] = field(default_factory=list)
     errors: list[tuple[str, str, str | None]] = field(default_factory=list)
     summaries: list[RunSummary] = field(default_factory=list)
+    checkpoint_views: list[CheckpointView] = field(default_factory=list)
+    checkpoint_replies: list[CheckpointReply] = field(default_factory=list)
+    chat_reply_script: list[AmendmentReply | None] = field(default_factory=list)
+    chat_reply_calls: list[tuple[str, PromptKind | None]] = field(default_factory=list)
 
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
-        raise NotImplementedError
+        self.checkpoint_views.append(view)
+        if self.checkpoint_replies:
+            return self.checkpoint_replies.pop(0)
+        return orchestrator.Approve()
 
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply:
         raise NotImplementedError
@@ -60,7 +85,10 @@ class FakePresenter:
     def show_chat_reply(
         self, text: str, prompt: PromptKind | None
     ) -> AmendmentReply | None:
-        raise NotImplementedError
+        self.chat_reply_calls.append((text, prompt))
+        if self.chat_reply_script:
+            return self.chat_reply_script.pop(0)
+        return orchestrator.Approve()
 
     def notice(self, text: str) -> None:
         self.notices.append(text)
@@ -105,6 +133,146 @@ class FakeSDKClient:
 
     def close(self) -> None:
         pass
+
+
+@dataclass
+class FakeAgentSession:
+    """A scripted `agent.AgentSession` stand-in (orchestrator.md's test plan): drives
+    the *real* injected `sink`/`control` handlers (so the phase-state rule and
+    artifacts' content check are genuinely exercised) against scripted edit batches
+    and chat replies, rather than replaying real SDK wire events -- that full-stack
+    exercise is e2e's job. Trivial (no edits, no chat) by default, which is what
+    every preflight-focused test needs to reach a real completed run.
+
+    Constructed with the same keyword arguments `orchestrator._execute` passes to
+    `agent.AgentSession` (`sink`, `control`, `stack`, `transcript`), plus `client`
+    positionally, so a factory built from this class can replace `agent.AgentSession`
+    via `monkeypatch.setattr` transparently.
+    """
+
+    client: object
+    sink: agent.EditSink
+    control: agent.RunControlHandler
+    stack: object
+    transcript: object
+    edits_by_phase: dict[Phase, list[EditBatch]] = field(default_factory=dict)
+    chat_script: list[str] = field(default_factory=list)
+    # Scripted `run_control` calls to issue via the real control handler during a
+    # given phase's turn (orchestrator.md's test plan wants run-control totality
+    # exercised, even though analyze mode rejects every one of them today).
+    run_control_calls_by_phase: dict[Phase, list[RunControlCall]] = field(
+        default_factory=dict
+    )
+    # An exception to raise from `run_phase` for the named phase, simulating the
+    # agent session dying mid-phase (orchestrator.md's failure-mode test plan:
+    # "agent: AgentSessionError mid-phase").
+    raise_in_phase: dict[Phase, Exception] = field(default_factory=dict)
+    started_with: tuple[RunMode, RunContext] | None = field(default=None, init=False)
+    ran_phases: list[Phase] = field(default_factory=list, init=False)
+    chat_calls: list[str] = field(default_factory=list, init=False)
+    rejected_batches: list[BatchVerdict] = field(default_factory=list, init=False)
+    run_control_verdicts: list[RunControlVerdict] = field(default_factory=list, init=False)
+    closed: bool = field(default=False, init=False)
+
+    def start(self, mode: RunMode, context: RunContext) -> None:
+        # Mirrors the real `AgentSession.start`'s auth check (agent.md, R12) so tests
+        # that need an auth failure to fire *after* the phase-engine wiring exists
+        # still see it -- every other construction-time behavior (system prompt,
+        # tool registration) is real `AgentSession`'s own concern, not re-tested here.
+        result = self.client.handshake()  # type: ignore[attr-defined]
+        if not result.ready:
+            raise agent.AuthRequiredError(
+                cause="no Claude Code subscription login available",
+                next_action="Run `claude` and log in, then re-run blare.",
+            )
+        self.started_with = (mode, context)
+        self._write_transcript("outbound", {"type": "session_init", "mode": mode.value})
+
+    def run_phase(self, phase: Phase) -> None:
+        self.ran_phases.append(phase)
+        self._write_transcript("outbound", {"type": "phase_prompt", "phase": int(phase)})
+        if phase in self.raise_in_phase:
+            raise self.raise_in_phase[phase]
+        for batch in self.edits_by_phase.get(phase, []):
+            verdict = self.sink(batch)
+            if not verdict.ok:
+                self.rejected_batches.append(verdict)
+        for call in self.run_control_calls_by_phase.get(phase, []):
+            self.run_control_verdicts.append(self.control(call))
+        self._write_transcript("inbound", {"type": "turn_end"})
+
+    def chat(self, text: str) -> str:
+        self.chat_calls.append(text)
+        self._write_transcript("outbound", {"type": "chat", "text": text})
+        reply = self.chat_script.pop(0) if self.chat_script else ""
+        self._write_transcript("inbound", {"type": "text", "text": reply})
+        return reply
+
+    def _write_transcript(self, direction: str, event: dict[str, object]) -> None:
+        self.transcript.write_event(direction, event)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self.closed = True
+
+    @property
+    def transcript_path(self) -> Path:
+        return self.transcript.path  # type: ignore[attr-defined,no-any-return]
+
+    def triage(self) -> None:
+        raise NotImplementedError("analyze mode never calls triage")
+
+    def request_repair(self, phases: object, violations: object) -> None:
+        raise NotImplementedError("amendments are a later task's scope")
+
+    def notify_amendment_outcome(self, approved: bool, restored_phases: object) -> None:
+        raise NotImplementedError("amendments are a later task's scope")
+
+
+def _ready_session(
+    monkeypatch: pytest.MonkeyPatch,
+    ready: bool = True,
+    edits_by_phase: dict[Phase, list[EditBatch]] | None = None,
+    chat_script: list[str] | None = None,
+    run_control_calls_by_phase: dict[Phase, list[RunControlCall]] | None = None,
+    raise_in_phase: dict[Phase, Exception] | None = None,
+) -> list[FakeAgentSession]:
+    """Patch `agent.create_client` and `agent.AgentSession` so the phase engine runs
+    against a scripted `FakeAgentSession` instead of real SDK wire replay -- what
+    every test that needs preflight to reach a completed run (rather than merely
+    step 9's auth success) wants. Returns the list `FakeAgentSession` instances get
+    appended to as they are constructed (one per `orchestrator.run()` call), so a
+    test driving multiple runs can inspect each one afterward.
+    """
+    monkeypatch.setattr(agent, "create_client", lambda: FakeSDKClient(ready=ready))
+    scripted_edits = edits_by_phase or {}
+    scripted_chat = list(chat_script or [])
+    scripted_run_control = run_control_calls_by_phase or {}
+    scripted_raises = raise_in_phase or {}
+    sessions: list[FakeAgentSession] = []
+
+    def _factory(
+        client: object,
+        sink: agent.EditSink,
+        control: agent.RunControlHandler,
+        stack: object,
+        transcript: object,
+    ) -> FakeAgentSession:
+        session = FakeAgentSession(
+            client=client,
+            sink=sink,
+            control=control,
+            stack=stack,
+            transcript=transcript,
+            edits_by_phase=scripted_edits,
+            chat_script=list(scripted_chat),
+            run_control_calls_by_phase=scripted_run_control,
+            raise_in_phase=scripted_raises,
+        )
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(agent, "AgentSession", _factory)
+    return sessions
 
 
 # --- Repo-building helpers -----------------------------------------------------------
@@ -189,13 +357,14 @@ def repo_head(repo: Path) -> str:
 def test_contract_analyze_fresh_repo_reaches_session_and_exits_0(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A clean repo with no `.blare/` state: preflight completes, the session starts
-    and closes, and the placeholder summary carries real (zero) gap counts."""
+    """A clean repo with no `.blare/` state: preflight completes, all four phases run
+    (trivially, no edits scripted) and reach final confirmation, the write path
+    completes, and the summary carries real (zero) entry and gap counts (T2.3)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
     _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
     presenter = FakePresenter()
 
     code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
@@ -204,23 +373,31 @@ def test_contract_analyze_fresh_repo_reaches_session_and_exits_0(
     assert presenter.errors == []
     assert len(presenter.summaries) == 1
     summary = presenter.summaries[0]
-    assert summary.outcome == "no changes"
+    assert summary.outcome == "analysis complete"
     assert summary.transcript_path is not None
     assert summary.transcript_path.is_file()
     assert summary.gap_counts == artifacts.GapSummary(alertable=0, metric_gap=0, excluded=0)
+    assert summary.entry_counts == orchestrator.EntryCounts(added=0, updated=0, removed=0)
+    assert not summary.discarded
+    assert (_blare_root(repo) / "state.yaml").is_file()
+    assert (_blare_root(repo) / "config.yaml").is_file()
+    # Every checkpoint was presented and auto-approved, in phase order.
+    assert [view.phase for view in presenter.checkpoint_views] == list(Phase)
 
 
 def test_contract_analyze_over_existing_state_reaches_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R16: analyze with an existing, valid state file loads it (rather than
-    refusing per R1) and proceeds through preflight."""
+    """Analyze with an existing, valid state file loads it (rather than refusing
+    per R1) and proceeds through preflight and the (trivial, no-op) phase engine to
+    a completed run -- the mode-dispatch half of R16, not R16 itself: ID/byte
+    stability of edits against existing entries is T2.5's e2e scope."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
     _write_minimal_analyzed_state(repo, analyzed_sha=repo_head(repo))
     _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
     presenter = FakePresenter()
 
     code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
@@ -302,7 +479,7 @@ def test_contract_r11_dirty_confined_to_blare_never_blocks(
     (repo / ".blare").mkdir()
     (repo / ".blare" / "scratch.txt").write_text("stray\n")
     _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
     presenter = FakePresenter()
 
     code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
@@ -818,7 +995,7 @@ def test_contract_r21_reclaims_stale_lock_with_notice(
     repo.mkdir()
     _init_repo(repo)
     state_home = _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
     repo_id = gitrepo.GitRepo.discover(repo).repo_id()
     lock_dir = state_home / "blare" / repo_id
     lock_dir.mkdir(parents=True)
@@ -881,7 +1058,7 @@ def test_contract_lock_released_on_every_exit_path(
     repo.mkdir()
     _init_repo(repo)
     _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
 
     presenter1 = FakePresenter()
     assert orchestrator.run(RunMode.ANALYZE, repo, presenter1) == 0
@@ -941,16 +1118,18 @@ def test_contract_sigint_during_preflight_exits_3_with_aborted_notice(
 def test_contract_sigint_after_session_started_renders_summary_with_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A SIGINT after the session has started (post step 9, during the placeholder
-    tail) is a session-bearing abort: it renders a summary naming the transcript
-    path rather than the pre-session `aborted` notice (orchestrator.md, Error
-    handling: "the summary still naming the transcript path (R14 -- a session
-    ran)")."""
+    """A SIGINT after the session has started (post step 9, during the phase engine)
+    is a session-bearing abort: it renders a summary naming the transcript path
+    rather than the pre-session `aborted` notice (orchestrator.md, Error handling:
+    "the summary still naming the transcript path (R14 -- a session ran)"). The
+    gap-counts computation raising a second `KeyboardInterrupt` while the abort
+    summary is itself being built must not crash the run a second time (it degrades
+    to a bare "discarded" summary instead, per `_discarded_summary_fields`)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
     _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
 
     def _raise_sigint(*_a: object, **_k: object) -> artifacts.GapSummary:
         raise KeyboardInterrupt
@@ -966,6 +1145,7 @@ def test_contract_sigint_after_session_started_renders_summary_with_transcript(
     assert len(presenter.summaries) == 1
     assert presenter.summaries[0].outcome == "aborted"
     assert presenter.summaries[0].transcript_path is not None
+    assert presenter.summaries[0].discarded
 
 
 def test_contract_unexpected_exception_at_step1_exits_2_with_stderr_detail(
@@ -1037,7 +1217,7 @@ def test_contract_run_log_records_preflight_steps(
     repo.mkdir()
     _init_repo(repo)
     state_home = _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
     presenter = FakePresenter()
 
     code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
@@ -1067,7 +1247,7 @@ def test_failure_run_log_write_degrades_to_notice_and_run_continues(
     repo.mkdir()
     _init_repo(repo)
     _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
 
     original_start_run_log = orchestrator._start_run_log
 
@@ -1103,7 +1283,7 @@ def test_contract_contending_invocations_write_distinct_run_logs(
     repo.mkdir()
     _init_repo(repo)
     state_home = _isolate_state_home(monkeypatch, tmp_path)
-    _ready_client(monkeypatch)
+    _ready_session(monkeypatch)
     repo_id = gitrepo.GitRepo.discover(repo).repo_id()
     lock_dir = state_home / "blare" / repo_id
     lock_dir.mkdir(parents=True)
@@ -1121,6 +1301,446 @@ def test_contract_contending_invocations_write_distinct_run_logs(
     logs = sorted(run_log_dir.glob("*.jsonl"))
     assert len(logs) == 2
     assert logs[0] != logs[1]
+
+
+# --- T2.3: the analyze phase engine, checkpoints, the approval gate, the write path --
+
+
+def _happy_path_edits() -> dict[Phase, list[EditBatch]]:
+    """A small, internally consistent artifact set spanning every T2.3 e2e criterion
+    in one script: a system map (R1), a failure-mode chain where a user-visible
+    failure is caused by a non-user-visible one (R3), an excluded failure mode and
+    an alertable one with a metric detecting it (R4, R5), and an alert recommendation
+    whose severity matches its failure mode and whose coverage linkage agrees."""
+    return {
+        Phase.SYSTEM_MAP: [
+            EditBatch(
+                phase=Phase.SYSTEM_MAP,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "system_components",
+                        {
+                            "id": "sm-web",
+                            "name": "web",
+                            "kind": "service",
+                            "description": "the web frontend",
+                            "depends_on": [],
+                        },
+                    ),
+                ),
+            )
+        ],
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "failure_modes",
+                        {
+                            "id": "fm-timeout",
+                            "title": "upstream timeout",
+                            "description": "a call to an upstream service times out",
+                            "severity": "warning",
+                            "user_visible": False,
+                            "caused_by": [],
+                            "coverage_status": "excluded",
+                            "exclusion_reason": "not independently detectable",
+                        },
+                    ),
+                    Edit(
+                        EditOp.ADD,
+                        "failure_modes",
+                        {
+                            "id": "fm-503",
+                            "title": "web returns 503",
+                            "description": "the web frontend serves 503s to users",
+                            "severity": "critical",
+                            "user_visible": True,
+                            "caused_by": ["fm-timeout"],
+                            "coverage_status": "alertable",
+                        },
+                    ),
+                ),
+            )
+        ],
+        Phase.METRIC_COVERAGE: [
+            EditBatch(
+                phase=Phase.METRIC_COVERAGE,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "metrics",
+                        {
+                            "id": "mx-errors",
+                            "name": "http_requests_total",
+                            "type": "counter",
+                            "labels": ["status"],
+                            "emitted_at": ["web/handler.go:10"],
+                            "description": "request count by status",
+                        },
+                    ),
+                    Edit(
+                        EditOp.UPDATE,
+                        "coverage",
+                        {"failure_mode_id": "fm-503", "detecting_metric_ids": ["mx-errors"]},
+                    ),
+                ),
+            )
+        ],
+        Phase.ALERT_RECOMMENDATIONS: [
+            EditBatch(
+                phase=Phase.ALERT_RECOMMENDATIONS,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "alert_recommendations",
+                        {
+                            "id": "ar-503",
+                            "name": "High503Rate",
+                            "expr": "up == 0",
+                            "for_duration": "5m",
+                            "severity": "critical",
+                            "failure_mode_ids": ["fm-503"],
+                            "annotations": {"summary": "s", "description": "d"},
+                        },
+                    ),
+                    Edit(
+                        EditOp.UPDATE,
+                        "coverage",
+                        {"failure_mode_id": "fm-503", "alert_ids": ["ar-503"]},
+                    ),
+                ),
+            )
+        ],
+    }
+
+
+def test_contract_analyze_happy_path_writes_full_artifact_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full analyze happy path: four checkpoints, all approved; the write path
+    writes the whole artifact set to disk (entries, derived docs, default config,
+    state last); exit 0; summary counts and gap counts are real."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert sessions[0].closed
+    summary = presenter.summaries[0]
+    assert summary.outcome == "analysis complete"
+    assert not summary.discarded
+    # 1 system component + 2 failure modes + 1 metric + 1 alert + 2 mechanically
+    # created coverage entries (one per failure mode) = 7 entries added overall.
+    assert summary.entry_counts == orchestrator.EntryCounts(added=7, updated=0, removed=0)
+    assert summary.gap_counts == artifacts.GapSummary(alertable=1, metric_gap=0, excluded=1)
+
+    root = _blare_root(repo)
+    loaded = artifacts.load(root, RunMode.ANALYZE)
+    assert set(loaded.system_components) == {"sm-web"}
+    assert set(loaded.failure_modes) == {"fm-timeout", "fm-503"}
+    assert loaded.failure_modes["fm-503"].caused_by == ("fm-timeout",)
+    assert set(loaded.metrics) == {"mx-errors"}
+    assert set(loaded.alert_recommendations) == {"ar-503"}
+    assert loaded.coverage["fm-503"].detecting_metric_ids == ("mx-errors",)
+    assert loaded.coverage["fm-503"].alert_ids == ("ar-503",)
+    assert artifacts.semantic_violations(loaded) == []
+    assert (root / "config.yaml").is_file()
+    for doc_name in (
+        "system-map.md",
+        "failure-modes.md",
+        "metrics.md",
+        "metric-recommendations.md",
+        "alert-recommendations.md",
+        "coverage.md",
+    ):
+        doc_path = root / "docs" / doc_name
+        assert doc_path.is_file()
+        assert doc_path.read_bytes().startswith(artifacts.GENERATED_DOC_HEADER.encode())
+
+
+def test_contract_checkpoint_chat_routes_to_session_and_represents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2: chat at a checkpoint routes the text through `AgentSession.chat`, the
+    reply renders via `show_chat_reply` (re-offering the same checkpoint prompt,
+    never redrawing the view), and approval after the chat exchange proceeds."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(monkeypatch, chat_script=["noted, nothing further to add"])
+    presenter = FakePresenter()
+    # Phase 1's checkpoint: chat first, then approve; phases 2-4 auto-approve.
+    presenter.checkpoint_replies = [orchestrator.Chat("what about auth?")]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert sessions[0].chat_calls == ["what about auth?"]
+    assert presenter.chat_reply_calls == [
+        ("noted, nothing further to add", PromptKind.CHECKPOINT)
+    ]
+    # Exactly one CheckpointView was presented for phase 1 (the view is not redrawn
+    # after chat -- cli.md); the run still reached all four phases.
+    assert [view.phase for view in presenter.checkpoint_views] == list(Phase)
+
+
+def test_contract_sink_rejects_batch_for_frozen_and_unvisited_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit sink enforces the phase-state rule (architecture: Edit-proposal
+    protocol): a batch tagged for an already-frozen phase, or for a phase not yet
+    open, is rejected -- never silently applied or crashing the run."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    stray_batch_for_frozen_phase = EditBatch(
+        phase=Phase.SYSTEM_MAP,
+        edits=(
+            Edit(
+                EditOp.ADD,
+                "system_components",
+                {
+                    "id": "sm-late",
+                    "name": "late",
+                    "kind": "service",
+                    "description": "proposed after phase 1 already froze",
+                    "depends_on": [],
+                },
+            ),
+        ),
+    )
+    stray_batch_for_unvisited_phase = EditBatch(
+        phase=Phase.ALERT_RECOMMENDATIONS,
+        edits=(
+            Edit(
+                EditOp.ADD,
+                "alert_recommendations",
+                {
+                    "id": "ar-early",
+                    "name": "TooEarly",
+                    "expr": "up == 0",
+                    "for_duration": "5m",
+                    "severity": "warning",
+                    "failure_mode_ids": [],
+                    "annotations": {"summary": "s", "description": "d"},
+                },
+            ),
+        ),
+    )
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase={
+            # Phase 2 tries both a frozen-phase batch (phase 1, already frozen by
+            # the time phase 2 runs) and an unvisited-phase batch (phase 4, not
+            # reached yet).
+            Phase.FAILURE_MODES: [stray_batch_for_frozen_phase, stray_batch_for_unvisited_phase],
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert len(session.rejected_batches) == 2
+    assert all(not verdict.ok for verdict in session.rejected_batches)
+    assert "not open" in (session.rejected_batches[0].message or "")
+    # Neither stray batch actually landed anywhere.
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.system_components == {}
+    assert loaded.alert_recommendations == {}
+
+
+def test_contract_abort_at_checkpoint_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R20: aborting at any checkpoint exits 3, writes nothing under `.blare/`, and
+    the summary names the transcript path with a discarded entry-count split."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    presenter = FakePresenter()
+    # Abort at phase 2's checkpoint (after phase 1 already froze with a real edit).
+    presenter.checkpoint_replies = [orchestrator.Approve(), orchestrator.Abort()]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 3
+    assert sessions[0].closed
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    assert not (_blare_root(repo) / "system-map.yaml").exists()
+    assert len(presenter.summaries) == 1
+    summary = presenter.summaries[0]
+    assert summary.outcome == "aborted"
+    assert summary.discarded
+    assert summary.transcript_path is not None
+    # Phases 1 and 2's edits (sm-web; fm-timeout, fm-503, plus their 2 mechanically
+    # created coverage entries) were proposed and accepted into the pending
+    # candidate before the abort at phase 2's checkpoint discarded all of it.
+    assert summary.entry_counts == orchestrator.EntryCounts(added=5, updated=0, removed=0)
+    # Only the first two phases ran before the abort.
+    assert [view.phase for view in presenter.checkpoint_views] == [
+        Phase.SYSTEM_MAP,
+        Phase.FAILURE_MODES,
+    ]
+
+
+def test_contract_gate_failure_reports_violations_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2.3's scoped boundary: a candidate that fails the final semantic gate (an
+    unmapped, non-excluded failure mode) is not silently written, nor is an
+    amendment invented -- the run fails clearly (exit 2), naming the violation, and
+    writes nothing (R20)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits_by_phase = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "failure_modes",
+                        {
+                            "id": "fm-unmapped",
+                            "title": "never gets an alert",
+                            "description": "left unmapped on purpose for this test",
+                            "severity": "warning",
+                            "user_visible": False,
+                            "caused_by": [],
+                            "coverage_status": "alertable",
+                        },
+                    ),
+                ),
+            )
+        ],
+    }
+    sessions = _ready_session(monkeypatch, edits_by_phase=edits_by_phase)
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 2
+    assert len(presenter.errors) == 1
+    cause, next_action, _detail = presenter.errors[0]
+    assert "unmapped_failure_mode" in cause
+    assert "fm-unmapped" in cause
+    assert next_action != ""
+    assert len(presenter.summaries) == 1
+    assert presenter.summaries[0].outcome == "failed"
+    assert presenter.summaries[0].discarded
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    # The session is closed on every exit from the phase engine, gate failures
+    # included -- not only the approval and abort paths (agent.md: `close` is
+    # idempotent and safe after any error, which only matters if it is actually
+    # called on every path).
+    assert sessions[0].closed
+
+
+def test_contract_sigint_during_write_completes_and_reports_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """orchestrator.md, Write path: SIGINT is masked during the write -- a real
+    signal arriving between primitives is deferred, the write completes, and the
+    run is reported as what it is: completed (exit 0), not aborted."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(monkeypatch)
+    presenter = FakePresenter()
+
+    original_write_docs = artifacts.write_docs
+
+    def _send_sigint_then_write(root: Path, s: artifacts.ArtifactSet) -> artifacts.WriteReport:
+        os.kill(os.getpid(), 2)  # signal.SIGINT, injected mid-write
+        return original_write_docs(root, s)
+
+    monkeypatch.setattr(artifacts, "write_docs", _send_sigint_then_write)
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    assert len(presenter.summaries) == 1
+    assert presenter.summaries[0].outcome == "analysis complete"
+    assert (_blare_root(repo) / "state.yaml").is_file()
+
+
+def test_contract_derived_doc_restored_at_final_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R10: a derived doc hand-edited *during a checkpoint pause of the same run* --
+    the single-run construction that dodges R1's inverse refusal, since nothing was
+    at that path when preflight's `init_inspection` ran -- is restored to the
+    canonical form of the final candidate at final confirmation."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    doc_path = _blare_root(repo) / "docs" / "system-map.md"
+
+    class _EditDuringPhase1(FakePresenter):
+        def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
+            if view.phase is Phase.SYSTEM_MAP:
+                doc_path.parent.mkdir(parents=True, exist_ok=True)
+                doc_path.write_text(
+                    artifacts.GENERATED_DOC_HEADER + "\nhand-edited during the pause\n"
+                )
+            return super().present_checkpoint(view)
+
+    presenter = _EditDuringPhase1()
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    restored = doc_path.read_bytes()
+    assert restored.startswith(artifacts.GENERATED_DOC_HEADER.encode())
+    assert b"hand-edited during the pause" not in restored
+    assert b"sm-web" in restored
+
+
+def test_contract_derived_doc_not_restored_on_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The abort variant of the same setup (R10, R20): nothing is written, so a
+    derived doc hand-edited mid-run survives exactly as edited."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    doc_path = _blare_root(repo) / "docs" / "system-map.md"
+    edited_content = artifacts.GENERATED_DOC_HEADER + "\nhand-edited during the pause\n"
+
+    class _EditThenAbort(FakePresenter):
+        def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
+            if view.phase is Phase.SYSTEM_MAP:
+                doc_path.parent.mkdir(parents=True, exist_ok=True)
+                doc_path.write_text(edited_content)
+                return orchestrator.Abort()
+            return super().present_checkpoint(view)
+
+    presenter = _EditThenAbort()
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 3
+    assert doc_path.read_text() == edited_content
+    assert not (_blare_root(repo) / "state.yaml").exists()
 
 
 # --- Failure-mode tests ---------------------------------------------------------------
@@ -1207,6 +1827,214 @@ def test_failure_agent_auth_required_exits_1(
     code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
 
     assert code == 1
+
+
+def test_failure_agent_session_error_mid_phase_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`AgentSessionError` raised mid-phase (the session dying) exits 2, `.blare/`
+    is untouched, and the transcript path is still printed (orchestrator.md's
+    failure-mode test plan: "agent: AgentSessionError mid-phase")."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        raise_in_phase={
+            Phase.FAILURE_MODES: agent.AgentSessionError(
+                cause="phase 2: transport error", next_action="Re-run blare."
+            )
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 2
+    cause, _next_action, _detail = presenter.errors[0]
+    assert "transport error" in cause
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    assert sessions[0].closed
+    assert len(presenter.summaries) == 1
+    assert presenter.summaries[0].outcome == "failed"
+    assert presenter.summaries[0].discarded
+    assert presenter.summaries[0].transcript_path is not None
+
+
+def test_failure_write_primitive_failure_mid_write_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write primitive raising partway through the write path (artifacts.md:
+    `WriteError` naming the failing file) exits 2, leaves `state.yaml` untouched on
+    disk (it is written last), and the reports already logged show what landed
+    before the failure (orchestrator.md's failure-mode test plan: "artifacts: ...
+    write failure mid-write (injected) -> exit 2, state file untouched on disk,
+    report shows what landed")."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    state_home = _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    presenter = FakePresenter()
+
+    def _raise(root: Path, s: artifacts.ArtifactSet) -> artifacts.WriteReport:
+        raise artifacts.WriteError(
+            cause=f"{root / 'docs'} could not be written (disk full)",
+            next_action="Check disk space, then re-run blare.",
+        )
+
+    monkeypatch.setattr(artifacts, "write_docs", _raise)
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 2
+    cause, _next_action, _detail = presenter.errors[0]
+    assert "could not be written" in cause
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    assert len(presenter.summaries) == 1
+    assert presenter.summaries[0].outcome == "failed"
+    assert presenter.summaries[0].discarded
+    assert sessions[0].closed
+
+    repo_id = gitrepo.GitRepo.discover(repo).repo_id()
+    run_log_dir = state_home / "blare" / repo_id / "runs"
+    [log_path] = list(run_log_dir.glob("*.jsonl"))
+    lines = [json.loads(line) for line in log_path.read_text().splitlines()]
+    write_reports = [entry for entry in lines if entry.get("event") == "write_report"]
+    # write_entries_and_config (the primitive before the one that raised) already
+    # logged its report -- "the reports collected so far" the design doc promises.
+    assert any(r["primitive"] == "write_entries_and_config" for r in write_reports)
+    assert not any(r["primitive"] == "write_state" for r in write_reports)
+
+
+def test_contract_write_recheck_aborts_on_mid_run_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R20's write-time re-check: a commit landing on the repo after the run
+    started (before final confirmation) aborts the write (exit 2), and nothing
+    under `.blare/` is created."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+
+    class _CommitDuringPhase1(FakePresenter):
+        def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
+            if view.phase is Phase.SYSTEM_MAP:
+                (repo / "README.md").write_text("changed after the run started\n")
+                _commit_all(repo, "a commit landing mid-run")
+            return super().present_checkpoint(view)
+
+    sessions = _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    presenter = _CommitDuringPhase1()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 2
+    cause, _next_action, _detail = presenter.errors[0]
+    assert "changed since this run started" in cause
+    assert not (_blare_root(repo)).exists()
+    assert sessions[0].closed
+
+
+def test_contract_write_recheck_aborts_on_mid_run_canonical_yaml_hand_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R20's write-time re-check: a hand edit to canonical YAML (not a derived doc)
+    landing mid-run aborts the write (exit 2), distinct from a derived-doc edit
+    (R10), which never aborts."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    canonical_path = _blare_root(repo) / "system-map.yaml"
+
+    class _HandEditCanonicalDuringPhase1(FakePresenter):
+        def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
+            if view.phase is Phase.SYSTEM_MAP:
+                # A fresh run's baseline has nothing at this path yet
+                # (`init_inspection` verified that); a file appearing here mid-run
+                # is exactly what `raw_bytes_match` must catch.
+                canonical_path.parent.mkdir(parents=True, exist_ok=True)
+                canonical_path.write_text("- id: sm-hand-edited\n")
+            return super().present_checkpoint(view)
+
+    sessions = _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    presenter = _HandEditCanonicalDuringPhase1()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 2
+    cause, _next_action, _detail = presenter.errors[0]
+    assert "canonical YAML" in cause
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    assert sessions[0].closed
+
+
+def test_contract_run_control_calls_reach_the_real_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run-control handling is total (architecture): every `run_control` action is
+    rejected with a verdict naming why, never a raise -- exercised here for each
+    action kind in analyze mode."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    calls = [
+        RunControlCall(action=RunControlAction.AFFECTED_VERDICT, payload={"phases": [1]}),
+        RunControlCall(action=RunControlAction.NO_IMPACT, payload={}),
+        RunControlCall(action=RunControlAction.AMEND_PROPOSAL, payload={"phases": [4]}),
+        RunControlCall(action=RunControlAction.AMEND_COMPLETE, payload={}),
+    ]
+    sessions = _ready_session(
+        monkeypatch, run_control_calls_by_phase={Phase.SYSTEM_MAP: calls}
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    verdicts = sessions[0].run_control_verdicts
+    assert len(verdicts) == 4
+    assert all(not v.ok for v in verdicts)
+    assert "diff-mode verdict" in (verdicts[0].message or "")
+    assert "diff-mode verdict" in (verdicts[1].message or "")
+    assert "not supported in this build" in (verdicts[2].message or "")
+    assert "not supported in this build" in (verdicts[3].message or "")
+
+
+def test_contract_checkpoint_view_carries_real_entry_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `CheckpointView` the phase engine builds from real `ArtifactSet` entries
+    (via `_phase_diff`/`_entry_change`) carries the actual added entry's id, type,
+    and fields -- not just a count -- for phase 1 and phase 2's chain (R3)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(monkeypatch, edits_by_phase=_happy_path_edits())
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    phase1_view, phase2_view = presenter.checkpoint_views[0], presenter.checkpoint_views[1]
+    assert len(phase1_view.added) == 1
+    added_component = phase1_view.added[0]
+    assert added_component.entry_type == "system_components"
+    assert added_component.id == "sm-web"
+    assert ("name", "web") in added_component.fields
+    assert ("kind", "service") in added_component.fields
+
+    added_failure_modes = {change.id: change for change in phase2_view.added}
+    assert set(added_failure_modes) == {"fm-timeout", "fm-503"}
+    assert ("caused_by", "fm-timeout") in added_failure_modes["fm-503"].fields
+    assert ("severity", "critical") in added_failure_modes["fm-503"].fields
+    assert not phase1_view.updated
+    assert not phase1_view.removed
 
 
 # --- Type re-exports sanity (nothing here calls these directly, but they must be

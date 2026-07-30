@@ -1,2 +1,0 @@
-{"capture_date": "2026-07-30", "sdk_version": "provisional-skeleton", "scenario": "handshake", "provisional": true}
-{"direction": "inbound", "event": {"type": "session_ready"}}

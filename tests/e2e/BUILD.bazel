@@ -25,6 +25,7 @@ py_test(
     srcs = [
         "__init__.py",
         "pty_harness.py",
+        "repo_fixtures.py",
         "test_seam_through.py",
         "//:pytest_main.py",
         "//tests:__init__.py",
@@ -32,12 +33,111 @@ py_test(
     args = ["$(location :test_seam_through.py)"],
     data = [
         "//src/blare:blare",
-        "//tests/fixtures/claude-sdk/handshake:scenario.jsonl",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
     tags = ["e2e"],
     deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_analyze_happy_path",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_analyze_happy_path.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_analyze_happy_path.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "//src/blare:blare_lib",
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_analyze_checkpoint_chat",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_analyze_checkpoint_chat.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_analyze_checkpoint_chat.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/analyze-checkpoint-chat:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_analyze_abort",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_analyze_abort.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_analyze_abort.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_analyze_derived_doc_discipline",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_analyze_derived_doc_discipline.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_analyze_derived_doc_discipline.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "//src/blare:blare_lib",
         "@pip//pytest_bazel",
         "@rules_python//python/runfiles",
     ],

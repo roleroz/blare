@@ -1,56 +1,55 @@
-"""e2e: a seam-through run reaching agent session start over a handshake-only
-replay fixture, exiting 0 with a placeholder no-op summary.
+"""e2e: a seam-through run over the analyze-happy-path replay fixture, driving all
+four checkpoints to a real completed run.
 
-Traces T1.1's e2e scope: "a seam-through run in a minimal temp repo with a
-handshake-only replay fixture that reaches session start and exits 0 with a
-placeholder no-op summary (skeleton behavior, superseded by T2.2/T2.3)".
+T1.1's own scenario here was a placeholder ("reaches session start and exits 0 with
+a placeholder no-op summary (skeleton behavior, superseded by T2.2/T2.3)"); this is
+that supersession -- the same wiring (cli -> orchestrator -> agent -> the fixture
+seam -> artifacts) now exercised all the way through the real phase engine and write
+path, which is a strictly stronger "does the wiring work" check than the placeholder
+it replaces.
 """
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from python.runfiles import Runfiles
 
-from tests.e2e.pty_harness import run_blare
+from tests.e2e.pty_harness import PtyProcess
+from tests.e2e.repo_fixtures import init_repo
+
+_CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
 
 
-def _init_minimal_repo(repo_dir: Path) -> None:
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "--quiet"], cwd=repo_dir, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True
-    )
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
-    (repo_dir / "README.md").write_text(
-        "minimal repo for the T1.1 seam-through e2e test\n"
-    )
-    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "--quiet", "-m", "initial commit"], cwd=repo_dir, check=True)
-
-
-def test_e2e_seam_through_reaches_session_start(tmp_path: Path) -> None:
-    """A run over a minimal git repo, seamed through to the replay client via a
-    handshake-only fixture, reaches session start and exits 0."""
+def test_e2e_seam_through_reaches_a_completed_run(tmp_path: Path) -> None:
+    """A run over a minimal git repo, seamed through to the replay client via the
+    analyze-happy-path fixture, drives all four checkpoints (approving each) and
+    exits 0 with a real completed-run summary."""
     runfiles = Runfiles.Create()
     assert runfiles is not None
     blare_bin = Path(runfiles.Rlocation("blare/src/blare/blare"))
     assert blare_bin.exists(), f"blare binary not found via Rlocation at {blare_bin}"
     fixture_file = Path(
-        runfiles.Rlocation("blare/tests/fixtures/claude-sdk/handshake/scenario.jsonl")
+        runfiles.Rlocation("blare/tests/fixtures/claude-sdk/analyze-happy-path/scenario.jsonl")
     )
-    assert fixture_file.exists(), f"handshake fixture not found via Rlocation at {fixture_file}"
+    assert fixture_file.exists(), f"analyze-happy-path fixture not found at {fixture_file}"
 
     repo_dir = tmp_path / "repo"
-    _init_minimal_repo(repo_dir)
+    init_repo(repo_dir)
 
-    result = run_blare(
-        blare_bin,
-        ["analyze"],
+    process = PtyProcess(
+        [str(blare_bin), "analyze"],
         cwd=repo_dir,
-        env={"BLARE_SDK_FIXTURES": f"replay:{fixture_file.parent}"},
+        env={
+            "BLARE_SDK_FIXTURES": f"replay:{fixture_file.parent}",
+            "XDG_STATE_HOME": str(tmp_path / "xdg"),
+        },
     )
+    for occurrence in (1, 2, 3, 4):
+        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
+        process.send_line("approve")
+    result = process.read_all_until_exit()
 
     assert result.exit_code == 0
-    assert "no changes" in result.output
+    assert "analysis complete" in result.output
+    assert (repo_dir / ".blare" / "state.yaml").is_file()
