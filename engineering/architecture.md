@@ -224,7 +224,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   `--no-renames` semantics, contract and failure tests (real git; stub executables). No e2e
   of its own: its behaviour surfaces end-to-end through T2.2's refusals and T3.1's deltas,
   so the done-criterion's e2e clause is satisfied by its design doc's test plan alone.
-- [ ] **T1.3 stack**: registry, `supported_stacks`, the Prometheus implementation with pinned
+- [x] **T1.3 stack**: registry, `supported_stacks`, the Prometheus implementation with pinned
   `promql-parser`, both hint fragments, both validators, rule shape; full test plan. No e2e
   of its own: it surfaces through T2.2's R23 refusals and T2.3's alert validation.
 - [ ] **T1.4 artifacts, read side**: schemas and entry types, `state_exists`,
