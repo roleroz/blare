@@ -206,9 +206,17 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
 - checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/analyze-checkpoint-chat/scenario.jsonl`; a release-suite
   capture still supersedes it
-- agent-proposed amendment, approved; and rejected (restore)
-- amendment cascade: a unit spanning multiple phases, approved; and rejected as one unit
-- system-originated amendment (semantic violation at the approval gate)
+- agent-proposed amendment, approved; and rejected (restore) — T2.4 hand-authored provisional
+  instances at `tests/fixtures/claude-sdk/amendment-agent-{approved,rejected}/scenario.jsonl`;
+  a release-suite capture still supersedes both
+- amendment cascade: a unit spanning multiple phases, approved; and rejected as one unit —
+  T2.4 hand-authored provisional instances at
+  `tests/fixtures/claude-sdk/amendment-cascade-{approved,rejected}/scenario.jsonl`; a
+  release-suite capture still supersedes both
+- system-originated amendment (semantic violation at the approval gate) — T2.4
+  hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/amendment-system/scenario.jsonl`; a release-suite capture
+  still supersedes it
 - update whose affected phases were seeded by a load-time semantic violation (R18),
   repaired via `request_repair`
 - auth-failure handshake shape (R12) — captured by a dedicated logged-out release
