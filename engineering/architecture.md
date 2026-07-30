@@ -277,5 +277,5 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   diff-mode redirect, the logged-out auth capture); captured fixtures replace the
   provisional set, and emptying that list is this task's definition of done, per the
   global rule that it gates the first release.
-- [ ] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
+- [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
