@@ -58,6 +58,15 @@ class AlertRuleInput:                            # stack-owned; artifacts maps i
 - `validate_expression` is consumed by **artifacts** (per-batch content check and the
   semantic tier's R4 language clause). It never raises for bad input — a verdict, not an
   exception; internal parser failures become a failing verdict carrying the parser message.
+  The Prometheus implementation additionally enforces a length precondition (5,000
+  characters) *before* invoking the parser: `promql-parser` 0.10.0 is a recursive-descent
+  parser whose native call stack overflows on sufficiently deep/long adversarial input
+  (nested parens, nested calls, long operator chains), segfaulting the interpreter rather
+  than raising — an uncatchable failure a Python `try` cannot turn into a verdict after
+  the fact. The cap sits with wide margin below the measured crash boundary (~6,875 levels
+  of paren nesting on the reference environment) and above any realistic legitimate
+  expression; rejections on this path carry a synthesized message, since the parser is
+  never invoked for input over the cap.
 - `validate_rule_fields` validates the stack-specific non-expression fields — for
   Prometheus: `for_duration` is a valid Prometheus duration, severity non-empty,
   `summary` and `description` annotation keys present — so a malformed duration cannot
@@ -91,9 +100,12 @@ rejected expression, visible to the agent as a tool verdict.
 
 ## Failure visibility
 
-Verdict messages carry the parser's own error text verbatim, so a rejected expression shows
-the user (and the model) exactly why. Nothing is logged directly; verdicts surface through
-the batch-check tool result and semantic-violation listings.
+Verdict messages carry the parser's own error text verbatim for every expression the parser
+actually sees, so a rejected expression shows the user (and the model) exactly why. The one
+exception is the length-cap precondition above: since the parser is never invoked for
+over-cap input, that rejection's message is synthesized (stating the length and the limit)
+rather than quoted from the parser. Nothing is logged directly; verdicts surface through the
+batch-check tool result and semantic-violation listings.
 
 ## Test plan
 
