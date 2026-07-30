@@ -32,7 +32,7 @@ py_test(
     args = ["$(location :test_seam_through.py)"],
     data = [
         "//src/blare:blare",
-        "//tests/fixtures/claude-sdk/handshake:handshake.jsonl",
+        "//tests/fixtures/claude-sdk/handshake:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",

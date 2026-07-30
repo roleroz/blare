@@ -68,11 +68,16 @@ py_test(
         "//:pytest_main.py",
     ],
     args = ["$(location :test_agent.py)"],
+    data = [
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
+    ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
     deps = [
         ":blare_lib",
+        "@pip//claude_agent_sdk",
         "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
     ],
 )
 

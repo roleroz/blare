@@ -38,7 +38,7 @@ def test_e2e_seam_through_reaches_session_start(tmp_path: Path) -> None:
     blare_bin = Path(runfiles.Rlocation("blare/src/blare/blare"))
     assert blare_bin.exists(), f"blare binary not found via Rlocation at {blare_bin}"
     fixture_file = Path(
-        runfiles.Rlocation("blare/tests/fixtures/claude-sdk/handshake/handshake.jsonl")
+        runfiles.Rlocation("blare/tests/fixtures/claude-sdk/handshake/scenario.jsonl")
     )
     assert fixture_file.exists(), f"handshake fixture not found via Rlocation at {fixture_file}"
 

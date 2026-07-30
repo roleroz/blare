@@ -63,12 +63,33 @@ class FakePresenter:
 @dataclass
 class FakeSDKClient:
     """A scripted SDKClient stand-in for orchestrator-level tests (agent.md's
-    replay client itself is exercised in test_agent.py)."""
+    replay client itself is exercised in test_agent.py). The seam-through flow only
+    ever calls `handshake`/`configure_worktree_root`/`configure_session`/`close` (it
+    never runs a phase), but all `agent.SDKClient` methods are implemented so this
+    fake type-checks against the full protocol."""
 
     ready: bool
 
     def handshake(self) -> agent.HandshakeResult:
         return agent.HandshakeResult(ready=self.ready)
+
+    def configure_worktree_root(self, root: Path) -> None:
+        pass
+
+    def configure_session(
+        self,
+        mode: RunMode,
+        system_prompt: str,
+        tools: tuple[agent.ToolDefinition, ...],
+        disallowed_tools: tuple[str, ...],
+    ) -> None:
+        pass
+
+    def send(self, event: dict[str, object]) -> None:
+        raise NotImplementedError("the seam-through flow never sends a turn message")
+
+    def receive(self) -> dict[str, object]:
+        raise NotImplementedError("the seam-through flow never receives a turn message")
 
     def close(self) -> None:
         pass

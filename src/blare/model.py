@@ -6,19 +6,23 @@ stack) owns these types outright, and the dependency graph is one-directional
 Putting cross-cutting value types that more than one module needs to reference here
 avoids importing "downstream" modules into "upstream" ones just to name a type.
 
-This module currently holds what the T1.1 walking skeleton and T1.4's artifacts module
-need. `Phase` and `Violation` live here rather than in `artifacts.py` because **agent**
-also names them in its own interface (`request_repair(phases, violations)`,
-`engineering/modules/agent.md`) despite having no dependency edge on **artifacts** in the
-architecture's module graph (agent -> stack only) -- putting them in `artifacts.py` would
-force a disallowed agent -> artifacts import. Later tasks add the remaining shared types
-their design docs describe as those modules are built out.
+T1.1 added only what the walking skeleton needed (`RunMode`, `BlareError`). T1.4
+(artifacts) added `Phase` and `Violation`/`ViolationKind`: **agent** names them too
+(`request_repair(phases, violations)`, `engineering/modules/agent.md`) despite having no
+dependency edge on **artifacts** in the architecture's module graph (agent -> stack
+only), so putting them in `artifacts.py` would force a disallowed agent -> artifacts
+import. T2.1 (agent) added the edit-proposal and run-control payload/verdict types and
+`RunContext` — the same reasoning: this is the currency the agent module's injected
+sink/control handlers and `start` exchange with the orchestrator, none of which agent
+may get by importing artifacts or orchestrator directly. Later tasks add what remains as
+those modules are built out.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum, StrEnum
+from pathlib import Path
 
 
 class RunMode(Enum):
@@ -28,11 +32,14 @@ class RunMode(Enum):
     UPDATE = "update"
 
 
-class Phase(Enum):
-    """The four phases of a Blare run, in order (spec, Scope; architecture, Overview).
+class Phase(IntEnum):
+    """One of the four full-analysis phases (spec, Scope): system map, failure modes,
+    metric coverage, alert recommendations, in run order.
 
-    Values are the phase numbers themselves (1-4) so they sort and print naturally in
-    run summaries and checkpoint views.
+    An `IntEnum` rather than a plain `Enum`: `orchestrator.md`'s phase queue and
+    `artifacts.md`'s `referencing_phases`/`Violation.phase` all reason about phase order
+    and compare against bare phase numbers ("phase 3", "phase 4"), which an int-valued
+    enum supports directly.
     """
 
     SYSTEM_MAP = 1
@@ -88,6 +95,94 @@ class Violation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "phase", _REPAIR_PHASE[self.kind])
+
+
+class EditOp(StrEnum):
+    """One edit operation kind, per `artifacts.md`'s `Edit(op, entry_type, payload_or_id)`."""
+
+    ADD = "add"
+    UPDATE = "update"
+    REMOVE = "remove"
+
+
+@dataclass(frozen=True)
+class Edit:
+    """One structured artifact edit (architecture: Edit-proposal protocol).
+
+    `payload_or_id` is the new/changed entry's fields for `add`/`update`, or the target
+    entry's ID (the `failure_mode_id` for a coverage entry) for `remove` -- a single field
+    typed as a union rather than two optional fields, matching `artifacts.md`'s own naming.
+    """
+
+    op: EditOp
+    entry_type: str
+    payload_or_id: dict[str, object] | str
+
+
+@dataclass(frozen=True)
+class EditBatch:
+    """One `propose_edits` call's payload: edits tagged for a single phase.
+
+    Defined here rather than in `artifacts` (which owns validating and applying it)
+    because the architecture draws no edge between **agent** and **artifacts** -- the
+    edit sink is an orchestrator-injected callable agent calls without importing
+    artifacts, so the batch shape has to be common currency both modules can reference
+    without either importing the other (this module's own stated purpose).
+    """
+
+    phase: Phase
+    edits: tuple[Edit, ...] = ()
+
+
+@dataclass(frozen=True)
+class BatchVerdict:
+    """The edit sink's verdict on one `EditBatch` -- the tool result the model sees.
+
+    Field names/shape are implementation detail (artifacts.md's own words) until the
+    write-side module (T1.5) settles them; kept minimal and symmetric with
+    `stack.ExpressionVerdict`'s ok/message convention used elsewhere in this codebase.
+    """
+
+    ok: bool
+    message: str | None = None
+
+
+class RunControlAction(StrEnum):
+    """One `run_control` action kind (architecture: Run-control channel)."""
+
+    AFFECTED_VERDICT = "affected_verdict"
+    NO_IMPACT = "no_impact"
+    AMEND_PROPOSAL = "amend_proposal"
+    AMEND_COMPLETE = "amend_complete"
+
+
+@dataclass(frozen=True)
+class RunControlCall:
+    """One `run_control` tool call's payload: an action plus its action-specific fields."""
+
+    action: RunControlAction
+    payload: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RunControlVerdict:
+    """The run-control handler's verdict on one `RunControlCall` -- the tool result seen."""
+
+    ok: bool
+    message: str | None = None
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """Dynamic per-run context that enters the agent session once, at `start` (agent.md).
+
+    `delta_files`/`patch_text` are update-mode-only (the effective delta's file list and
+    patch text); both default empty for a full-analysis run, which never populates them.
+    """
+
+    worktree_root: Path
+    delta_files: tuple[str, ...] = ()
+    patch_text: str = ""
 
 
 class BlareError(Exception):

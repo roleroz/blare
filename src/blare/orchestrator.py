@@ -17,6 +17,9 @@ land with the phase engine (T2.2/T2.3).
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,7 +28,16 @@ from pathlib import Path
 from typing import Protocol
 
 from blare import agent, gitrepo
-from blare.model import BlareError, RunMode
+from blare.model import (
+    BatchVerdict,
+    BlareError,
+    EditBatch,
+    RunContext,
+    RunControlCall,
+    RunControlVerdict,
+    RunMode,
+)
+from blare.stack import get_stack
 
 __all__ = [
     "Abort",
@@ -132,22 +144,65 @@ class Presenter(Protocol):
 RunFn = Callable[[RunMode, Path, Presenter], int]
 
 
+class _PlaceholderTranscriptWriter:
+    """T1.1/T2.1 placeholder `agent.TranscriptWriter`: a real one, rooted under
+    `$XDG_STATE_HOME/blare/<repo-id>/transcripts/` via gitrepo's repo-id, is built at
+    preflight step 9 by T2.2 (`orchestrator.md`). Until then the seam-through flow
+    needs *something* real to hand `AgentSession`, so this writes JSONL to a plain
+    temp file.
+    """
+
+    def __init__(self) -> None:
+        fd, path = tempfile.mkstemp(prefix="blare-transcript-", suffix=".jsonl")
+        os.close(fd)
+        self._path = Path(path)
+
+    def write_event(self, direction: str, event: dict[str, object]) -> None:
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"direction": direction, "event": event}) + "\n")
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+
+def _noop_sink(batch: EditBatch) -> BatchVerdict:
+    """T1.1/T2.1 placeholder `agent.EditSink`: the real sink (phase-state rule plus
+    artifacts' per-batch content check) lands with T2.2/T2.3; the seam-through flow
+    never actually calls `run_phase`, so nothing ever proposes an edit through it."""
+    return BatchVerdict(ok=True, message=None)
+
+
+def _noop_control(call: RunControlCall) -> RunControlVerdict:
+    """T1.1/T2.1 placeholder `agent.RunControlHandler`, see `_noop_sink`."""
+    return RunControlVerdict(ok=True, message=None)
+
+
 def _seam_through(mode: RunMode, repo_path: Path) -> RunSummary:
     """Repo discovery, then the agent session's minimal handshake.
 
-    Raises `BlareError` (exit 1) for any refusal along this path. `mode` is
-    accepted per the entry contract but not yet consulted — analyze/update only
-    diverge once the phase engine and triage exist (T2.2 onward).
+    Raises `BlareError` (exit 1) for any refusal along this path. `mode` reaches
+    `AgentSession.start` (its system prompt differs by mode) but the run otherwise
+    does not yet diverge by mode — the phase engine and triage are T2.2 onward. The
+    stack is hardcoded to the MVP default (`prometheus`) rather than resolved from
+    `.blare/config.yaml`: config/stack resolution is `artifacts.load`/`empty_set`'s
+    job (T1.4/T2.2), not yet wired here.
     """
-    del mode  # unused until the phase engine distinguishes analyze from update
-    gitrepo.GitRepo.discover(repo_path)
+    repo = gitrepo.GitRepo.discover(repo_path)
 
     client = agent.create_client()
-    session = agent.AgentSession(client)
-    session.start()
+    transcript = _PlaceholderTranscriptWriter()
+    session = agent.AgentSession(
+        client,
+        sink=_noop_sink,
+        control=_noop_control,
+        stack=get_stack("prometheus"),
+        transcript=transcript,
+    )
+    session.start(mode, RunContext(worktree_root=repo.worktree_root))
     session.close()
 
-    return RunSummary(outcome="no changes")
+    return RunSummary(outcome="no changes", transcript_path=transcript.path)
 
 
 def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
