@@ -236,6 +236,27 @@ py_test(
 )
 
 py_test(
+    name = "test_r15_refusal",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_r15_refusal.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_r15_refusal.py)"],
+    data = ["//src/blare:blare"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
     name = "test_r1_inverse_refusal",
     srcs = [
         "__init__.py",
@@ -530,6 +551,81 @@ py_test(
     data = [
         "//src/blare:blare",
         "//tests/fixtures/claude-sdk/update-no-impact:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_update_dynamic_expansion",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_update_dynamic_expansion.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_update_dynamic_expansion.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/update-dynamic-expansion:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_update_load_seeded_repair",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_update_load_seeded_repair.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_update_load_seeded_repair.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/update-load-seeded-repair:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_update_no_impact_redirect",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_update_no_impact_redirect.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_update_no_impact_redirect.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/update-no-impact-redirect:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",

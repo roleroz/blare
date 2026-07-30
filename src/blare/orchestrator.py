@@ -32,9 +32,28 @@ again at the top of its own gate loop -- so a phase a gate-opened system unit
 leaves `open` (joined from `unvisited`) still gets its ordinary checkpoint
 before the write -- and is shared by both modes' final confirmation, which is
 what makes R18's SHA-only advance the *same*
-write path over an unchanged candidate rather than a separate one. Dynamic
-queue growth via a *revised* verdict or a load-seeded violation's repair is
-T3.2's build (architecture.md's Tasks section).
+write path over an unchanged candidate rather than a separate one.
+
+T3.2 scope (this task): R18's dynamic clauses in full, plus R15's refusal
+e2e coverage (the code itself already existed from T2.2). Dynamic phase-queue
+expansion -- a revised `affected_verdict` opening a phase ahead of or behind
+the run's position, mid-phase or mid-chat -- needed no new mechanism: it was
+already correct via the same `_handle_affected_verdict`/`_drain_phase_queue`
+plumbing T3.1 built (the queue is re-read from `phase_status` at the top of
+every drain iteration), so this task's contribution there is test coverage,
+not code. Two things genuinely needed building: `_repair_residual_violations`
+(called right after triage) proactively opens a system-originated unit for
+whatever semantic violations the candidate still carries -- recomputed fresh
+rather than reusing step 7's snapshot, since a triage-time agent amendment may
+already have fixed it -- because `request_repair` is the only channel that
+can ever tell the model about a load-seeded violation (agent.md: "loaded-state
+violations do not travel in RunContext"). And `_run_no_impact_checkpoint` now
+implements R18's full redirect: a mid-chat run-control call that opens a phase
+or a unit withdraws the no-impact conclusion via `prompt=None` (mooting the
+in-progress reply rather than re-offering a now-stale conclusion), resolves
+any opened unit, and either lets the caller's queue drain take over (something
+durably opened) or re-presents the conclusion fresh (a redirecting unit was
+rejected, restoring exactly the state the conclusion was based on).
 
 The `Presenter` protocol below mirrors `cli.md`'s `TerminalPresenter` interface in
 full so `cli.TerminalPresenter` type-checks against it.
@@ -850,9 +869,11 @@ def _handle_no_impact(
     counts both a triage-opened phase *and* a load-time semantic-violation seed
     from preflight step 7 (orchestrator.md: "a no_impact conclusion with a
     non-empty queue... is rejected back to the agent... the seeded phases still
-    need work"). Actually opening and repairing a load-seeded violation's phase
-    is T3.2's build; here the seed only has to make the queue non-empty for this
-    check."""
+    need work"). This check only needs the raw step-7 snapshot to make the
+    queue non-empty; actually opening and repairing a load-seeded violation's
+    phase is `_repair_residual_violations` (T3.2), called by the update driver
+    right after `triage()` returns, before this handler could even see another
+    `no_impact` attempt."""
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, str) or not reasoning:
         return RunControlVerdict(
@@ -1237,17 +1258,26 @@ def _open_system_unit(
     holder: _CandidateHolder,
     log: _Log,
 ) -> None:
-    """Open a system-originated unit for a failed approval gate (architecture:
-    Amendment mechanism), naming every violation's repair phase. In analyze mode
-    this only ever fires once every phase has already run (the gate's own
+    """Open a system-originated unit naming every violation's repair phase
+    (architecture: Amendment mechanism). Two call sites (T3.2): a failed
+    approval gate (`_finalize_and_write`), and update mode's own post-triage
+    check for load-seeded violations (`_repair_residual_violations`) -- both
+    just hand this whatever `artifacts.semantic_violations` currently reports,
+    so this function itself does not care which. In analyze mode the gate call
+    only ever fires once every phase has already run (the gate's own
     precondition), so every named phase is frozen, never unvisited. In update
-    mode (T3.1) this is no longer guaranteed: the queue can empty (and the gate
-    fire) with a phase still `unvisited` if no triage verdict or amendment ever
-    named it -- e.g. a load-seeded violation (step 7) whose repair phase the
-    model never named. `_finalize_and_write`'s own loop accounts for this: it
-    drains the phase queue again after this unit closes, so an unvisited-opened
-    phase still gets its ordinary checkpoint before the write, never only the
-    amendment's."""
+    mode this is no longer guaranteed: a repair phase can still be `unvisited`
+    (nothing has named it yet) or already `open` (a triage verdict opened it
+    for an unrelated reason, but the model still needs telling about the
+    violation -- request_repair is the only channel that can, since
+    load-seeded violations never travel in RunContext). Whichever caller,
+    `_mark_phase_open` is a no-op for a phase already open, and `_close_unit`'s
+    approval branch only ever re-freezes a phase whose *recorded* prior status
+    was frozen -- recording `open` as the prior status here is therefore
+    harmless: approval leaves it open, exactly as it already was. The queue
+    re-read at the top of `_drain_phase_queue`'s own loop is what gives every
+    phase this unit opens (from unvisited or already-open alike) its own
+    ordinary checkpoint before the write, never only the amendment's."""
     assert unit_holder.current is None
     unit = _AmendmentUnit(origin=AmendmentOrigin.SYSTEM, baseline=holder.current)
     for p in sorted({v.phase for v in violations}, key=int):
@@ -1262,6 +1292,47 @@ def _open_system_unit(
             "phases": sorted(int(p) for p in unit.opened_from),
             "violation_count": len(violations),
         }
+    )
+
+
+def _repair_residual_violations(
+    holder: _CandidateHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    unit_holder: _UnitHolder,
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    session: agent.AgentSession,
+    presenter: Presenter,
+    log: _Log,
+) -> None:
+    """T3.2: update mode's own post-triage check for R18's load-seeded violation
+    repairs (agent.md: "in update mode the orchestrator calls it [request_repair]
+    right after triage seeds the queue, naming the repair phases and
+    violations"). Recomputes `artifacts.semantic_violations` fresh against the
+    *current* candidate rather than reusing step 7's snapshot: a triage-time
+    agent amendment (resolved by the caller just before this runs) may already
+    have fixed what step 7 found, and reusing the stale list would re-request a
+    repair that no longer exists. A no-op when nothing is currently violating.
+
+    Assumes `unit_holder.current is None` (the caller resolves any unit triage
+    itself opened before calling this -- `_open_system_unit`'s own precondition).
+    Whatever residual violations remain get one system-originated unit, exactly
+    like a failed approval gate's own repair (`_finalize_and_write`); any
+    violation this doesn't catch (e.g. one newly introduced by a later phase's
+    own work) is still caught by that gate at the end, so nothing is silently
+    lost."""
+    violations = artifacts.semantic_violations(holder.current)
+    if not violations:
+        return
+    log(
+        {
+            "event": "load_seeded_violation_repair",
+            "violation_count": len(violations),
+            "kinds": [v.kind.value for v in violations],
+        }
+    )
+    _open_system_unit(violations, phase_status, unit_holder, phase_baselines, holder, log)
+    _resolve_unit_to_presentation(
+        unit_holder, phase_status, phase_baselines, holder, session, presenter, log
     )
 
 
@@ -1417,22 +1488,37 @@ def _run_no_impact_checkpoint(
     session: agent.AgentSession,
     presenter: Presenter,
     view: NoImpactView,
+    unit_holder: _UnitHolder,
+    phase_status: dict[Phase, _PhaseStatus],
+    phase_baselines: dict[Phase, artifacts.ArtifactSet],
+    holder: _CandidateHolder,
+    log: _Log,
 ) -> None:
     """Present the R18 no-impact conclusion as a checkpoint -- approve/abort/chat,
     the same reply convention `_run_checkpoint` drives (cli.md: "replies per the
-    checkpoint convention"); raises `_AbortRun` on abort. T3.1's scope is this
-    basic loop; a mid-chat verdict or amend_proposal that withdraws the
-    conclusion (the "redirect") is T3.2's build (architecture.md's Tasks section
-    assigns "redirect at the no-impact confirmation" there, alongside the rest of
-    R18's dynamic clauses) -- this loop does not defer or moot the prompt, it
-    simply re-offers it after each chat exchange like an ordinary checkpoint.
-    Chat can still legally open a unit or a phase through the ordinary
-    run-control handlers during that exchange (run-control totality is not
-    scoped to this prompt); this function returning on `Approve` does not by
-    itself mean nothing was opened -- the caller re-checks `phase_status` and
-    `unit_holder` afterward and routes any such work through its own
-    presentation before writing, so a stale approval can never silently skip
-    it (see the call site in `_execute`)."""
+    checkpoint convention"); raises `_AbortRun` on abort.
+
+    T3.2's redirect: a run-control call during chat that opens a phase (a
+    revised `affected_verdict`) or a unit (`amend_proposal`) withdraws the
+    conclusion the same way (orchestrator.md, "No-impact flow (R18)"): the
+    in-progress reply is rendered via `prompt=None` -- mooting this round
+    rather than re-offering the now-stale conclusion -- any opened unit is
+    driven to closure right here (mirroring `_run_checkpoint`'s own
+    `unit_holder.current is not None` handling), and then:
+
+    - if anything is durably open afterward (a phase left open by a bare
+      `affected_verdict`, or one the unit's own approval left open -- "opening
+      a phase for a repair never substitutes for running it"), the conclusion
+      never returns: this function returns having withdrawn it, and the
+      caller's unconditional `_drain_phase_queue` call runs the newly opened
+      work through its own ordinary checkpoint(s);
+    - if a unit opened and was *rejected*, with nothing else left open, the
+      restore returned to exactly the state the conclusion was based on --
+      the no-impact confirmation is re-presented fresh ("rejection of the
+      withdrawal is what puts the conclusion back on the table").
+
+    Plain chat with neither effect just re-offers this same prompt, as before
+    -- the ordinary (non-redirect) path is unchanged from T3.1."""
     reply: CheckpointReply | AmendmentReply | None = presenter.present_no_impact(view)
     while True:
         if isinstance(reply, Approve):
@@ -1441,6 +1527,23 @@ def _run_no_impact_checkpoint(
             raise _AbortRun
         if isinstance(reply, Chat):
             chat_reply_text = session.chat(reply.text)
+            redirect = unit_holder.current is not None or any(
+                status is _PhaseStatus.OPEN for status in phase_status.values()
+            )
+            if redirect:
+                presenter.show_chat_reply(chat_reply_text, None)
+                if unit_holder.current is not None:
+                    _resolve_unit_to_presentation(
+                        unit_holder, phase_status, phase_baselines, holder, session,
+                        presenter, log,
+                    )
+                if any(status is _PhaseStatus.OPEN for status in phase_status.values()):
+                    return
+                # The unit opened and was rejected, restoring the pre-unit
+                # state -- nothing else is open, so the conclusion still
+                # stands: re-present it fresh (R18).
+                reply = presenter.present_no_impact(view)
+                continue
             reply = presenter.show_chat_reply(chat_reply_text, PromptKind.NO_IMPACT)
             assert reply is not None, (
                 "a no-impact prompt was given (not None); show_chat_reply must "
@@ -1467,13 +1570,18 @@ def _drain_phase_queue(
     engine's own machinery (`_run_checkpoint`, the "resume any open unit before
     proceeding" rule) rather than a parallel implementation. The queue is
     re-read from `phase_status` at the top of every iteration rather than
-    snapshotted once after triage: a phase opened *mid-run* (an ahead phase
-    named by an agent-proposed amendment, or -- T3.2's build -- a revised
-    verdict) must still get its own ordinary checkpoint once the phases ahead of
-    it have been processed, "opening a phase for a repair never substitutes for
-    running it" (orchestrator.md) -- analyze mode gets this for free from its
-    fixed four-phase loop; update mode's queue is not fixed, so this loop
-    recomputes it instead. Returns once no phase is left `open` -- a no-op when
+    snapshotted once after triage: a phase opened *mid-run* -- an ahead phase
+    named by an agent-proposed amendment, or (T3.2) a revised `affected_verdict`
+    naming a phase ahead of or behind the run's current position -- must still
+    get its own ordinary checkpoint once the phases ahead of it have been
+    processed, "opening a phase for a repair never substitutes for running it"
+    (orchestrator.md) -- analyze mode gets this for free from its fixed
+    four-phase loop; update mode's queue is not fixed, so this loop recomputes
+    it instead. This re-read is the entire mechanism R18's dynamic-expansion
+    clause needs: `_handle_affected_verdict` already opens whatever phase a
+    revised verdict names (T3.1), so a later iteration here simply finds it in
+    the recomputed queue, whichever position it falls at. Returns once no phase
+    is left `open` -- a no-op when
     called with an already-empty queue, which is what lets `_finalize_and_write`
     call this unconditionally from both modes (a no-op in analyze mode, where
     the queue is always already empty by the time the gate runs)."""
@@ -1786,11 +1894,13 @@ def _execute(
 
     # Step 7: semantic check on the loaded set -> violations seed the affected-phase
     # queue (R18). Computed here so the ordering rule "(7,8) semantic seeds never
-    # terminate the run" holds structurally. In update mode this list also feeds
-    # `_handle_no_impact`'s queue-emptiness check below (T3.1): a no_impact
-    # conclusion is rejected while it is non-empty. Actually opening and driving
-    # repairs into these phases via `request_repair` is T3.2's build
-    # ("load-seeded violation repairs").
+    # terminate the run" holds structurally. In update mode this snapshot also
+    # feeds `_handle_no_impact`'s queue-emptiness check below (T3.1): a
+    # no_impact conclusion is rejected while it is non-empty. Actually opening
+    # and driving repairs for these violations happens later, right after
+    # `triage()` returns, via `_repair_residual_violations` (T3.2) -- which
+    # recomputes the check fresh rather than reusing this snapshot, since a
+    # triage-time agent amendment may already have fixed what's found here.
     violations = artifacts.semantic_violations(artifact_set)
     _log(
         run_state,
@@ -1893,43 +2003,55 @@ def _execute(
                     _log_event,
                 )
 
-            if no_impact_holder.conclusion is not None:
+            # T3.2: R18's load-seeded violation repairs -- request_repair is the
+            # only channel that can ever tell the model about a violation
+            # already present in the loaded state (agent.md: "loaded-state
+            # violations do not travel in RunContext"), so the orchestrator
+            # proactively opens a system-originated unit for whatever is still
+            # violating right after triage, before deciding what to do about a
+            # no_impact conclusion or draining the queue.
+            _repair_residual_violations(
+                holder, phase_status, unit_holder, phase_baselines, session, presenter,
+                _log_event,
+            )
+
+            # T3.2: a same-turn sequence within triage() itself -- an accepted
+            # no_impact followed by an amend_proposal before the turn ends --
+            # is nothing `_handle_amend_proposal` forbids, and the unit just
+            # resolved above (or a residual-violation unit just above that)
+            # can leave a phase durably open even though `no_impact_holder`
+            # still holds the earlier conclusion. Presenting that conclusion
+            # now would offer it for approval as if it were still current; the
+            # "queue empty" precondition R18's no-impact confirmation assumes
+            # (orchestrator.md, "No-impact flow") already failed by the time
+            # we get here, so it is withdrawn the same way a mid-chat redirect
+            # withdraws it -- never presented at all, and the caller's
+            # unconditional `_drain_phase_queue` below is what runs the
+            # opened phase's own ordinary checkpoint instead.
+            queue_already_open = any(
+                status is _PhaseStatus.OPEN for status in phase_status.values()
+            )
+            if no_impact_holder.conclusion is not None and not queue_already_open:
                 view = NoImpactView(
                     delta_file_count=len(delta_files),
                     delta_files=delta_files,
                     conclusion=no_impact_holder.conclusion,
                 )
-                _run_no_impact_checkpoint(session, presenter, view)
-                # T3.1 does not build R18's full redirect UX (mooting the
-                # in-flight prompt via prompt=None, re-presenting the
-                # conclusion after a rejected unit -- T3.2's build). But
-                # approving what may now be a *stale* conclusion must never
-                # silently skip real review: chat during the confirmation can
-                # still open a unit or a phase through the ordinary
-                # run-control handlers, and those must go through their own
-                # checkpoint/amendment presentation before anything is
-                # written, exactly like every other path into
-                # `_finalize_and_write`. This is the same
-                # resume-then-run-the-queue sequence already used right after
-                # `triage()` returns, not a parallel mechanism.
-                if unit_holder.current is not None:
-                    _resolve_unit_to_presentation(
-                        unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                        _log_event,
-                    )
-                # `_drain_phase_queue` is a no-op over an empty queue, so this
-                # unconditional call is exactly the guard it used to be,
-                # phrased the same way `_finalize_and_write` itself drains the
-                # queue at its own gate.
-                _drain_phase_queue(
-                    session, presenter, holder, phase_status, phase_baselines, unit_holder,
-                    _log_event,
+                # T3.2: `_run_no_impact_checkpoint` itself moots the prompt and
+                # resolves any unit/phase a mid-chat redirect opens (R18),
+                # re-presenting the conclusion fresh if a redirecting unit is
+                # rejected -- nothing further to do here once it returns.
+                _run_no_impact_checkpoint(
+                    session, presenter, view, unit_holder, phase_status, phase_baselines,
+                    holder, _log_event,
                 )
-            else:
-                _drain_phase_queue(
-                    session, presenter, holder, phase_status, phase_baselines, unit_holder,
-                    _log_event,
-                )
+            # `_drain_phase_queue` is a no-op over an empty queue, so this
+            # unconditional call covers both the no_impact-withdrawn path (a
+            # phase is now open) and the ordinary affected_verdict path.
+            _drain_phase_queue(
+                session, presenter, holder, phase_status, phase_baselines, unit_holder,
+                _log_event,
+            )
 
             _finalize_and_write(
                 holder, phase_status, unit_holder, phase_baselines, session, presenter,

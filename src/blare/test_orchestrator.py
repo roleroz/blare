@@ -230,6 +230,14 @@ class FakeAgentSession:
         default_factory=list, init=False
     )
     closed: bool = field(default=False, init=False)
+    # A single ordered log across every driving call this fake receives (T3.2):
+    # most scenarios only need per-kind lists (`ran_phases`,
+    # `request_repair_calls`, ...), but a scenario distinguishing *when* one
+    # driving call happens relative to another -- e.g. whether a proactive
+    # repair reaches the model before or after an unrelated phase's own turn
+    # -- needs their relative order, which no per-kind list captures on its
+    # own.
+    call_order: list[str] = field(default_factory=list, init=False)
 
     def start(self, mode: RunMode, context: RunContext) -> None:
         # Mirrors the real `AgentSession.start`'s auth check (agent.md, R12) so tests
@@ -247,6 +255,7 @@ class FakeAgentSession:
 
     def run_phase(self, phase: Phase) -> None:
         self.ran_phases.append(phase)
+        self.call_order.append(f"run_phase:{int(phase)}")
         self._write_transcript("outbound", {"type": "phase_prompt", "phase": int(phase)})
         if phase in self.raise_in_phase:
             raise self.raise_in_phase[phase]
@@ -260,6 +269,7 @@ class FakeAgentSession:
 
     def chat(self, text: str) -> str:
         self.chat_calls.append(text)
+        self.call_order.append("chat")
         self._write_transcript("outbound", {"type": "chat", "text": text})
         for batch in self.chat_edits_by_text.get(text, []):
             verdict = self.sink(batch)
@@ -283,6 +293,7 @@ class FakeAgentSession:
 
     def triage(self) -> None:
         self.triage_called = True
+        self.call_order.append("triage")
         self._write_transcript("outbound", {"type": "triage"})
         for call in self.triage_run_control_calls:
             self.run_control_verdicts.append(self.control(call))
@@ -291,6 +302,7 @@ class FakeAgentSession:
     def request_repair(self, phases: list[Phase], violations: list[Violation]) -> None:
         key = tuple(sorted(phases, key=int))
         self.request_repair_calls.append((key, tuple(violations)))
+        self.call_order.append("request_repair:" + ",".join(str(int(p)) for p in key))
         self._write_transcript(
             "outbound", {"type": "request_repair", "phases": [int(p) for p in key]}
         )
@@ -3636,18 +3648,18 @@ def test_contract_update_no_impact_rejected_when_load_seeded_violation_present(
     assert artifacts.semantic_violations(loaded) == []
 
 
-def test_contract_update_gate_opens_system_unit_for_unvisited_repair_phase(
+def test_contract_update_load_seeded_violation_repaired_proactively_after_triage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A load-seeded violation whose repair phase the model never names (it
-    settles on some other affected phase instead) is caught by
-    `_finalize_and_write`'s own gate, exactly as it would be in analyze mode --
-    except here the repair phase is still `unvisited`, never `frozen`, when the
-    system-originated unit opens it (`_open_system_unit`'s note). The unit's own
-    approval leaves that phase open, and `_finalize_and_write` drains the queue
-    again afterward: the phase still gets its own ordinary checkpoint before the
-    write -- "opening a phase for a repair never substitutes for running it"
-    holds at the gate too, not only during the ordinary phase loop."""
+    """T3.2: a load-seeded violation whose repair phase the model never names
+    (it settles on some other affected phase instead) is repaired proactively
+    -- `_repair_residual_violations` opens a system-originated unit for it and
+    calls `request_repair` right after `triage()` returns, before the queue is
+    ever drained -- rather than surviving all the way to `_finalize_and_write`'s
+    own gate. The unit's approval leaves the (previously `unvisited`) repair
+    phase open, and the ordinary queue drain still gives it its own checkpoint
+    afterward: "opening a phase for a repair never substitutes for running
+    it" holds for this proactive path too, not only for the gate's."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
@@ -3660,8 +3672,8 @@ def test_contract_update_gate_opens_system_unit_for_unvisited_repair_phase(
         triage_run_control_calls=[
             RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing to do"}),
             # Settles on phase 2 -- not the violation's own repair phase (4) --
-            # so the violation survives phase 2's checkpoint and is only ever
-            # caught at the gate.
+            # so the violation is still present when triage() returns and
+            # `_repair_residual_violations` finds it.
             RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]}),
         ],
         repair_edits_by_phases={
@@ -3682,21 +3694,105 @@ def test_contract_update_gate_opens_system_unit_for_unvisited_repair_phase(
 
     assert code == 0
     session = sessions[0]
-    # Phase 2 ran normally first (settled by the verdict); phase 4 only ran
-    # afterward, once the gate's system unit opened it.
+    # request_repair fired proactively, naming the violation, before either
+    # phase's own ordinary checkpoint ran -- this is what distinguishes the
+    # proactive path from the pre-T3.2 gate-only fallback, which would only
+    # ever call request_repair *after* every named phase had already run.
+    assert len(session.request_repair_calls) == 1
+    repaired_phases, repaired_violations = session.request_repair_calls[0]
+    assert repaired_phases == (Phase.ALERT_RECOMMENDATIONS,)
+    assert [v.kind for v in repaired_violations] == [ViolationKind.UNMAPPED_FAILURE_MODE]
+    assert session.call_order == [
+        "triage",
+        "request_repair:4",
+        "run_phase:2",
+        "run_phase:4",
+    ]
+    # Phase 2 ran normally first (settled by the verdict); phase 4 ran
+    # afterward too, as its own ordinary checkpoint -- the repair itself
+    # landed via request_repair, not via run_phase.
     assert session.ran_phases == [Phase.FAILURE_MODES, Phase.ALERT_RECOMMENDATIONS]
     assert [v.phase for v in presenter.checkpoint_views] == [
         Phase.FAILURE_MODES,
         Phase.ALERT_RECOMMENDATIONS,
     ]
-    # The gate-driven amendment was presented (system origin, non-rejectable)
-    # in addition to phase 4's own ordinary checkpoint above.
+    # The proactive repair's own amendment was presented (system origin,
+    # non-rejectable) in addition to phase 4's own ordinary checkpoint above.
     assert len(presenter.amendment_views) == 1
     assert presenter.amendment_views[0].origin is orchestrator.AmendmentOrigin.SYSTEM
     assert session.notify_outcomes == [(True, ())]
     loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
     assert artifacts.semantic_violations(loaded) == []
     assert set(loaded.alert_recommendations) == {"ar-orphan"}
+
+
+def test_contract_update_gate_still_catches_violation_introduced_after_triage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3.2: `_repair_residual_violations` only ever sees what's wrong right
+    after `triage()` returns -- a violation a later phase's *own* edits
+    introduce (nothing was wrong in the loaded state, so the proactive check
+    is a no-op here) is still caught, exactly as before T3.2, by
+    `_finalize_and_write`'s own gate once the queue empties: the proactive
+    check is an addition, not a replacement for that fallback."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]})
+        ],
+        edits_by_phase={
+            # Phase 2's own turn introduces a fresh, unmapped failure mode --
+            # nothing was wrong until this lands, so only the gate (not the
+            # proactive post-triage check) can ever catch it.
+            Phase.FAILURE_MODES: [
+                EditBatch(phase=Phase.FAILURE_MODES, edits=(_fm_edit("fm-fresh"),))
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.ALERT_RECOMMENDATIONS,): [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-fresh", ["fm-fresh"], severity="warning"),
+                        _coverage_alert_edit("fm-fresh", ["ar-fresh"]),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # Exactly one request_repair call: the gate's own, once phase 2's edit
+    # made the candidate violate R4 -- nothing to repair right after triage.
+    assert len(session.request_repair_calls) == 1
+    repaired_phases, repaired_violations = session.request_repair_calls[0]
+    assert repaired_phases == (Phase.ALERT_RECOMMENDATIONS,)
+    assert [v.kind for v in repaired_violations] == [ViolationKind.UNMAPPED_FAILURE_MODE]
+    assert session.ran_phases == [Phase.FAILURE_MODES, Phase.ALERT_RECOMMENDATIONS]
+    # Phase 4 opened only via the gate's system unit (prior: unvisited), so it
+    # still gets its own ordinary checkpoint once the gate's loop drains the
+    # queue again, in addition to phase 2's.
+    assert [v.phase for v in presenter.checkpoint_views] == [
+        Phase.FAILURE_MODES,
+        Phase.ALERT_RECOMMENDATIONS,
+    ]
+    assert len(presenter.amendment_views) == 1
+    assert presenter.amendment_views[0].origin is orchestrator.AmendmentOrigin.SYSTEM
+    assert session.notify_outcomes == [(True, ())]
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert artifacts.semantic_violations(loaded) == []
+    assert set(loaded.alert_recommendations) == {"ar-fresh"}
 
 
 def test_contract_update_affected_verdict_naming_open_phase_is_noop_ack(
@@ -3973,6 +4069,47 @@ def test_contract_update_no_impact_rejected_when_unit_open(
     assert not presenter.no_impact_views
 
 
+def test_contract_update_no_impact_withdrawn_by_same_turn_amend_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3.2: the opposite order from the test above -- an accepted `no_impact`
+    followed, in the *same* triage turn, by an `amend_proposal` (nothing in
+    `_handle_amend_proposal` forbids this sequence). The unit resolved right
+    after `triage()` returns leaves its named phase durably open, so the
+    now-stale conclusion must never be presented for approval: this is R18's
+    withdrawal applied at the same point a mid-chat redirect would apply it,
+    just triggered before the no-impact screen is ever shown at all."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing obvious"}),
+            RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [3]}),
+        ],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert [v.ok for v in session.run_control_verdicts] == [True, True]
+    # The conclusion was withdrawn -- never presented at all.
+    assert not presenter.no_impact_views
+    # Phase 3 was opened from unvisited by the amendment: it stays open and
+    # takes its own ordinary checkpoint (opening a phase for a repair never
+    # substitutes for running it).
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+    assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
+    assert session.notify_outcomes == [(True, ())]
+
+
 def test_contract_update_affected_verdict_unvisited_phase_rejected_when_unit_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4137,3 +4274,160 @@ def test_contract_update_no_impact_chat_opening_amendment_still_gets_presented(
     assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
     loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
     assert set(loaded.metrics) == {"mx-sneaky"}
+
+
+# --- T3.2: dynamic phase-queue expansion via a revised (bare) affected_verdict,
+# ahead of and behind the run's current position -----------------------------
+
+
+def test_contract_update_dynamic_expansion_ahead_and_behind_via_revised_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R18's dynamic-expansion clause: triage names only phase 3; mid-phase-3,
+    the model revises its verdict twice more -- once naming phase 2 (behind the
+    run's current position) and once naming phase 4 (ahead) -- via a bare
+    `affected_verdict`, no amendment involved. Both still get their own
+    ordinary checkpoint, in phase order, once phase 3's is done: this needed no
+    new mechanism (`_handle_affected_verdict` already opens whatever phase it
+    names; `_drain_phase_queue` already re-reads `phase_status` fresh every
+    iteration), so this test is this task's whole contribution to that clause."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+        ],
+        run_control_calls_by_phase={
+            Phase.METRIC_COVERAGE: [
+                RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]}),
+                RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [4]}),
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert [v.ok for v in session.run_control_verdicts] == [True, True, True]
+    # Phase 3 (triage's own) ran first; the behind phase (2) and the ahead
+    # phase (4) both ran afterward, in phase order -- neither substituted for
+    # the other, and neither was silently skipped.
+    assert session.ran_phases == [
+        Phase.METRIC_COVERAGE,
+        Phase.FAILURE_MODES,
+        Phase.ALERT_RECOMMENDATIONS,
+    ]
+    assert [v.phase for v in presenter.checkpoint_views] == [
+        Phase.METRIC_COVERAGE,
+        Phase.FAILURE_MODES,
+        Phase.ALERT_RECOMMENDATIONS,
+    ]
+
+
+# --- T3.2: the R18 redirect at the no-impact confirmation --------------------
+
+
+def test_contract_update_no_impact_redirect_rejected_unit_represents_conclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R18's redirect, the rejection half (orchestrator.md: "on rejection the
+    restore covers the whole pre-unit state, the withdrawn conclusion
+    included, and the no-impact confirmation is re-presented"): chat during
+    the no-impact confirmation proposes an amendment (mooting the conclusion),
+    the unit is rejected, nothing else is left open, and the *same* no-impact
+    conclusion is presented again -- approving that second presentation is
+    what finally proceeds, exactly the confirmation the agent's original
+    conclusion was based on."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    reconsider_text = "wait, maybe phase 3 needs a look"
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing obvious"})
+        ],
+        chat_run_control_by_text={
+            reconsider_text: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [3]})
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.no_impact_replies = [orchestrator.Chat(reconsider_text)]
+    # The amendment presentation (rejectable, agent-origin) is rejected; the
+    # no-impact confirmation that follows is then approved for real.
+    presenter.amendment_replies = [orchestrator.Reject()]
+    presenter.no_impact_replies.append(orchestrator.Approve())
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    # The prompt was mooted (prompt=None), not re-offered with the stale
+    # conclusion -- this is what distinguishes a redirect from an ordinary
+    # chat re-offer.
+    assert any(prompt is None for _text, prompt in presenter.chat_reply_calls)
+    assert len(presenter.amendment_views) == 1
+    assert session.notify_outcomes == [(False, (Phase.METRIC_COVERAGE,))]
+    # The no-impact screen was presented twice: the original, then the fresh
+    # re-presentation after the rejected redirect.
+    assert len(presenter.no_impact_views) == 2
+    # Nothing ever opened for real: phase 3 was restored to unvisited, so no
+    # phase ever ran, and only the SHA/derived docs would change at write time.
+    assert session.ran_phases == []
+    assert presenter.checkpoint_views == []
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert loaded.analyzed_sha == repo_head(repo)
+
+
+def test_contract_update_no_impact_redirect_bare_verdict_withdraws_for_good(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R18's redirect via a bare `affected_verdict` (no amendment unit at all):
+    once a phase is durably open there is no "reject" to fall back to, so the
+    conclusion is withdrawn permanently -- the no-impact screen is presented
+    exactly once, never again, and the newly opened phase gets its own
+    ordinary checkpoint."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    reconsider_text = "actually, metric coverage needs a look"
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing obvious"})
+        ],
+        chat_run_control_by_text={
+            reconsider_text: [
+                RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [3]})
+            ]
+        },
+    )
+    presenter = FakePresenter()
+    presenter.no_impact_replies = [orchestrator.Chat(reconsider_text)]
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    session = sessions[0]
+    assert any(prompt is None for _text, prompt in presenter.chat_reply_calls)
+    assert len(presenter.no_impact_views) == 1
+    assert session.ran_phases == [Phase.METRIC_COVERAGE]
+    assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
