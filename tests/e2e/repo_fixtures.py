@@ -40,6 +40,20 @@ def head_sha(repo_dir: Path) -> str:
     return result.stdout.strip()
 
 
+def commit_file(repo_dir: Path, relative_path: str, content: str, message: str) -> str:
+    """Write `content` to `relative_path` (outside `.blare/`) and commit it -- T2.5's
+    re-analysis scenarios use this to give the second `blare analyze` invocation a
+    genuinely new HEAD to record, the realistic re-analysis trigger (a code change
+    between runs), distinct from the state file's own recorded SHA that `blare
+    analyze` never consults (unlike `blare update`, it has no ancestry check)."""
+    path = repo_dir / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    subprocess.run(["git", "add", relative_path], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", message], cwd=repo_dir, check=True)
+    return head_sha(repo_dir)
+
+
 def write_minimal_state(blare_root: Path, analyzed_sha: str, schema_version: int = 1) -> None:
     """A minimal, structurally valid `.blare/`: every entry file an empty list."""
     blare_root.mkdir(parents=True, exist_ok=True)

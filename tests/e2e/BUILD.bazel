@@ -144,6 +144,34 @@ py_test(
 )
 
 py_test(
+    name = "test_analyze_reanalysis",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_analyze_reanalysis.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_analyze_reanalysis.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
+        "//tests/fixtures/claude-sdk/analyze-reanalysis-noop:scenario.jsonl",
+        "//tests/fixtures/claude-sdk/analyze-reanalysis-update:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "//src/blare:blare_lib",
+        "@pip//pytest_bazel",
+        "@pip//ruamel_yaml",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
     name = "test_r17_refusal",
     srcs = [
         "__init__.py",
