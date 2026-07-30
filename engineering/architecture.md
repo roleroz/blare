@@ -238,7 +238,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T2 — Full analysis
 
-- [ ] **T2.1 agent**: session lifecycle, the two tools over injected handlers, prompt
+- [x] **T2.1 agent**: session lifecycle, the two tools over injected handlers, prompt
   templates, `create_client` with replay/record clients and normalization, transcripts,
   error taxonomy; hand-authored provisional fixtures for the analyze happy path. Traces:
   R12 (unit level; its e2e is T2.2's auth refusal) and R14 (unit level; e2e with T2.3).

@@ -190,7 +190,10 @@ release-suite run against `~/external_git/miniflux_v2`; emptying this list is a
 precondition for the first release. Entries are captured by the release suite's scripted
 scenarios (architecture, Test strategy) unless a dedicated capture path is named:
 
-- analyze happy path (four phases, approvals only)
+- analyze happy path (four phases, approvals only) — T2.1 hand-authored a provisional
+  instance at `tests/fixtures/claude-sdk/analyze-happy-path/scenario.jsonl` (marked
+  provisional in the file, generated from the real phase-prompt/stack code to keep the
+  prompt text byte-exact); a release-suite capture still supersedes it
 - analyze re-run over an existing state file (R16 re-analysis, edits against existing IDs)
 - update with an affected subset of phases
 - update no-impact conclusion (R18), and its chat-redirected variant
@@ -205,9 +208,9 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
 - auth-failure handshake shape (R12) — captured by a dedicated logged-out release
   scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials
 - the minimal handshake fixture T1.1 hand-authored to reach session start
-  (`tests/fixtures/claude-sdk/handshake/handshake.jsonl`, marked provisional in the file):
-  a metadata line plus one `session_ready` handshake event, this task's own guess at the
-  format below; T2.1 may reshape it once the real SDK handshake shape is known — it
+  (`tests/fixtures/claude-sdk/handshake/scenario.jsonl`, renamed by T2.1 from
+  `handshake.jsonl` — a scenario is a whole session, not only a handshake; still marked
+  provisional in the file): a metadata line plus one `session_ready` handshake event; it
   supersedes this entry rather than adding to the release-capture list, since the full
   analyze-happy-path fixture (already listed above) subsumes a bare handshake
 
