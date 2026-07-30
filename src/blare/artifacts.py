@@ -1,11 +1,12 @@
 """Everything under `.blare/` (architecture: no other module touches it): schemas,
-structural load-time validation (R19), the semantic-invariant check (R4-R5 plus the
-excluded-empty-sets property), state and config (R23, R24), gap counting.
+the three validation tiers (R19 structural, per-batch content, R4-R5 semantic), surgical
+edit application, deterministic rendering, ordered writing, state and config (R23, R24).
 
-This module (T1.4) implements the read side only: `state_exists`, `init_inspection`,
-`empty_set`, `load`, `semantic_violations`, `gap_counts`. The write side --
-`batch_check`, `apply`, `referencing_phases`, `render_docs`, `raw_bytes_match`, and the
-three write primitives -- is T1.5, per `engineering/modules/artifacts.md`.
+T1.4 built the read side: `state_exists`, `init_inspection`, `empty_set`, `load`,
+`semantic_violations`, `gap_counts`. This task (T1.5) adds the write side: `batch_check`,
+`apply`, `referencing_phases`, `render_docs`, `raw_bytes_match`, and the three write
+primitives (`write_entries_and_config`, `write_docs`, `write_state`), per
+`engineering/modules/artifacts.md`.
 
 Throughout this module, `root` names the `.blare/` directory itself (the layout tree in
 `engineering/architecture.md`'s "Artifact file layout" section is rooted there) -- not
@@ -14,16 +15,28 @@ the target repo's root. The orchestrator is expected to pass `repo_root / ".blar
 
 from __future__ import annotations
 
+import copy
+import io
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedSeq
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
-from blare.model import BlareError, RunMode, Violation, ViolationKind
-from blare.stack import ObservabilityStack, get_stack, supported_stacks
+from blare.model import (
+    BatchVerdict,
+    BlareError,
+    Edit,
+    EditBatch,
+    EditOp,
+    Phase,
+    RunMode,
+    Violation,
+    ViolationKind,
+)
+from blare.stack import AlertRuleInput, ObservabilityStack, get_stack, supported_stacks
 
 CURRENT_SCHEMA_VERSION = 1
 
@@ -67,6 +80,11 @@ _RECOMMENDATION_KINDS = ("new", "change")
 
 _SEVERITY_RANK: dict[str, int] = {"warning": 0, "critical": 1}
 
+# The canonical YAML set (spec, Artifacts: "entry-based artifacts plus state"), the R20
+# write-time re-check's comparison scope -- config.yaml is deliberately excluded (a
+# pre-existing config is legitimate on the fresh path and is never rewritten by Blare).
+_CANONICAL_YAML_FILENAMES: tuple[str, ...] = (*_ENTRY_FILENAMES.values(), _STATE_FILENAME)
+
 # One shared round-trip YAML (de)serializer. Round-trip mode (not safe/rt-lite) is what
 # lets T1.5 preserve hand-formatting on entries an edit batch never touches (R9/R16); this
 # task only reads, but loads through the same instance so the parsed representation is
@@ -107,6 +125,14 @@ class SchemaVersionError(BlareError):
     Cause names both versions; distinct from `StructuralValidationError` since the
     recovery (run the matching Blare version, or discard and re-analyze) differs from a
     plain data-shape fix."""
+
+
+class WriteError(BlareError):
+    """A write primitive (T1.5) failed partway through -- the underlying filesystem
+    operation raised (R20's crash case). Cause names the failing file; next_action
+    points at git as the recovery, since Blare never commits and `write_state` -- the
+    last primitive in the orchestrator's write order -- has not yet run, so the old
+    analyzed SHA still matches whatever landed on disk (architecture, Write path)."""
 
 
 # --- Entry types -------------------------------------------------------------------
@@ -246,6 +272,21 @@ class ArtifactSet:
     documents: dict[str, CommentedSeq]
 
 
+@dataclass(frozen=True)
+class WriteReport:
+    """One write primitive's outcome (artifacts.md, Failure visibility): every canonical
+    path it wrote (content changed, or a fresh run creating it for the first time) and
+    every one it left alone (an unchanged entry file, or an existing `config.yaml`).
+    Paths are absolute (`root`-joined), matching the style every other error in this
+    module already names files in. A primitive that fails partway raises `WriteError`
+    naming the failing file instead of returning; the reports already returned by
+    *earlier* primitives in the orchestrator's write order are the partial-write record
+    (architecture, Write path)."""
+
+    written: tuple[Path, ...]
+    skipped: tuple[Path, ...]
+
+
 # --- Small parsing helpers -----------------------------------------------------------
 
 
@@ -355,6 +396,27 @@ def _load_entry_list(path: Path) -> tuple[bytes, CommentedSeq]:
     return raw, cast(CommentedSeq, doc)
 
 
+def _extract_prefixed_id(
+    file: Path, item: Mapping[str, object], prefix: str, index: int | None = None
+) -> str:
+    """Extract and validate an entry's `id`: non-empty string, carrying `prefix`'s
+    required `<prefix>-` form. Shared by `_load_entries` (load-time, `index` given for
+    the error message) and T1.5's batch-check/apply (no `index`, since a batch edit's
+    payload isn't drawn from an indexed list) -- the one place this rule is enforced,
+    so the two call sites can never drift (artifacts.md: "a prefix in the wrong file is
+    a schema-conformance failure")."""
+    id_ = item.get("id")
+    if not isinstance(id_, str) or not id_:
+        loc = f"entry at index {index}" if index is not None else "entry"
+        raise _err(file, f"{loc} is missing a non-empty string 'id'")
+    if not id_.startswith(f"{prefix}-"):
+        raise _err(
+            file,
+            f"id {id_!r} does not use the {prefix!r}- prefix required in {file.name}",
+        )
+    return id_
+
+
 def _load_entries[EntryT](
     file: Path,
     raw_items: Sequence[Mapping[str, object]],
@@ -367,18 +429,33 @@ def _load_entries[EntryT](
     equal to the set's global uniqueness (artifacts.md)."""
     result: dict[str, EntryT] = {}
     for index, item in enumerate(raw_items):
-        id_ = item.get("id")
-        if not isinstance(id_, str) or not id_:
-            raise _err(file, f"entry at index {index} is missing a non-empty string 'id'")
-        if not id_.startswith(f"{prefix}-"):
-            raise _err(
-                file,
-                f"id {id_!r} does not use the {prefix!r}- prefix required in {file.name}",
-            )
+        id_ = _extract_prefixed_id(file, item, prefix, index)
         if id_ in result:
             raise _err(file, f"duplicate id {id_!r}")
         result[id_] = parser(file, id_, item)
     return result
+
+
+def _extract_coverage_key(file: Path, item: Mapping[str, object], index: int | None = None) -> str:
+    """Extract and validate a coverage entry's `failure_mode_id` -- the one entry type
+    keyed by something other than a prefixed `id` (artifacts.md). Shared by
+    `_load_coverage` and T1.5's batch-check/apply, same reasoning as
+    `_extract_prefixed_id`."""
+    fm_id = item.get("failure_mode_id")
+    if not isinstance(fm_id, str) or not fm_id:
+        loc = f"entry at index {index}" if index is not None else "entry"
+        raise _err(file, f"{loc} is missing a non-empty string 'failure_mode_id'")
+    return fm_id
+
+
+def _parse_coverage_entry(file: Path, fm_id: str, item: Mapping[str, object]) -> CoverageEntry:
+    desc = f"coverage entry for {fm_id!r}"
+    return CoverageEntry(
+        failure_mode_id=fm_id,
+        detecting_metric_ids=_str_list_field(file, item, "detecting_metric_ids", desc),
+        metric_recommendation_ids=_str_list_field(file, item, "metric_recommendation_ids", desc),
+        alert_ids=_str_list_field(file, item, "alert_ids", desc),
+    )
 
 
 def _load_coverage(
@@ -386,23 +463,10 @@ def _load_coverage(
 ) -> dict[str, CoverageEntry]:
     result: dict[str, CoverageEntry] = {}
     for index, item in enumerate(raw_items):
-        fm_id = item.get("failure_mode_id")
-        if not isinstance(fm_id, str) or not fm_id:
-            raise _err(
-                file,
-                f"entry at index {index} is missing a non-empty string 'failure_mode_id'",
-            )
+        fm_id = _extract_coverage_key(file, item, index)
         if fm_id in result:
             raise _err(file, f"duplicate coverage key (failure_mode_id) {fm_id!r}")
-        desc = f"coverage entry for {fm_id!r}"
-        result[fm_id] = CoverageEntry(
-            failure_mode_id=fm_id,
-            detecting_metric_ids=_str_list_field(file, item, "detecting_metric_ids", desc),
-            metric_recommendation_ids=_str_list_field(
-                file, item, "metric_recommendation_ids", desc
-            ),
-            alert_ids=_str_list_field(file, item, "alert_ids", desc),
-        )
+        result[fm_id] = _parse_coverage_entry(file, fm_id, item)
     return result
 
 
@@ -487,6 +551,124 @@ def _parse_alert_recommendation(
         failure_mode_ids=_str_list_field(file, item, "failure_mode_ids", desc),
         annotations=_str_map_field(file, item, "annotations", desc, ("summary", "description")),
     )
+
+
+# --- Per-type field serializers (T1.5: the parsers' inverse, for surgical writing) ----
+
+
+def _serialize_system_component(c: SystemComponent) -> dict[str, object]:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "kind": c.kind,
+        "description": c.description,
+        "depends_on": list(c.depends_on),
+    }
+
+
+def _serialize_failure_mode(fm: FailureMode) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "id": fm.id,
+        "title": fm.title,
+        "description": fm.description,
+        "severity": fm.severity,
+        "user_visible": fm.user_visible,
+        "caused_by": list(fm.caused_by),
+        "coverage_status": fm.coverage_status,
+    }
+    if fm.exclusion_reason is not None:
+        fields["exclusion_reason"] = fm.exclusion_reason
+    return fields
+
+
+def _serialize_metric(m: Metric) -> dict[str, object]:
+    return {
+        "id": m.id,
+        "name": m.name,
+        "type": m.type,
+        "labels": list(m.labels),
+        "emitted_at": list(m.emitted_at),
+        "description": m.description,
+    }
+
+
+def _serialize_metric_recommendation(mr: MetricRecommendation) -> dict[str, object]:
+    fields: dict[str, object] = {"id": mr.id, "kind": mr.kind}
+    if mr.metric_id is not None:
+        fields["metric_id"] = mr.metric_id
+    fields["failure_mode_ids"] = list(mr.failure_mode_ids)
+    fields["rationale"] = mr.rationale
+    fields["details"] = mr.details
+    return fields
+
+
+def _serialize_alert_recommendation(ar: AlertRecommendation) -> dict[str, object]:
+    return {
+        "id": ar.id,
+        "name": ar.name,
+        "expr": ar.expr,
+        "for_duration": ar.for_duration,
+        "severity": ar.severity,
+        "failure_mode_ids": list(ar.failure_mode_ids),
+        "annotations": dict(ar.annotations),
+    }
+
+
+def _serialize_coverage(c: CoverageEntry) -> dict[str, object]:
+    return {
+        "failure_mode_id": c.failure_mode_id,
+        "detecting_metric_ids": list(c.detecting_metric_ids),
+        "metric_recommendation_ids": list(c.metric_recommendation_ids),
+        "alert_ids": list(c.alert_ids),
+    }
+
+
+# --- Entry-type registry (T1.5: one source of truth for batch_check/apply/write) -----
+
+
+@dataclass(frozen=True)
+class _TypeSpec:
+    """Everything the write side needs to know about one entry-based file, keyed by the
+    same `ArtifactSet` field name used throughout this module (`_ENTRY_FILENAMES`'s
+    keys) -- that string is also `Edit.entry_type`'s contract (implementation detail,
+    artifacts.md's decisions section). `prefix`/`phase` are `None` for `"coverage"`,
+    the one entry type with no `id` prefix and no single owning phase (it spans phases
+    3-4 by side, artifacts.md)."""
+
+    filename: str
+    id_key: str
+    prefix: str | None
+    phase: Phase | None
+    parser: Callable[[Path, str, Mapping[str, object]], object]
+    serializer: Callable[[Any], dict[str, object]]
+
+
+_TYPE_SPECS: dict[str, _TypeSpec] = {
+    "system_components": _TypeSpec(
+        "system-map.yaml", "id", "sm", Phase.SYSTEM_MAP,
+        _parse_system_component, _serialize_system_component,
+    ),
+    "failure_modes": _TypeSpec(
+        "failure-modes.yaml", "id", "fm", Phase.FAILURE_MODES,
+        _parse_failure_mode, _serialize_failure_mode,
+    ),
+    "metrics": _TypeSpec(
+        "metrics.yaml", "id", "mx", Phase.METRIC_COVERAGE,
+        _parse_metric, _serialize_metric,
+    ),
+    "metric_recommendations": _TypeSpec(
+        "metric-recommendations.yaml", "id", "mr", Phase.METRIC_COVERAGE,
+        _parse_metric_recommendation, _serialize_metric_recommendation,
+    ),
+    "alert_recommendations": _TypeSpec(
+        "alert-recommendations.yaml", "id", "ar", Phase.ALERT_RECOMMENDATIONS,
+        _parse_alert_recommendation, _serialize_alert_recommendation,
+    ),
+    "coverage": _TypeSpec(
+        "coverage.yaml", "failure_mode_id", None, None,
+        _parse_coverage_entry, _serialize_coverage,
+    ),
+}
 
 
 # --- Cross-entry structural checks ----------------------------------------------------
@@ -950,6 +1132,674 @@ def gap_counts(s: ArtifactSet) -> GapSummary:
     return GapSummary(alertable=alertable, metric_gap=metric_gap, excluded=excluded)
 
 
+# --- batch_check: the per-batch content check (T1.5) ----------------------------------
+
+
+def _check_regular_edit_schema(
+    s: ArtifactSet,
+    batch_phase: Phase,
+    edit: Edit,
+    live_ids: set[str],
+) -> BatchVerdict | None:
+    """The content half of the per-batch check for one non-coverage edit: phase
+    consistency, payload schema (reusing the same parser `load` uses), and -- for alert
+    edits -- expression syntax and rule-field validation via the set's stack. `live_ids`
+    is the set of ids that exist *as of this point in the batch* -- it starts as a copy
+    of every id already in `s` and is updated in place as ADD/REMOVE edits are processed
+    (added on ADD, discarded on REMOVE), so a batch that adds an id and then updates or
+    removes that same id later in the same batch is validated against the batch's actual
+    running effect rather than a static pre-batch snapshot. Returns `None` when the edit
+    passes, or the rejecting verdict."""
+    spec = _TYPE_SPECS[edit.entry_type]
+    assert spec.phase is not None and spec.prefix is not None  # not "coverage"
+    if spec.phase is not batch_phase:
+        return BatchVerdict(
+            ok=False,
+            message=(
+                f"edit tagged for phase {batch_phase.value} targets "
+                f"{edit.entry_type!r}, which belongs to phase {spec.phase.value}"
+            ),
+        )
+    file = Path(spec.filename)
+
+    if edit.op is EditOp.REMOVE:
+        id_ = edit.payload_or_id
+        if not isinstance(id_, str) or not id_:
+            return BatchVerdict(ok=False, message="remove op requires a non-empty string id")
+        # `live_ids` is a flattened union across every non-coverage entry type (ids are
+        # globally unique, artifacts.md), so membership alone doesn't catch a remove
+        # tagged with the wrong entry_type but naming a real id from a *different* type
+        # -- e.g. removing a metric id through a "system_components" edit. Reject that
+        # explicitly rather than letting it through to silently no-op in apply() (a
+        # dict.pop on the wrong map never raises, so it would report success without
+        # doing anything).
+        if not id_.startswith(f"{spec.prefix}-"):
+            return BatchVerdict(
+                ok=False,
+                message=(
+                    f"remove targets {id_!r}, which does not use the {spec.prefix!r}- "
+                    f"prefix required for {edit.entry_type!r}"
+                ),
+            )
+        if id_ not in live_ids:
+            return BatchVerdict(ok=False, message=f"remove targets unknown id {id_!r}")
+        live_ids.discard(id_)
+        return None
+
+    payload = edit.payload_or_id
+    if not isinstance(payload, dict):
+        return BatchVerdict(
+            ok=False,
+            message=f"{edit.op.value} op on {edit.entry_type!r} requires a mapping payload",
+        )
+    try:
+        id_ = _extract_prefixed_id(file, payload, spec.prefix)
+    except StructuralValidationError as exc:
+        return BatchVerdict(ok=False, message=exc.cause)
+
+    if edit.op is EditOp.ADD and id_ in live_ids:
+        return BatchVerdict(ok=False, message=f"duplicate id {id_!r}")
+    if edit.op is EditOp.UPDATE and id_ not in live_ids:
+        return BatchVerdict(ok=False, message=f"update targets unknown id {id_!r}")
+
+    try:
+        entry = spec.parser(file, id_, payload)
+    except StructuralValidationError as exc:
+        return BatchVerdict(ok=False, message=exc.cause)
+
+    if edit.entry_type == "alert_recommendations":
+        assert isinstance(entry, AlertRecommendation)
+        rule_input = AlertRuleInput(
+            name=entry.name,
+            expr=entry.expr,
+            for_duration=entry.for_duration,
+            severity=entry.severity,
+            annotations=dict(entry.annotations),
+        )
+        try:
+            expr_verdict = s.stack.validate_expression(entry.expr)
+        except Exception as exc:  # defense-in-depth: a misbehaving stack must not crash
+            return BatchVerdict(ok=False, message=f"stack raised validating expression: {exc}")
+        if not expr_verdict.ok:
+            return BatchVerdict(ok=False, message=expr_verdict.message or "invalid expression")
+        try:
+            fields_verdict = s.stack.validate_rule_fields(rule_input)
+        except Exception as exc:  # same defense, for the rule-fields validator
+            return BatchVerdict(ok=False, message=f"stack raised validating rule fields: {exc}")
+        if not fields_verdict.ok:
+            return BatchVerdict(ok=False, message=fields_verdict.message or "invalid rule fields")
+
+    if edit.op is EditOp.ADD:
+        live_ids.add(id_)
+    return None
+
+
+_METRIC_SIDE_KEYS = frozenset({"detecting_metric_ids", "metric_recommendation_ids"})
+_ALERT_SIDE_KEYS = frozenset({"alert_ids"})
+
+
+def _check_coverage_edit_schema(
+    s: ArtifactSet, batch_phase: Phase, edit: Edit
+) -> BatchVerdict | None:
+    """The content half of the per-batch check for one coverage edit: only `update` is
+    ever legal (coverage keys are mechanical, artifacts.md), the batch must be tagged
+    phase 3 or 4, and the payload may only carry that phase's owned side."""
+    if edit.op is not EditOp.UPDATE:
+        return BatchVerdict(
+            ok=False,
+            message=(
+                "coverage entries accept only update ops -- their keys are mechanical "
+                f"(op was {edit.op.value})"
+            ),
+        )
+    if batch_phase not in (Phase.METRIC_COVERAGE, Phase.ALERT_RECOMMENDATIONS):
+        return BatchVerdict(
+            ok=False,
+            message=(
+                f"coverage edits must be tagged phase 3 or phase 4, got phase {batch_phase.value}"
+            ),
+        )
+    payload = edit.payload_or_id
+    if not isinstance(payload, dict):
+        return BatchVerdict(ok=False, message="coverage update requires a mapping payload")
+    fm_id = payload.get("failure_mode_id")
+    if not isinstance(fm_id, str) or not fm_id:
+        return BatchVerdict(
+            ok=False, message="coverage update requires a non-empty string 'failure_mode_id'"
+        )
+    if fm_id not in s.failure_modes:
+        return BatchVerdict(
+            ok=False, message=f"coverage update targets unknown failure_mode_id {fm_id!r}"
+        )
+
+    owned_keys = _METRIC_SIDE_KEYS if batch_phase is Phase.METRIC_COVERAGE else _ALERT_SIDE_KEYS
+    other_keys = _ALERT_SIDE_KEYS if batch_phase is Phase.METRIC_COVERAGE else _METRIC_SIDE_KEYS
+    present_other = other_keys & payload.keys()
+    if present_other:
+        return BatchVerdict(
+            ok=False,
+            message=(
+                f"phase {batch_phase.value} coverage edit for {fm_id!r} touches the "
+                f"other side's field(s): {', '.join(sorted(present_other))}"
+            ),
+        )
+    for key in owned_keys & payload.keys():
+        value = payload[key]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return BatchVerdict(ok=False, message=f"{key!r} must be a list of strings")
+    return None
+
+
+def batch_check(s: ArtifactSet, b: EditBatch) -> BatchVerdict:
+    """The per-batch content check (architecture, Edit-proposal protocol): payload
+    schema, phase consistency (the tagged phase's owned side for coverage entries), and
+    R19's structural rules -- uniqueness, reference integrity including removals,
+    acyclicity -- applied to the resulting candidate, so an accepted batch always passes
+    its own next load. Never raises for a content problem (`BatchVerdict.ok=False`
+    carries the reason instead); only a programmer error (an unrecognized `entry_type`
+    reaching `apply` after passing every check above, which cannot happen through this
+    function's own dispatch) would propagate."""
+    # The ids that exist as of "now" while walking the batch in order -- starts as every
+    # id already in `s` and is updated in place by `_check_regular_edit_schema` as
+    # ADD/REMOVE edits are processed, so an ADD followed later in the same batch by an
+    # UPDATE or REMOVE of that same id validates against the batch's running effect
+    # rather than a static pre-batch snapshot (a batch is never required to touch each
+    # id only once).
+    live_ids = (
+        set(s.system_components)
+        | set(s.failure_modes)
+        | set(s.metrics)
+        | set(s.metric_recommendations)
+        | set(s.alert_recommendations)
+    )
+
+    for edit in b.edits:
+        if edit.entry_type not in _TYPE_SPECS:
+            return BatchVerdict(ok=False, message=f"unknown entry_type {edit.entry_type!r}")
+        if edit.entry_type == "coverage":
+            verdict = _check_coverage_edit_schema(s, b.phase, edit)
+        else:
+            verdict = _check_regular_edit_schema(s, b.phase, edit, live_ids)
+        if verdict is not None:
+            return verdict
+
+    candidate = apply(s, b)
+
+    files = {key: Path(spec.filename) for key, spec in _TYPE_SPECS.items()}
+    try:
+        _check_dangling_references(
+            candidate.system_components,
+            candidate.failure_modes,
+            candidate.metrics,
+            candidate.metric_recommendations,
+            candidate.alert_recommendations,
+            candidate.coverage,
+            files,
+        )
+        _check_acyclic(candidate.failure_modes, files["failure_modes"])
+        _check_coverage_completeness(candidate.failure_modes, candidate.coverage, files["coverage"])
+    except StructuralValidationError as exc:
+        return BatchVerdict(ok=False, message=exc.cause)
+
+    return BatchVerdict(ok=True)
+
+
+# --- apply: the pure candidate, with mechanical coverage completeness (T1.5) ----------
+
+
+def _apply_add_update_or_remove[EntryT](
+    edit: Edit,
+    target: dict[str, EntryT],
+    file: Path,
+    prefix: str,
+    parser: Callable[[Path, str, Mapping[str, object]], EntryT],
+) -> str:
+    """Mutate `target` (a copy `apply` owns, never the caller's) in place per `edit`'s
+    op; returns the affected id -- `apply`'s failure-mode bookkeeping uses it to drive
+    mechanical coverage completeness, every other entry type ignores it. Assumes `edit`
+    already passed `batch_check`'s content validation; a malformed edit reaching here
+    (bypassing `batch_check`) is a programmer error and raises."""
+    if edit.op is EditOp.REMOVE:
+        id_ = edit.payload_or_id
+        assert isinstance(id_, str), "remove op must carry a string id"
+        target.pop(id_, None)
+        return id_
+    payload = edit.payload_or_id
+    assert isinstance(payload, dict), f"{edit.op.value} op must carry a mapping payload"
+    id_ = _extract_prefixed_id(file, payload, prefix)
+    target[id_] = parser(file, id_, payload)
+    return id_
+
+
+def _coerce_str_tuple(value: object) -> tuple[str, ...]:
+    if isinstance(value, tuple):
+        return cast(tuple[str, ...], value)
+    assert isinstance(value, list), "coverage side field must be a list of strings"
+    return tuple(value)
+
+
+def _apply_coverage_edit(edit: Edit, phase: Phase, coverage: dict[str, CoverageEntry]) -> None:
+    """Merge one coverage edit's owned side into `coverage` in place, leaving the other
+    side untouched (architecture: "apply merges the owned side and leaves the other
+    untouched")."""
+    payload = edit.payload_or_id
+    assert isinstance(payload, dict), "coverage update must carry a mapping payload"
+    fm_id = payload["failure_mode_id"]
+    assert isinstance(fm_id, str)
+    existing = coverage.get(fm_id, CoverageEntry(fm_id, (), (), ()))
+    if phase is Phase.METRIC_COVERAGE:
+        coverage[fm_id] = CoverageEntry(
+            failure_mode_id=fm_id,
+            detecting_metric_ids=_coerce_str_tuple(
+                payload.get("detecting_metric_ids", existing.detecting_metric_ids)
+            ),
+            metric_recommendation_ids=_coerce_str_tuple(
+                payload.get("metric_recommendation_ids", existing.metric_recommendation_ids)
+            ),
+            alert_ids=existing.alert_ids,
+        )
+    else:
+        coverage[fm_id] = CoverageEntry(
+            failure_mode_id=fm_id,
+            detecting_metric_ids=existing.detecting_metric_ids,
+            metric_recommendation_ids=existing.metric_recommendation_ids,
+            alert_ids=_coerce_str_tuple(payload.get("alert_ids", existing.alert_ids)),
+        )
+
+
+def apply(s: ArtifactSet, b: EditBatch) -> ArtifactSet:
+    """Apply `b` to `s`, returning a new `ArtifactSet` -- pure, `s` is never mutated
+    (architecture: "a later apply must return a new ArtifactSet rather than mutate this
+    one in place"). Coverage completeness is mechanical, never the agent's: adding a
+    failure mode creates its empty coverage entry in the candidate, removing one deletes
+    it -- so no reachable candidate can violate the one-entry-per-failure-mode rule
+    (artifacts.md)."""
+    system_components = dict(s.system_components)
+    failure_modes = dict(s.failure_modes)
+    metrics = dict(s.metrics)
+    metric_recommendations = dict(s.metric_recommendations)
+    alert_recommendations = dict(s.alert_recommendations)
+    coverage = dict(s.coverage)
+
+    added_failure_modes: set[str] = set()
+    removed_failure_modes: set[str] = set()
+
+    for edit in b.edits:
+        if edit.entry_type == "system_components":
+            _apply_add_update_or_remove(
+                edit, system_components, Path("system-map.yaml"), "sm", _parse_system_component
+            )
+        elif edit.entry_type == "failure_modes":
+            fm_id = _apply_add_update_or_remove(
+                edit, failure_modes, Path("failure-modes.yaml"), "fm", _parse_failure_mode
+            )
+            if edit.op is EditOp.ADD:
+                added_failure_modes.add(fm_id)
+                removed_failure_modes.discard(fm_id)
+            elif edit.op is EditOp.REMOVE:
+                removed_failure_modes.add(fm_id)
+                added_failure_modes.discard(fm_id)
+        elif edit.entry_type == "metrics":
+            _apply_add_update_or_remove(edit, metrics, Path("metrics.yaml"), "mx", _parse_metric)
+        elif edit.entry_type == "metric_recommendations":
+            _apply_add_update_or_remove(
+                edit,
+                metric_recommendations,
+                Path("metric-recommendations.yaml"),
+                "mr",
+                _parse_metric_recommendation,
+            )
+        elif edit.entry_type == "alert_recommendations":
+            _apply_add_update_or_remove(
+                edit,
+                alert_recommendations,
+                Path("alert-recommendations.yaml"),
+                "ar",
+                _parse_alert_recommendation,
+            )
+        elif edit.entry_type == "coverage":
+            continue  # handled in the second pass below, after mechanical completeness
+        else:
+            raise ValueError(f"unknown entry_type {edit.entry_type!r}")
+
+    for fm_id in added_failure_modes:
+        coverage.setdefault(fm_id, CoverageEntry(fm_id, (), (), ()))
+    for fm_id in removed_failure_modes:
+        coverage.pop(fm_id, None)
+
+    for edit in b.edits:
+        if edit.entry_type == "coverage":
+            _apply_coverage_edit(edit, b.phase, coverage)
+
+    return ArtifactSet(
+        system_components=system_components,
+        failure_modes=failure_modes,
+        metrics=metrics,
+        metric_recommendations=metric_recommendations,
+        alert_recommendations=alert_recommendations,
+        coverage=coverage,
+        analyzed_sha=s.analyzed_sha,
+        schema_version=s.schema_version,
+        stack_name=s.stack_name,
+        stack=s.stack,
+        config_existed=s.config_existed,
+        raw_bytes=s.raw_bytes,
+        documents=s.documents,
+    )
+
+
+# --- referencing_phases: the reference half of the amendment blast radius (T1.5) ------
+
+
+def referencing_phases(s: ArtifactSet, changed_ids: set[str]) -> set[Phase]:
+    """The phases owning entries that reference any id in `changed_ids` -- coverage
+    entries attributed by side (metric side references -> phase 3, alert side -> phase
+    4, artifacts.md). One hop only: the orchestrator's amendment recompute is what loops
+    this to a fixpoint over a growing changed-id set, not this function."""
+    phases: set[Phase] = set()
+    for component in s.system_components.values():
+        if any(dep in changed_ids for dep in component.depends_on):
+            phases.add(Phase.SYSTEM_MAP)
+    for fm in s.failure_modes.values():
+        if any(cause in changed_ids for cause in fm.caused_by):
+            phases.add(Phase.FAILURE_MODES)
+    for mr in s.metric_recommendations.values():
+        if (mr.metric_id is not None and mr.metric_id in changed_ids) or any(
+            fmid in changed_ids for fmid in mr.failure_mode_ids
+        ):
+            phases.add(Phase.METRIC_COVERAGE)
+    for ar in s.alert_recommendations.values():
+        if any(fmid in changed_ids for fmid in ar.failure_mode_ids):
+            phases.add(Phase.ALERT_RECOMMENDATIONS)
+    for cov in s.coverage.values():
+        if any(mid in changed_ids for mid in cov.detecting_metric_ids) or any(
+            mrid in changed_ids for mrid in cov.metric_recommendation_ids
+        ):
+            phases.add(Phase.METRIC_COVERAGE)
+        if any(arid in changed_ids for arid in cov.alert_ids):
+            phases.add(Phase.ALERT_RECOMMENDATIONS)
+    return phases
+
+
+# --- render_docs: deterministic derived-doc rendering (T1.5) -------------------------
+
+
+def _doc_header_and_title(title: str) -> str:
+    return f"{GENERATED_DOC_HEADER}\n\n# {title}\n\n"
+
+
+def _render_system_map(s: ArtifactSet) -> bytes:
+    parts = [_doc_header_and_title("System map")]
+    for c in sorted(s.system_components.values(), key=lambda c: c.id):
+        parts.append(f"## {c.id}: {c.name}\n\n")
+        parts.append(f"- kind: {c.kind}\n")
+        parts.append(f"- description: {c.description}\n")
+        parts.append(f"- depends_on: {', '.join(c.depends_on) or '(none)'}\n\n")
+    return "".join(parts).encode()
+
+
+def _render_failure_modes(s: ArtifactSet) -> bytes:
+    parts = [_doc_header_and_title("Failure modes")]
+    for fm in sorted(s.failure_modes.values(), key=lambda fm: fm.id):
+        parts.append(f"## {fm.id}: {fm.title}\n\n")
+        parts.append(f"- description: {fm.description}\n")
+        parts.append(f"- severity: {fm.severity}\n")
+        parts.append(f"- user_visible: {fm.user_visible}\n")
+        parts.append(f"- coverage_status: {fm.coverage_status}\n")
+        parts.append(f"- caused_by: {', '.join(fm.caused_by) or '(none)'}\n")
+        if fm.exclusion_reason is not None:
+            parts.append(f"- exclusion_reason: {fm.exclusion_reason}\n")
+        parts.append("\n")
+    return "".join(parts).encode()
+
+
+def _render_metrics(s: ArtifactSet) -> bytes:
+    parts = [_doc_header_and_title("Implemented metrics")]
+    for m in sorted(s.metrics.values(), key=lambda m: m.id):
+        parts.append(f"## {m.id}: {m.name}\n\n")
+        parts.append(f"- type: {m.type}\n")
+        parts.append(f"- labels: {', '.join(m.labels) or '(none)'}\n")
+        parts.append(f"- emitted_at: {', '.join(m.emitted_at) or '(none)'}\n")
+        parts.append(f"- description: {m.description}\n\n")
+    return "".join(parts).encode()
+
+
+def _render_metric_recommendations(s: ArtifactSet) -> bytes:
+    parts = [_doc_header_and_title("Metric recommendations")]
+    for mr in sorted(s.metric_recommendations.values(), key=lambda mr: mr.id):
+        parts.append(f"## {mr.id}\n\n")
+        parts.append(f"- kind: {mr.kind}\n")
+        if mr.metric_id is not None:
+            parts.append(f"- metric_id: {mr.metric_id}\n")
+        parts.append(f"- failure_mode_ids: {', '.join(mr.failure_mode_ids) or '(none)'}\n")
+        parts.append(f"- rationale: {mr.rationale}\n")
+        parts.append(f"- details: {mr.details}\n\n")
+    return "".join(parts).encode()
+
+
+def _render_alert_recommendations(s: ArtifactSet) -> bytes:
+    parts = [_doc_header_and_title("Alert recommendations")]
+    for ar in sorted(s.alert_recommendations.values(), key=lambda ar: ar.id):
+        parts.append(f"## {ar.id}: {ar.name}\n\n")
+        parts.append(f"- severity: {ar.severity}\n")
+        parts.append(f"- failure_mode_ids: {', '.join(ar.failure_mode_ids) or '(none)'}\n\n")
+        rule_input = AlertRuleInput(
+            name=ar.name,
+            expr=ar.expr,
+            for_duration=ar.for_duration,
+            severity=ar.severity,
+            annotations=dict(ar.annotations),
+        )
+        shape = s.stack.alert_rule_shape(rule_input)
+        buf = io.StringIO()
+        _YAML.dump(shape, buf)
+        parts.append("```yaml\n")
+        parts.append(buf.getvalue())
+        parts.append("```\n\n")
+    return "".join(parts).encode()
+
+
+def _render_coverage(s: ArtifactSet) -> bytes:
+    gaps = gap_counts(s)
+    parts = [_doc_header_and_title("Coverage mapping")]
+    parts.append("## Gap report\n\n")
+    parts.append(f"- alertable: {gaps.alertable}\n")
+    parts.append(f"- metric-gap: {gaps.metric_gap}\n")
+    parts.append(f"- excluded: {gaps.excluded}\n\n")
+    parts.append("## Entries\n\n")
+    for cov in sorted(s.coverage.values(), key=lambda cov: cov.failure_mode_id):
+        parts.append(f"### {cov.failure_mode_id}\n\n")
+        parts.append(
+            f"- detecting_metric_ids: {', '.join(cov.detecting_metric_ids) or '(none)'}\n"
+        )
+        parts.append(
+            "- metric_recommendation_ids: "
+            f"{', '.join(cov.metric_recommendation_ids) or '(none)'}\n"
+        )
+        parts.append(f"- alert_ids: {', '.join(cov.alert_ids) or '(none)'}\n\n")
+    return "".join(parts).encode()
+
+
+def render_docs(s: ArtifactSet) -> dict[Path, bytes]:
+    """Render every derived doc from `s`'s current entries: the generated-file header
+    first, entries sorted by id, `coverage.md` carrying the gap report. Deterministic --
+    unchanged YAML renders byte-identically (R9) -- since it is a pure function of `s`'s
+    entries. Keys are relative to `.blare/` (`docs/<name>.md`); `write_docs` joins them
+    with `root`."""
+    return {
+        Path(_DOCS_DIRNAME) / "system-map.md": _render_system_map(s),
+        Path(_DOCS_DIRNAME) / "failure-modes.md": _render_failure_modes(s),
+        Path(_DOCS_DIRNAME) / "metrics.md": _render_metrics(s),
+        Path(_DOCS_DIRNAME) / "metric-recommendations.md": _render_metric_recommendations(s),
+        Path(_DOCS_DIRNAME) / "alert-recommendations.md": _render_alert_recommendations(s),
+        Path(_DOCS_DIRNAME) / "coverage.md": _render_coverage(s),
+    }
+
+
+# --- raw_bytes_match: the R20 write-time re-check (T1.5) -----------------------------
+
+
+def raw_bytes_match(root: Path, s: ArtifactSet) -> bool:
+    """Whether the canonical YAML set (entry-based files plus state -- `config.yaml`
+    excluded) on disk still matches what `s` loaded, byte for byte. A pure comparison,
+    no validation: a mid-run hand edit surfaces as R20's "changed mid-run" abort, not a
+    validation error. The fresh-run baseline (`s.raw_bytes == {}`) means any
+    compared-path file appearing mid-run fails the check."""
+    for filename in _CANONICAL_YAML_FILENAMES:
+        path = root / filename
+        recorded = s.raw_bytes.get(filename)
+        if recorded is None:
+            if path.exists():
+                return False
+            continue
+        try:
+            current = path.read_bytes()
+        except OSError:
+            return False
+        if current != recorded:
+            return False
+    return True
+
+
+# --- Write primitives (T1.5): surgical entries+config, docs, state -------------------
+
+
+def _write_file(path: Path, data: bytes) -> None:
+    """The write seam every primitive below goes through -- what the failure-mode test
+    plan's "`_write_file` monkeypatched" targets. Wraps a filesystem failure as
+    `WriteError` naming the file (R20's crash case; artifacts.md, Failure visibility)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as exc:
+        raise WriteError(
+            cause=f"{path} could not be written ({exc.strerror or exc})",
+            next_action=(
+                "Nothing under .blare/ is committed until you commit it yourself: check "
+                "git status and restore or clean up the partial write, then re-run blare."
+            ),
+        ) from exc
+
+
+def _dump_yaml_bytes(data: object) -> bytes:
+    buf = io.BytesIO()
+    _YAML.dump(data, buf)
+    return buf.getvalue()
+
+
+def _to_commented_map(fields: Mapping[str, object]) -> CommentedMap:
+    cm = CommentedMap()
+    for key, value in fields.items():
+        cm[key] = value
+    return cm
+
+
+def _merge_entry_file(
+    spec: _TypeSpec, loaded_seq: CommentedSeq, current_map: Mapping[str, object]
+) -> tuple[CommentedSeq, bool]:
+    """Surgically merge `current_map` (the final in-memory entries) against `loaded_seq`
+    (the round-trip YAML `load` parsed), returning a new sequence: an entry whose parsed
+    value is unchanged keeps its exact original object -- hand-formatting, comments,
+    quote style included (architecture, Determinism) -- a changed entry's item is
+    replaced, a removed one is dropped, and new entries are appended in id order.
+    `loaded_seq` (an `ArtifactSet.documents` entry, potentially shared with other
+    candidates derived from the same loaded set via `apply`) is deep-copied first and
+    never itself mutated, keeping this a pure function despite `CommentedSeq` being a
+    mutable container. Returns the merged sequence and whether anything actually
+    changed."""
+    merged: CommentedSeq = copy.deepcopy(loaded_seq)
+    changed = False
+    seen_ids: set[str] = set()
+    kept_indices: list[int] = []
+    for index, item in enumerate(merged):
+        item_id = item.get(spec.id_key)
+        assert isinstance(item_id, str)  # already validated at load time
+        seen_ids.add(item_id)
+        if item_id not in current_map:
+            changed = True
+            continue
+        original_entry = spec.parser(Path(spec.filename), item_id, item)
+        if original_entry != current_map[item_id]:
+            changed = True
+            merged[index] = _to_commented_map(spec.serializer(current_map[item_id]))
+        kept_indices.append(index)
+
+    for index in sorted(set(range(len(merged))) - set(kept_indices), reverse=True):
+        del merged[index]
+
+    new_ids = sorted(set(current_map) - seen_ids)
+    if new_ids:
+        changed = True
+    for new_id in new_ids:
+        merged.append(_to_commented_map(spec.serializer(current_map[new_id])))
+
+    return merged, changed
+
+
+def write_entries_and_config(root: Path, s: ArtifactSet) -> WriteReport:
+    """Write the six entry-based files plus `config.yaml`, surgically: a file with no
+    changed entries is not rewritten, except that a fresh run (`s.documents == {}`)
+    creates every canonical file, zero-entry files included, so the written set
+    satisfies load's "entry files present when state exists" rule. `config.yaml` is
+    created only when it did not already exist (R23); an existing one is preserved
+    byte-identically (never rewritten). Raises `WriteError` naming the failing file if a
+    write fails partway; files already written land on disk regardless."""
+    written: list[Path] = []
+    skipped: list[Path] = []
+
+    for key, filename in _ENTRY_FILENAMES.items():
+        path = root / filename
+        spec = _TYPE_SPECS[key]
+        current_map = getattr(s, key)
+        if filename in s.documents:
+            merged_seq, changed = _merge_entry_file(spec, s.documents[filename], current_map)
+            if not changed:
+                skipped.append(path)
+                continue
+        else:
+            merged_seq = CommentedSeq()
+            for entry_id in sorted(current_map):
+                merged_seq.append(_to_commented_map(spec.serializer(current_map[entry_id])))
+        _write_file(path, _dump_yaml_bytes(merged_seq))
+        written.append(path)
+
+    config_path = root / _CONFIG_FILENAME
+    if s.config_existed:
+        skipped.append(config_path)
+    else:
+        _write_file(config_path, _dump_yaml_bytes({"stack": s.stack_name}))
+        written.append(config_path)
+
+    return WriteReport(written=tuple(written), skipped=tuple(skipped))
+
+
+def write_docs(root: Path, s: ArtifactSet) -> WriteReport:
+    """Restore every derived doc to the canonical form of `s`'s current entries (R10):
+    unconditional, since restoration -- not skip-if-unchanged -- is what R10 promises;
+    when nothing changed, the restored bytes equal what was already there, so R9's zero
+    diff still holds at the git level even though every file is rewritten."""
+    written: list[Path] = []
+    for rel_path, content in render_docs(s).items():
+        path = root / rel_path
+        _write_file(path, content)
+        written.append(path)
+    return WriteReport(written=tuple(written), skipped=())
+
+
+def write_state(root: Path, s: ArtifactSet, analyzed_sha: str) -> WriteReport:
+    """Write `state.yaml` last (R20). `analyzed_sha` enters only here, never through
+    batches. When `s` was loaded from an existing state file and `analyzed_sha` equals
+    what was already recorded, the file is left untouched -- byte for byte -- rather
+    than reformatted, since R9 permits exactly two changes in a no-op run and "the
+    analyzed SHA advancing" is not one of them when it does not advance."""
+    path = root / _STATE_FILENAME
+    if _STATE_FILENAME in s.raw_bytes and analyzed_sha == s.analyzed_sha:
+        return WriteReport(written=(), skipped=(path,))
+    data = {"analyzed_sha": analyzed_sha, "schema_version": s.schema_version}
+    _write_file(path, _dump_yaml_bytes(data))
+    return WriteReport(written=(path,), skipped=())
+
+
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "GENERATED_DOC_HEADER",
@@ -958,6 +1808,7 @@ __all__ = [
     "PreexistingFilesError",
     "ConfigError",
     "SchemaVersionError",
+    "WriteError",
     "SystemComponent",
     "FailureMode",
     "Metric",
@@ -966,10 +1817,19 @@ __all__ = [
     "CoverageEntry",
     "GapSummary",
     "ArtifactSet",
+    "WriteReport",
     "state_exists",
     "init_inspection",
     "empty_set",
     "load",
     "semantic_violations",
     "gap_counts",
+    "batch_check",
+    "apply",
+    "referencing_phases",
+    "render_docs",
+    "raw_bytes_match",
+    "write_entries_and_config",
+    "write_docs",
+    "write_state",
 ]
