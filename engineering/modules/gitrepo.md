@@ -3,7 +3,18 @@
 ## Decisions needed from you
 
 This section contains only open items. **No open items** — everything below is implementation
-of boundaries the architecture fixed. 
+of boundaries the architecture fixed.
+
+**Changes since last approval**: gains `patch_text` (added 2026-07-31) — the real diff
+content `effective_delta` never produced, a gap discovered via live testing (orchestrator.py
+hardcoded an empty patch text for triage from T2.2 onward; T4.1's release-suite capture
+showed the model correctly noticing it had nothing real to review and defaulting to
+no-impact for a substantive commit). No cap on patch size in the MVP — deliberately: R8
+already commits to "any number of commits" in a delta with no size limit on the resulting
+file list, so a size cap on the same delta's patch text would be an inconsistent,
+unprincipled place to suddenly start capping. If a real diff turns out to be impractically
+large for the model's context in practice, that is a problem to observe and record when it
+actually happens, not one to speculatively design around now.
 
 ## Responsibility
 
@@ -24,6 +35,7 @@ class GitRepo:
     def is_ancestor(self, ancestor: str, descendant: str) -> bool
     def dirty_paths_outside(self, exclude: str) -> list[str]
     def effective_delta(self, base_sha: str, end_sha: str, exclude: str) -> Delta
+    def patch_text(self, base_sha: str, end_sha: str, exclude: str) -> str
     def tree_matches(self, sha: str, exclude: str) -> bool
 ```
 
@@ -45,6 +57,14 @@ class GitRepo:
   of the user's `diff.renames` config: a rename is always added-plus-deleted. Status `T`
   (typechange) maps to `modified`; any other status letter is unparseable output
   (`GitCommandError`).
+- `patch_text(base_sha, end_sha, exclude)` (2026-07-31): the same range's full unified diff
+  — real content, not just file/status — via
+  `git diff --no-renames base end -- . ':(exclude).blare'` (same as `effective_delta`'s
+  command, minus `--name-status`). Same net-diff semantics as `effective_delta` over the
+  identical range (empty for same-SHA and for a change-plus-revert), for the same reason:
+  it must answer "what would triage see," not "what happened commit-by-commit." No output
+  parsing beyond the subprocess call — the text is opaque to this module, consumed only by
+  the model via `RunContext.patch_text` (agent.md). No size cap (Decisions section).
 - `tree_matches`: true when the working tree outside `exclude` is byte-identical to the tree
   at `sha` and no untracked files exist outside `exclude` — the R20 write-time re-check.
   Git-ignored files never affect it, exactly as in `dirty_paths_outside`: a build output or
@@ -115,6 +135,9 @@ Contract tests (`test_contract_*`), one per behaviour:
   change-plus-revert delta empty; files under the excluded dir absent from the delta;
   a rename surfaces as added plus deleted regardless of `diff.renames` config; a
   typechange (file replaced by symlink) maps to `modified`.
+- `patch_text` returns real diff content for a modified file (contains the changed lines);
+  empty for a same-SHA range and for a change-plus-revert; files under the excluded dir
+  never appear in it; content is independent of the user's `diff.renames` config.
 - `repo_id` stable across calls and invocation directories; differs between two checkouts of
   the same content.
 - `tree_matches` true on clean tree at HEAD; false after a tracked edit, after an untracked
@@ -127,7 +150,9 @@ Failure-mode tests (`test_failure_<dependency>_<mode>`), dependency = the git su
   `GitCommandError` naming the executable.
 - `test_failure_git_command_error` — corrupted object store (`.git/objects` emptied),
   exercised through `effective_delta` (whose corrupt-store failure has no answer-set or
-  typed-refusal mapping); `GitCommandError` carrying git's stderr.
+  typed-refusal mapping); `GitCommandError` carrying git's stderr. `patch_text` shares the
+  identical subprocess/error path (same failure-mode dependency, no separate test needed —
+  the two-set testing rule enumerates failure modes per dependency, not per method).
 - `test_failure_git_answer_set_exceeded` — stub git exiting 2 on
   `merge-base --is-ancestor`; `GitCommandError`, not `False`.
 - `test_failure_git_unparseable_status` — injected executable (a stub script) exiting zero

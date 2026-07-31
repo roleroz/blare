@@ -6,7 +6,9 @@ This section contains only open items. **No open items** — the exit-code taxon
 conventional mapping documented as fact; say so if you want it surfaced as a choice instead.
 
 **Changes since last approval**: a progress ticker wraps every agent-driving call (R25,
-added 2026-07-31). See Phase engine.
+added 2026-07-31). See Phase engine. Step 6 of the preflight sequence now also captures the
+delta's full patch text via `gitrepo.patch_text` (new in gitrepo.md), closing a gap
+hardcoded empty since T2.2 and discovered via live testing.
 
 
 ## Responsibility
@@ -58,7 +60,11 @@ Fail-fast, in order, per the spec's precedence rules:
    never touches the stack module and hands `s.stack` to the agent session as a value
 5. update only: recorded SHA resolves and is an ancestor (R15)
 6. update only: empty effective delta → up-to-date summary with gap counts from the loaded
-   set, exit 0 (R7; no session, no login, no transcript)
+   set, exit 0 (R7; no session, no login, no transcript). A non-empty delta's full patch
+   text (`gitrepo.patch_text`, same range and exclude as `effective_delta`) is captured here
+   too, carried through to `RunContext.patch_text` at step 9 (2026-07-31 fix: this was
+   hardcoded `""` from T2.2 through T4.1, a real gap discovered via live testing — triage
+   was judging affected phases from file names alone, never real diff content)
 7. semantic check on the loaded set → violations seed the affected-phase queue (R18)
 8. TTY check, only reached when checkpoints will be presented (R22)
 9. auth preflight via `AgentSession.start` (R12)
@@ -279,6 +285,10 @@ R20's nothing-written on observable filesystem state):
   (6,7) an empty delta exits 0 with no seeding and no session even when the loaded set has
   semantic violations (R7 precedence); (7,8) semantic seeds never terminate the run — with
   a seeded queue and a non-TTY stdin, the R22 refusal is what fires.
+- update mode's `RunContext` (T4.4): for a non-empty delta, `session.started_with`'s
+  context carries both `delta_files` (the existing assertion) and `patch_text` equal to
+  `gitrepo.patch_text`'s return value for the captured range — asserted via the fake
+  `GitRepo`'s recorded arguments, not by re-deriving the diff text in the test.
 - analyze happy path: four checkpoints, approvals; artifacts on disk match the candidate;
   default config created; state written last per the report; exit 0; summary counts, gap
   counts, transcript path.

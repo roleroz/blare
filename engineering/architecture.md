@@ -14,8 +14,11 @@ T2.5 — building `create_client`'s real (`unset`) branch, discovered missing wh
 (no prior task's scope ever included it). It also gained **T4.3 progress feedback**, after
 T4.2 — R25's three-module handshake (agent tool-call callback, orchestrator ticker, cli
 rendering), added as a new cross-cutting decision and reflected in the agent/orchestrator/cli
-module bullets above. Everything else in the Tasks section, and everything above it, is as
-previously approved.
+module bullets above. And **T4.4 real patch text for triage**, after T4.3 — `gitrepo` gains
+`patch_text` (real diff content, no size cap), wired into `RunContext.patch_text` at
+preflight step 9, closing a gap hardcoded empty since T2.2 and discovered via T4.1's live
+testing. The gitrepo module bullet above is updated to match. Everything else in the Tasks
+section, and everything above it, is as previously approved.
 
 ---
 
@@ -55,8 +58,9 @@ graph TD
   coordinates the others.
 - **gitrepo** — all git access, via the `git` subprocess: repo discovery, SHA resolution and
   ancestry, dirty-tree check (excluding `.blare/` and git-ignored files), effective-delta
-  computation, and the repo-id (a hash of the repository's top-level worktree path — two
-  invocations in the same checkout collide on the lock, R21; different checkouts do not). No
+  computation and its full patch text, and the repo-id (a hash of the repository's
+  top-level worktree path — two invocations in the same checkout collide on the lock, R21;
+  different checkouts do not). No
   other module invokes git.
 - **artifacts** — everything under `.blare/`: YAML schemas, structural load-time validation
   (R19), the per-batch content check (consulting **stack** for alert-expression syntax), the
@@ -318,3 +322,21 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   delay or fake clock advancing between them) asserts progress lines appear on the PTY
   before the checkpoint renders, naming the phase and updating `last_activity`. Traces:
   R25.
+- [ ] **T4.4 real patch text for triage**: `gitrepo.patch_text` (new — real diff content
+  for the same range `effective_delta` already covers, no size cap per gitrepo.md's
+  Decisions), wired into `RunContext.patch_text` at preflight step 9, replacing the `""`
+  hardcoded since T2.2. Discovered via T4.1's live testing: the model, given no real diff,
+  correctly defaulted to no-impact for a substantive commit. Once wired, every recorded
+  fixture that reaches triage over a non-empty delta will byte-mismatch against its
+  hardcoded `"patch_text": ""` — this task must update the `patch_text` field in all six:
+  `update-happy-path`, `update-multi-commit`, `update-no-impact`, `update-no-impact-redirect`,
+  `update-dynamic-expansion`, `update-load-seeded-repair`, with plausible content matching
+  each scenario's described file changes (real diff text for `update-load-seeded-repair`
+  specifically only if convenient — T4.1 found its behavior is orchestrator-driven, not
+  diff-content-driven, so a representative patch body is sufficient there). New contract
+  test in `test_orchestrator.py`: `RunContext.patch_text` (asserted via `FakeAgentSession
+  .started_with`, alongside the existing `context.delta_files` assertion) carries
+  `gitrepo.patch_text`'s return value for the captured range. Unblocks re-attempting
+  update-happy-path, update-multi-commit, update-dynamic-expansion, and a genuine
+  update-no-impact/-redirect against the live SDK once merged (T4.1's continuation, not this
+  task's own scope).
