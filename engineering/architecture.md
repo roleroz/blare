@@ -362,7 +362,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   update-happy-path, update-multi-commit, update-dynamic-expansion, and a genuine
   update-no-impact/-redirect against the live SDK once merged (T4.1's continuation, not this
   task's own scope).
-- [ ] **T4.5 unattended mode**: R26 — `cli`'s `--unattended` flag on `analyze`/`update`,
+- [x] **T4.5 unattended mode**: R26 — `cli`'s `--unattended` flag on `analyze`/`update`,
   threaded into the presenter so every checkpoint/no-impact/amendment presentation still
   renders full view content but omits the reserved-word prompt line and resolves as an
   immediate approval with no reply ever read (chat is therefore unreachable); `orchestrator`'s
