@@ -1315,7 +1315,11 @@ def batch_check(s: ArtifactSet, b: EditBatch) -> BatchVerdict:
 
     for edit in b.edits:
         if edit.entry_type not in _TYPE_SPECS:
-            return BatchVerdict(ok=False, message=f"unknown entry_type {edit.entry_type!r}")
+            valid_types = ", ".join(sorted(_TYPE_SPECS))
+            return BatchVerdict(
+                ok=False,
+                message=f"unknown entry_type {edit.entry_type!r}; valid types: {valid_types}",
+            )
         if edit.entry_type == "coverage":
             verdict = _check_coverage_edit_schema(s, b.phase, edit)
         else:

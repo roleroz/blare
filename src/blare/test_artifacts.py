@@ -1394,6 +1394,26 @@ def test_contract_batch_check_accepts_a_clean_batch(tmp_path: Path) -> None:
     assert verdict == BatchVerdict(ok=True)
 
 
+def test_contract_batch_check_rejects_unknown_entry_type(tmp_path: Path) -> None:
+    """An edit naming an entry_type outside the registry is rejected with a message
+    that lists the valid entry types, so a caller guessing a name doesn't have to
+    guess blindly a second time."""
+    root = tmp_path / ".blare"
+    s = _load_default(root)
+    b = EditBatch(
+        Phase.SYSTEM_MAP,
+        (Edit(EditOp.ADD, "linkage", {"id": "sm-cache"}),),
+    )
+
+    verdict = batch_check(s, b)
+
+    assert verdict.ok is False
+    assert verdict.message is not None
+    assert "'linkage'" in verdict.message
+    for valid_type in artifacts_module._TYPE_SPECS:
+        assert valid_type in verdict.message
+
+
 def test_contract_batch_check_rejects_mistagged_phase_edit(tmp_path: Path) -> None:
     """An edit whose entry_type belongs to a different phase than the batch's is
     rejected."""
