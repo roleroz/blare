@@ -12,9 +12,14 @@ resuming an agent-proposed amendment whose turn ended before `amend_complete`) a
 
 T3.1 scope: `triage` (diff mode's first step, R18) -- sends the effective delta plus
 the verdict contract and returns once an `affected_verdict`/`no_impact` verdict is
-accepted, reminding once then raising on a verdict-less turn. The live (`unset`) SDK
-client stays out of scope -- `create_client` keeps T1.1's `NotImplementedError` for
-that branch.
+accepted, reminding once then raising on a verdict-less turn.
+
+T2.6 scope: `create_client`'s `unset` (live) branch -- `_LiveSDKClient`, a real
+`claude_agent_sdk.ClaudeSDKClient` wrapped to satisfy the `SDKClient` protocol below,
+with no `model` override (2026-07-30 decision: the Claude Code subscription's own
+default), wired into `start`'s auth-handshake preflight and the two in-process MCP
+tools. Also wires a `_LiveSDKClient` into the `record:<dir>` branch's already-complete
+`_RecordingSDKClient`.
 
 Design note on the client/wire boundary: the real `claude_agent_sdk.ClaudeSDKClient`
 takes the system prompt, tool registrations, and disallowed-tools policy as
@@ -30,15 +35,22 @@ session, not only a handshake.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import contextlib
 import datetime as _dt
 import json
 import os
-from collections.abc import Callable
+import queue
+import threading
+import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from io import TextIOWrapper
 from pathlib import Path
-from typing import NoReturn, Protocol, TypeVar, cast
+from typing import Any, NoReturn, Protocol, TypeVar, cast
+
+import claude_agent_sdk
 
 from blare.model import (
     BatchVerdict,
@@ -471,6 +483,368 @@ class _RecordingSDKClient:
             self._scenario_file.unlink(missing_ok=True)
 
 
+# ---- live client (the real claude_agent_sdk.ClaudeSDKClient, T2.6) ---------------
+
+# The name registered for Blare's in-process MCP server (agent.md, SDK usage: "an
+# in-process MCP server exposes exactly two tools"). Only ever seen by the model
+# through the tool names themselves; not otherwise meaningful.
+_MCP_SERVER_NAME = "blare"
+
+# A cheap, fixed probe turn for the auth-handshake preflight (agent.md, Auth
+# preflight: "start performs a minimal SDK handshake"). The installed SDK exposes no
+# dedicated auth-failure exception (verified against claude_agent_sdk==0.2.128's
+# actual API before writing this): the only concrete signal it defines is
+# `AssistantMessage.error == "authentication_failed"` (types.py's
+# `AssistantMessageError` literal), which is observable only in response to an
+# actual turn -- there is no cheaper connect-only signal the installed SDK exposes.
+_HANDSHAKE_PROBE_PROMPT = "Reply with the single word: ready."
+
+
+def _result_message_failure(message: claude_agent_sdk.ResultMessage) -> str:
+    """Format a failing `ResultMessage`'s subtype and any detail into one string
+    (e.g. `"error_max_turns"`, `"error_during_execution (disk full)"`, or
+    `"success (HTTP 529)"` for the documented `is_error=True, subtype="success"`
+    shape that carries only an `api_error_status`, no `errors` entries) -- shared
+    by the handshake probe and `_consume_turn`'s own `ResultMessage.is_error`
+    handling, both of which must not miss this: `_internal/query.py` documents
+    CLI-reported failures (`error_max_turns`, `error_during_execution`, ...) that
+    surface only here, with no `AssistantMessage.error` ever set."""
+    details = list(message.errors) if message.errors else []
+    if message.api_error_status is not None:
+        details.append(f"HTTP {message.api_error_status}")
+    detail = f" ({'; '.join(details)})" if details else ""
+    return f"{message.subtype}{detail}"
+
+
+def _interpret_handshake_message(message: object) -> bool | None:
+    """Settle the handshake's ready/not-ready verdict from one message of the probe
+    turn, or return None when this message doesn't settle it (the caller keeps
+    draining). `authentication_failed` is the one SDK error this handshake
+    interprets as "no login available" (R12); any other named SDK error (billing,
+    rate limit, server error, ..., or a failing `ResultMessage` -- max-turns,
+    execution error, ...) is a real operational failure, not a login problem, so
+    it is raised (a plain `RuntimeError`, deliberately *not* one of this module's
+    own error types -- `AgentSession._call_client`'s generic exception handling
+    is what must wrap it, closing the session and attaching the phase/driving
+    -call context label; an `AgentSessionError` raised directly from here would
+    instead hit `_call_client`'s "already enriched, just re-raise" branch and
+    skip both).
+    """
+    if isinstance(message, claude_agent_sdk.AssistantMessage) and message.error is not None:
+        if message.error == "authentication_failed":
+            return False
+        raise RuntimeError(f"handshake probe returned SDK error {message.error!r}")
+    if isinstance(message, claude_agent_sdk.ResultMessage) and message.is_error:
+        raise RuntimeError(
+            f"handshake probe turn ended in error: {_result_message_failure(message)}"
+        )
+    return None
+
+
+def _to_mcp_tool_result(result: dict[str, object]) -> dict[str, Any]:
+    """Map this module's `{"ok": bool, "message": str | None}` verdict shape (the
+    `propose_edits`/`run_control` tool result, agent.md) to the SDK MCP tool
+    handler's documented return contract: a `content` block list plus `is_error`
+    (claude_agent_sdk.tool's docstring)."""
+    message = result.get("message")
+    return {
+        "content": [{"type": "text", "text": str(message) if message is not None else ""}],
+        "is_error": not result.get("ok", False),
+    }
+
+
+class _ToolBridge:
+    """Bridges the SDK's async in-process MCP tool handlers to this module's
+    synchronous `send`/`receive` wire protocol.
+
+    Each real tool call blocks its async handler (running on the client's
+    background event-loop thread) on a `concurrent.futures.Future` until the
+    corresponding `tool_result` is delivered via `send` -- called from whatever
+    thread drives `AgentSession` -- exactly mirroring the tool_use/tool_result
+    round trip the replaying/recording clients exchange over their `send`/`receive`
+    pair. `concurrent.futures.Future.set_result` is thread-safe, and
+    `asyncio.wrap_future` schedules the corresponding asyncio Future's result via
+    the owning loop's thread-safe call scheduling, so `resolve` needs no loop
+    handle of its own.
+    """
+
+    def __init__(self, events: queue.Queue[dict[str, object]]) -> None:
+        self._events = events
+        self._pending: dict[str, concurrent.futures.Future[dict[str, object]]] = {}
+        self._lock = threading.Lock()
+
+    async def dispatch(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        tool_use_id = uuid.uuid4().hex
+        future: concurrent.futures.Future[dict[str, object]] = concurrent.futures.Future()
+        with self._lock:
+            self._pending[tool_use_id] = future
+        self._events.put({"type": "tool_use", "id": tool_use_id, "name": name, "input": args})
+        try:
+            result = await asyncio.wrap_future(future)
+        finally:
+            # Always remove this call's own entry, regardless of outcome --
+            # including a cancellation (e.g. the client closes with this call
+            # still in flight and no handler ever raised: the SDK's own task
+            # teardown on disconnect cancels this coroutine, which would
+            # otherwise abandon the entry in `_pending` forever).
+            with self._lock:
+                self._pending.pop(tool_use_id, None)
+        return _to_mcp_tool_result(result)
+
+    def resolve(self, tool_use_id: str, result: dict[str, object]) -> None:
+        with self._lock:
+            future = self._pending.pop(tool_use_id, None)
+        if future is None:
+            raise KeyError(f"no pending live-SDK tool call with id {tool_use_id!r}")
+        future.set_result(result)
+
+
+def _build_sdk_tools(
+    tools: tuple[ToolDefinition, ...], bridge: _ToolBridge
+) -> list[claude_agent_sdk.SdkMcpTool[Any]]:
+    """Build the real in-process MCP tools from this module's own `ToolDefinition`s
+    (T2.1's `tool_definitions()`), each handler forwarding into `bridge.dispatch`
+    under its own name -- so real dispatch reuses the exact schemas the
+    fixture/replay world already tests against, and the SDK routes each call to
+    the right handler by construction (this module never needs to parse whatever
+    name the CLI reports back on the wire)."""
+    built: list[claude_agent_sdk.SdkMcpTool[Any]] = []
+    for definition in tools:
+
+        async def _handler(
+            args: dict[str, Any], _name: str = definition.name
+        ) -> dict[str, Any]:
+            return await bridge.dispatch(_name, args)
+
+        built.append(
+            claude_agent_sdk.tool(
+                definition.name, definition.description, definition.input_schema
+            )(_handler)
+        )
+    return built
+
+
+def _build_live_options(
+    system_prompt: str,
+    tools: tuple[ToolDefinition, ...],
+    disallowed_tools: tuple[str, ...],
+    worktree_root: Path | None,
+    bridge: _ToolBridge,
+) -> claude_agent_sdk.ClaudeAgentOptions:
+    """Build the real `ClaudeAgentOptions` for the live session: no `model` field
+    (2026-07-30 decision -- the Claude Code subscription's own default is used,
+    never pinned), the two in-process MCP tools built from `tools`, and the
+    write-tools-disallowed policy already established in T2.1
+    (`WRITE_TOOLS_DISALLOWED`). Split out from `configure_session` so the
+    construction itself -- what a unit test can assert on without ever
+    connecting -- is separate from actually connecting the real client.
+    """
+    sdk_tools = _build_sdk_tools(tools, bridge)
+    server = claude_agent_sdk.create_sdk_mcp_server(_MCP_SERVER_NAME, tools=sdk_tools)
+    return claude_agent_sdk.ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        mcp_servers={_MCP_SERVER_NAME: server},
+        # Only Blare's own two tools, never a target-repo .mcp.json or other
+        # ambient MCP configuration (the target repo is otherwise read-only).
+        strict_mcp_config=True,
+        allowed_tools=[definition.name for definition in tools],
+        disallowed_tools=list(disallowed_tools),
+        # No per-tool permission prompts: Blare's own checkpoint loop is the
+        # human-facing approval surface; disallowed_tools above still wins over
+        # bypassPermissions for the write tools (ClaudeAgentOptions' own
+        # documented precedence).
+        permission_mode="bypassPermissions",
+        cwd=worktree_root,
+        # model intentionally omitted (2026-07-30 decision): the CLI's own
+        # default is used, never pinned.
+    )
+
+
+class _LiveSDKClient:
+    """The real `claude_agent_sdk.ClaudeSDKClient`, wrapped to satisfy `SDKClient`.
+
+    Bridges the real client's async, message-stream API to this module's
+    synchronous, per-turn `send`/`receive` wire protocol (agent.md leaves the
+    client seam's exact shape as this module's own implementation detail). A
+    dedicated background thread runs one asyncio event loop for the client's whole
+    lifetime; every call into the real SDK is scheduled onto it and its result (or
+    exception) is bridged back to the calling thread.
+
+    `configure_session` never sets `ClaudeAgentOptions.model` (2026-07-30 decision:
+    the Claude Code subscription's own default is used, never pinned) and builds
+    the two in-process MCP tools from the `ToolDefinition`s T2.1 already defines,
+    via `claude_agent_sdk.create_sdk_mcp_server`/`.tool` (verified against the
+    installed `claude_agent_sdk==0.2.128` package before writing this).
+    """
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever, name="blare-live-sdk-loop", daemon=True
+        )
+        self._loop_thread.start()
+        self._worktree_root: Path | None = None
+        self._client: claude_agent_sdk.ClaudeSDKClient | None = None
+        self._events: queue.Queue[dict[str, object]] = queue.Queue()
+        self._bridge = _ToolBridge(self._events)
+        self._closed = False
+
+    def _run_coro(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def handshake(self) -> HandshakeResult:
+        """A separate, throwaway probe connection with minimal default options --
+        the real config (system prompt, tools, cwd) isn't known yet at this point
+        in `AgentSession.start`'s call order, which asks for the handshake before
+        `configure_worktree_root`/`configure_session`."""
+        return self._run_coro(self._handshake_async())
+
+    async def _handshake_async(self) -> HandshakeResult:
+        # No tools at all for the probe turn (agent.md: "the target repo is
+        # read-only to the model" -- true even for this throwaway preflight,
+        # which has no legitimate reason to touch any tool at all); strict_mcp
+        # _config so no ambient MCP server config could offer one either,
+        # matching the real session's own hardening in _build_live_options.
+        probe_options = claude_agent_sdk.ClaudeAgentOptions(
+            max_turns=1, tools=[], strict_mcp_config=True
+        )
+        probe = claude_agent_sdk.ClaudeSDKClient(probe_options)
+        ready = True
+        try:
+            await probe.connect()
+            await probe.query(_HANDSHAKE_PROBE_PROMPT)
+            async for message in probe.receive_response():
+                verdict = _interpret_handshake_message(message)
+                if verdict is not None:
+                    # A settled verdict is final: stop draining rather than
+                    # continue into the turn's terminating ResultMessage, which
+                    # a real auth failure also marks is_error=True (the CLI still
+                    # emits it before exiting) -- letting the loop reach that
+                    # would raise a generic RuntimeError and discard the already
+                    # -correct "not logged in" verdict this handshake exists to
+                    # detect (R12).
+                    ready = verdict
+                    break
+        finally:
+            # Suppressed for the same reason `close()` suppresses the real
+            # client's own close failure: a `disconnect()` failure while a real
+            # SDK error (e.g. rate_limit) is already propagating out of the
+            # `try` block would otherwise replace it in flight (plain
+            # try/finally semantics), silently losing the actual diagnostic
+            # (R13) behind an unrelated transport-close error -- there is no
+            # "next action" to report for a cleanup failure either way.
+            with contextlib.suppress(Exception):
+                await probe.disconnect()
+        return HandshakeResult(ready=ready)
+
+    def configure_worktree_root(self, root: Path) -> None:
+        self._worktree_root = root
+
+    def configure_session(
+        self,
+        mode: RunMode,
+        system_prompt: str,
+        tools: tuple[ToolDefinition, ...],
+        disallowed_tools: tuple[str, ...],
+    ) -> None:
+        options = _build_live_options(
+            system_prompt, tools, disallowed_tools, self._worktree_root, self._bridge
+        )
+        self._client = claude_agent_sdk.ClaudeSDKClient(options)
+        self._run_coro(self._client.connect())
+
+    def send(self, event: dict[str, object]) -> None:
+        # Both raises below are plain `RuntimeError`s, deliberately not this
+        # module's own `AgentSessionError`: `AgentSession._call_client` (the sole
+        # caller of `send`, via its `_send` wrapper) special-cases `AgentSessionError`
+        # as "already enriched, just re-raise" and would skip both closing the
+        # session and attaching the phase/driving-call context label that its
+        # generic `except Exception` branch adds for every other internal failure.
+        if event.get("type") == "tool_result":
+            tool_use_id = event["tool_use_id"]
+            result = event["result"]
+            if not isinstance(tool_use_id, str) or not isinstance(result, dict):
+                raise RuntimeError(f"malformed tool_result event sent to live client: {event!r}")
+            self._bridge.resolve(tool_use_id, cast("dict[str, object]", result))
+            return
+        text = event.get("text")
+        if not isinstance(text, str):
+            raise RuntimeError(f"live SDK client cannot send event with no text field: {event!r}")
+        self._run_coro(self._start_turn(text))
+
+    async def _start_turn(self, text: str) -> None:
+        assert self._client is not None
+        await self._client.query(text)
+        # Fire-and-forget on this same loop: `send` must return once the turn is
+        # under way, not once it finishes -- `receive` is what drains it
+        # incrementally, one event at a time, per this module's wire protocol.
+        self._loop.create_task(self._consume_turn())
+
+    async def _consume_turn(self) -> None:
+        assert self._client is not None
+        try:
+            async for message in self._client.receive_response():
+                if isinstance(message, claude_agent_sdk.AssistantMessage):
+                    if message.error is not None:
+                        self._events.put({"type": "_sdk_error", "error": message.error})
+                        return
+                    for block in message.content:
+                        if isinstance(block, claude_agent_sdk.TextBlock) and block.text:
+                            self._events.put({"type": "text", "text": block.text})
+                    continue
+                if isinstance(message, claude_agent_sdk.ResultMessage):
+                    # A CLI-reported turn failure (error_max_turns,
+                    # error_during_execution, ...) surfaces only here, with no
+                    # AssistantMessage.error ever set (_internal/query.py) --
+                    # missing this would silently report a failed turn as an
+                    # empty successful one.
+                    if message.is_error:
+                        self._events.put(
+                            {"type": "_sdk_error", "error": _result_message_failure(message)}
+                        )
+                        return
+                    continue  # the turn ends right after; "turn_end" is pushed below
+                # ToolUseBlock content is not translated here: the registered SDK
+                # MCP tool handler itself pushes the "tool_use" event (_ToolBridge
+                # .dispatch) under this module's own canonical tool name, decoupled
+                # from whatever name the CLI reports on the wire for an in-process
+                # MCP tool -- translating the same call a second time here would
+                # double-report it. Any other message type is skipped, draining
+                # to the next one.
+        except Exception as exc:  # noqa: BLE001 - must reach receive(), not vanish in this task
+            self._events.put({"type": "_transport_error", "error": exc})
+            return
+        self._events.put({"type": "turn_end"})
+
+    def receive(self) -> dict[str, object]:
+        event = self._events.get()
+        event_type = event.get("type")
+        if event_type == "_transport_error":
+            # The captured exception's own type (CLIConnectionError, ProcessError,
+            # ...) is what must reach `AgentSession._call_client`'s generic
+            # `except Exception` branch -- re-raising it verbatim (rather than
+            # wrapping it) keeps that branch's phase-context/close enrichment
+            # working exactly as it already does for the replaying/recording
+            # clients' own raised exceptions.
+            raise cast(BaseException, event["error"])
+        if event_type == "_sdk_error":
+            # Plain RuntimeError, not AgentSessionError: see send()'s comment --
+            # the same "must reach the generic exception branch" reasoning.
+            raise RuntimeError(f"assistant turn reported SDK error: {event['error']}")
+        return event
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                self._run_coro(self._client.disconnect())
+        with contextlib.suppress(Exception):
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5)
+
+
 def _ensure_recordable_directory(directory: Path) -> None:
     """Validate `directory` is writable for `record:<dir>` (agent.md: an unwritable
     `record:<dir>` raises `FixtureMismatchError` at `create_client`)."""
@@ -489,30 +863,21 @@ def _ensure_recordable_directory(directory: Path) -> None:
 def create_client() -> SDKClient:
     """Select the SDK client via the `BLARE_SDK_FIXTURES` env-var seam.
 
-    `replay:<dir>` is fully built (the e2e mock). `record:<dir>` validates the target
-    directory is writable (a real, testable behavior) and then raises
-    `NotImplementedError`: the recorder it would wrap needs a real live SDK client,
-    whose wiring is out of scope for this task — `_RecordingSDKClient` itself is
-    complete and unit-tested against a fake standing in for "real" (per this task's
-    explicit instructions). `unset` (the live client) is likewise out of scope and
-    keeps T1.1's `NotImplementedError`.
+    `unset` — the real client (T2.6): a `_LiveSDKClient` wrapping
+    `claude_agent_sdk.ClaudeSDKClient`, unpinned (no `model` override — the
+    2026-07-30 decision). `replay:<dir>` is the e2e mock. `record:<dir>` validates
+    the target directory is writable, then wraps a fresh `_LiveSDKClient` in
+    `_RecordingSDKClient` (T2.1's recorder, unmodified) for release-suite capture.
     """
     spec = os.environ.get(_ENV_VAR)
     if spec is None:
-        raise NotImplementedError(
-            "the live Claude Agent SDK client is out of scope for this task; "
-            f"set {_ENV_VAR}=replay:<dir> to use the e2e replay seam"
-        )
+        return _LiveSDKClient()
     if spec.startswith(_REPLAY_PREFIX):
         return _ReplayingSDKClient(Path(spec[len(_REPLAY_PREFIX) :]))
     if spec.startswith(_RECORD_PREFIX):
         directory = Path(spec[len(_RECORD_PREFIX) :])
         _ensure_recordable_directory(directory)
-        raise NotImplementedError(
-            "the live Claude Agent SDK client to wrap for recording is out of scope "
-            "for this task; _RecordingSDKClient itself is complete and unit-tested "
-            "against a fake real client"
-        )
+        return _RecordingSDKClient(_LiveSDKClient(), directory, claude_agent_sdk.__version__)
     raise FixtureMismatchError(
         cause=f"malformed {_ENV_VAR} value {spec!r}",
         next_action=f"Set {_ENV_VAR} to 'replay:<dir>' or 'record:<dir>'.",

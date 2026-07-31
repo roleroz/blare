@@ -17,6 +17,7 @@ py_library(
     imports = [".."],
     visibility = ["//visibility:public"],
     deps = [
+        "@pip//claude_agent_sdk",
         "@pip//promql_parser",
         "@pip//ruamel_yaml",
     ],

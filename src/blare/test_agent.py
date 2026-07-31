@@ -1,7 +1,8 @@
 """Unit tests for blare.agent: T2.1 scope (session lifecycle, the two-tool dispatch
 over injected handlers, prompt templates, `create_client`'s replay/record branches,
 transcripts, and the error taxonomy) plus T2.4's `request_repair` and
-`notify_amendment_outcome`; T3.1 adds `triage` (diff mode's first step, R18).
+`notify_amendment_outcome`; T3.1 adds `triage` (diff mode's first step, R18); T2.6
+adds the live (`unset`) `create_client` branch.
 
 Contract tests cover what this module promises while its dependencies behave;
 failure-mode tests cover one per dependency failure mode (agent.md's Test plan):
@@ -12,7 +13,10 @@ sink/control handlers (raising vs. a rejecting verdict).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import queue
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,8 +32,15 @@ from blare.agent import (
     FixtureMismatchError,
     HandshakeResult,
     ToolDefinition,
+    _build_live_options,
+    _build_sdk_tools,
+    _interpret_handshake_message,
+    _LiveSDKClient,
     _RecordingSDKClient,
     _ReplayingSDKClient,
+    _result_message_failure,
+    _to_mcp_tool_result,
+    _ToolBridge,
     create_client,
     tool_definitions,
 )
@@ -219,15 +230,19 @@ def _handshake_only(directory: Path) -> None:
 # ==== create_client seam ===========================================================
 
 
-def test_contract_create_client_unset_is_not_yet_implemented(
+def test_contract_create_client_unset_returns_live_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With BLARE_SDK_FIXTURES unset, create_client raises NotImplementedError (the
-    live SDK client is out of scope for this task)."""
+    """With BLARE_SDK_FIXTURES unset, create_client returns a live client wrapping
+    the real claude_agent_sdk.ClaudeSDKClient (T2.6) -- construction only, no
+    connection is ever attempted by merely creating one."""
     monkeypatch.delenv("BLARE_SDK_FIXTURES", raising=False)
 
-    with pytest.raises(NotImplementedError):
-        create_client()
+    client = create_client()
+    try:
+        assert isinstance(client, _LiveSDKClient)
+    finally:
+        client.close()
 
 
 def test_contract_create_client_replay_seam_reaches_session_start(
@@ -258,19 +273,22 @@ def test_contract_create_client_malformed_value_raises(
     assert "record:" in exc_info.value.next_action
 
 
-def test_contract_create_client_record_seam_validates_directory_then_not_implemented(
+def test_contract_create_client_record_seam_wraps_a_live_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """record:<dir> validates the directory is writable (a real, testable behavior)
-    then raises NotImplementedError -- there is no live client to wrap yet (this
-    task's explicit scope carve-out); the recorder itself is tested directly below."""
+    """record:<dir> validates the directory is writable, then wraps a fresh live
+    client in _RecordingSDKClient (T2.6) -- _RecordingSDKClient itself is
+    unmodified (still tested against FakeSDKClient below)."""
     record_dir = tmp_path / "recorded"
     monkeypatch.setenv("BLARE_SDK_FIXTURES", f"record:{record_dir}")
 
-    with pytest.raises(NotImplementedError):
-        create_client()
-
-    assert record_dir.is_dir()
+    client = create_client()
+    try:
+        assert isinstance(client, _RecordingSDKClient)
+        assert isinstance(client._real, _LiveSDKClient)  # noqa: SLF001
+        assert record_dir.is_dir()
+    finally:
+        client.close()
 
 
 def test_failure_create_client_record_unwritable_directory_raises(
@@ -283,6 +301,493 @@ def test_failure_create_client_record_unwritable_directory_raises(
 
     with pytest.raises(FixtureMismatchError):
         create_client()
+
+
+def test_contract_create_client_record_uses_real_sdk_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recorded scenario's metadata carries the real installed SDK's own
+    version string, not a placeholder."""
+    record_dir = tmp_path / "recorded"
+    monkeypatch.setenv("BLARE_SDK_FIXTURES", f"record:{record_dir}")
+
+    client = create_client()
+    client.close()
+
+    metadata = json.loads((record_dir / "scenario.jsonl").read_text().splitlines()[0])
+    assert metadata["sdk_version"] == claude_agent_sdk.__version__
+
+
+# ==== live SDK client (T2.6) ========================================================
+#
+# These test the real claude_agent_sdk package's actual types and this module's own
+# translation/construction logic directly -- never a live connection (there is no
+# subscription login in this environment, and a hermetic unit test must not spawn
+# the `claude` CLI subprocess). The live release run (T4.1) is the first thing that
+# ever exercises a real connect()/handshake for real.
+
+
+def test_contract_live_client_construction_does_not_connect() -> None:
+    """Merely constructing the live client (create_client()'s unset branch) does
+    no I/O of any kind -- no SDK client exists until configure_session runs."""
+    client = _LiveSDKClient()
+    try:
+        assert client._client is None  # noqa: SLF001
+    finally:
+        client.close()
+
+
+def test_contract_build_sdk_tools_matches_tool_definitions() -> None:
+    """The two real SDK MCP tools built for the live client carry the exact same
+    name/description/schema as T2.1's tool_definitions() -- the single source of
+    truth both the fixture/replay world and the live client build from."""
+    bridge = _ToolBridge(queue.Queue())
+
+    built = _build_sdk_tools(tool_definitions(), bridge)
+
+    assert [t.name for t in built] == [d.name for d in tool_definitions()]
+    assert [t.description for t in built] == [d.description for d in tool_definitions()]
+    assert [t.input_schema for t in built] == [d.input_schema for d in tool_definitions()]
+
+
+def test_contract_build_live_options_has_no_model_override(tmp_path: Path) -> None:
+    """ClaudeAgentOptions is built with no `model` field set at all (2026-07-30
+    decision: the Claude Code subscription's own default is used, never pinned) --
+    and carries the system prompt, write-tools-disallowed policy, and worktree
+    root this module already threads through configure_session/configure_worktree
+    _root."""
+    bridge = _ToolBridge(queue.Queue())
+
+    options = _build_live_options(
+        "a system prompt", tool_definitions(), WRITE_TOOLS_DISALLOWED, tmp_path, bridge
+    )
+
+    assert options.model is None
+    assert options.system_prompt == "a system prompt"
+    assert options.disallowed_tools == list(WRITE_TOOLS_DISALLOWED)
+    assert options.cwd == tmp_path
+    assert options.permission_mode == "bypassPermissions"
+    assert options.strict_mcp_config is True
+    assert options.allowed_tools == [d.name for d in tool_definitions()]
+
+
+def test_contract_build_live_options_registers_one_sdk_mcp_server(tmp_path: Path) -> None:
+    """The two tools are registered on exactly one in-process ("sdk") MCP server
+    (agent.md, SDK usage: "an in-process MCP server exposes exactly two tools")."""
+    bridge = _ToolBridge(queue.Queue())
+
+    options = _build_live_options("prompt", tool_definitions(), (), tmp_path, bridge)
+
+    mcp_servers = options.mcp_servers
+    assert isinstance(mcp_servers, dict)
+    assert list(mcp_servers.keys()) == ["blare"]
+    server = mcp_servers["blare"]
+    assert server["type"] == "sdk"
+    assert server["name"] == "blare"
+
+
+def test_contract_to_mcp_tool_result_maps_ok_and_message() -> None:
+    """The {"ok", "message"} verdict shape maps to the SDK tool handler's
+    documented {"content", "is_error"} return contract."""
+    assert _to_mcp_tool_result({"ok": True, "message": None}) == {
+        "content": [{"type": "text", "text": ""}],
+        "is_error": False,
+    }
+    assert _to_mcp_tool_result({"ok": False, "message": "bad batch"}) == {
+        "content": [{"type": "text", "text": "bad batch"}],
+        "is_error": True,
+    }
+
+
+def test_contract_tool_bridge_dispatch_blocks_until_resolved() -> None:
+    """dispatch() pushes a tool_use event and blocks its caller until resolve()
+    delivers the matching tool_result -- the async<->sync bridge the live
+    client's in-process MCP tool handlers rely on."""
+    events: queue.Queue[dict[str, object]] = queue.Queue()
+    bridge = _ToolBridge(events)
+
+    async def _run() -> dict[str, object]:
+        task = asyncio.ensure_future(bridge.dispatch("propose_edits", {"phase": 1}))
+        await asyncio.sleep(0)  # let dispatch() push its tool_use event and start waiting
+        event = events.get_nowait()
+        assert event["type"] == "tool_use"
+        assert event["name"] == "propose_edits"
+        assert event["input"] == {"phase": 1}
+        tool_use_id = event["id"]
+        assert isinstance(tool_use_id, str)
+        bridge.resolve(tool_use_id, {"ok": True, "message": "done"})
+        return await task
+
+    result = asyncio.run(_run())
+    assert result == {"content": [{"type": "text", "text": "done"}], "is_error": False}
+
+
+def test_contract_tool_bridge_dispatch_cleans_up_pending_entry_on_cancellation() -> None:
+    """dispatch() removes its own _pending entry even when the awaited future is
+    cancelled rather than resolved -- e.g. the client closes with a call still
+    in flight and no handler ever raised to trigger resolve(). Without this, a
+    cancelled/abandoned call would leak its entry in _pending forever."""
+    events: queue.Queue[dict[str, object]] = queue.Queue()
+    bridge = _ToolBridge(events)
+
+    async def _run() -> None:
+        task = asyncio.ensure_future(bridge.dispatch("propose_edits", {"phase": 1}))
+        await asyncio.sleep(0)  # let dispatch() push its tool_use event and start waiting
+        assert len(bridge._pending) == 1  # noqa: SLF001
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert bridge._pending == {}  # noqa: SLF001
+
+    asyncio.run(_run())
+
+
+def test_failure_tool_bridge_resolve_unknown_id_raises() -> None:
+    """resolve() with a tool_use_id nothing is waiting on raises -- a programmer
+    error, not a legal outcome (there is no pending call to deliver the result to)."""
+    bridge = _ToolBridge(queue.Queue())
+
+    with pytest.raises(KeyError):
+        bridge.resolve("no-such-id", {"ok": True, "message": None})
+
+
+def test_contract_interpret_handshake_message_authentication_failed_is_not_ready() -> None:
+    """A real AssistantMessage carrying error="authentication_failed" settles the
+    handshake as not-ready (R12) -- the only concrete auth signal the installed
+    claude-agent-sdk==0.2.128 package exposes (there is no dedicated auth
+    exception type in this version)."""
+    message = claude_agent_sdk.AssistantMessage(
+        content=[], model="claude-x", error="authentication_failed"
+    )
+
+    assert _interpret_handshake_message(message) is False
+
+
+def test_contract_interpret_handshake_message_no_error_does_not_settle() -> None:
+    """A normal AssistantMessage (no error, with or without text content) does not
+    settle the handshake verdict -- the caller keeps draining/its current default."""
+    assert _interpret_handshake_message(claude_agent_sdk.AssistantMessage([], "claude-x")) is None
+    with_text = claude_agent_sdk.AssistantMessage(
+        content=[claude_agent_sdk.TextBlock(text="ready")], model="claude-x"
+    )
+    assert _interpret_handshake_message(with_text) is None
+    assert _interpret_handshake_message(object()) is None
+
+
+def test_failure_interpret_handshake_message_other_sdk_error_raises() -> None:
+    """A non-auth SDK error (billing, rate limit, server error, ...) observed
+    during the handshake probe is a real operational failure, not a login
+    problem: it raises a plain RuntimeError naming the SDK's own error string
+    rather than being folded into the ready/not-ready boolean. Deliberately not
+    AgentSessionError: AgentSession._call_client's generic exception branch is
+    what must wrap it (closing the session, attaching the driving-call context)
+    -- raising AgentSessionError directly here would instead hit
+    _call_client's "already enriched, just re-raise" branch and skip both."""
+    message = claude_agent_sdk.AssistantMessage(content=[], model="claude-x", error="rate_limit")
+
+    with pytest.raises(RuntimeError, match="rate_limit") as exc_info:
+        _interpret_handshake_message(message)
+
+    assert not isinstance(exc_info.value, AgentSessionError)
+
+
+def _result_message(
+    *,
+    is_error: bool,
+    subtype: str = "success",
+    errors: list[str] | None = None,
+    api_error_status: int | None = None,
+) -> claude_agent_sdk.ResultMessage:
+    return claude_agent_sdk.ResultMessage(
+        subtype=subtype,
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=is_error,
+        num_turns=1,
+        session_id="s",
+        errors=errors,
+        api_error_status=api_error_status,
+    )
+
+
+def test_contract_interpret_handshake_message_successful_result_does_not_settle() -> None:
+    """A successful (is_error=False) ResultMessage does not settle the handshake
+    verdict either -- it is the normal end of the probe turn, not a failure."""
+    assert _interpret_handshake_message(_result_message(is_error=False)) is None
+
+
+def test_failure_interpret_handshake_message_result_error_raises() -> None:
+    """A CLI-reported turn failure with no AssistantMessage.error ever set (e.g.
+    error_max_turns, error_during_execution -- claude_agent_sdk's own
+    _internal/query.py documents these) surfaces via ResultMessage.is_error, not
+    silently treated as a successful handshake."""
+    message = _result_message(is_error=True, subtype="error_max_turns", errors=["exceeded"])
+
+    with pytest.raises(RuntimeError, match="error_max_turns") as exc_info:
+        _interpret_handshake_message(message)
+
+    assert not isinstance(exc_info.value, AgentSessionError)
+
+
+def test_contract_result_message_failure_includes_api_error_status() -> None:
+    """The SDK's own documented is_error=True, subtype="success" shape (a failing
+    API call reported only via an HTTP status, no `errors` entries) is not
+    formatted as the bare, misleading string "success"."""
+    message = _result_message(is_error=True, subtype="success", api_error_status=529)
+
+    assert _result_message_failure(message) == "success (HTTP 529)"
+
+
+def test_contract_result_message_failure_combines_errors_and_api_error_status() -> None:
+    """Both `errors` entries and an HTTP status, when both present, appear
+    together rather than one silently dropping the other."""
+    message = _result_message(
+        is_error=True,
+        subtype="error_during_execution",
+        errors=["disk full"],
+        api_error_status=500,
+    )
+
+    assert _result_message_failure(message) == "error_during_execution (disk full; HTTP 500)"
+
+
+class _FakeInnerSDKClient:
+    """Stands in for `claude_agent_sdk.ClaudeSDKClient` itself (not this module's
+    own `SDKClient` protocol) so `_LiveSDKClient._consume_turn` can be driven
+    directly, one scripted message stream at a time, without ever connecting."""
+
+    def __init__(self, messages: list[object]) -> None:
+        self._messages = messages
+
+    async def receive_response(self) -> AsyncIterator[object]:
+        for message in self._messages:
+            yield message
+
+
+def test_contract_consume_turn_surfaces_result_message_failure() -> None:
+    """A ResultMessage with is_error=True (a CLI-reported turn failure with no
+    AssistantMessage.error ever set, e.g. error_max_turns) is surfaced as a
+    _sdk_error event -- not silently folded into an ordinary "turn_end", which
+    is what a naive translation (branching only on AssistantMessage) would do."""
+    client = _LiveSDKClient()
+    try:
+        failing_result = _result_message(
+            is_error=True, subtype="error_max_turns", errors=["exceeded max turns"]
+        )
+        client._client = _FakeInnerSDKClient([failing_result])  # type: ignore[assignment]  # noqa: SLF001
+
+        asyncio.run_coroutine_threadsafe(
+            client._consume_turn(), client._loop  # noqa: SLF001
+        ).result(timeout=5)
+
+        with pytest.raises(RuntimeError, match="error_max_turns") as exc_info:
+            client.receive()
+        assert not isinstance(exc_info.value, AgentSessionError)
+    finally:
+        client.close()
+
+
+def test_contract_consume_turn_successful_result_message_ends_turn_normally() -> None:
+    """A successful ResultMessage (is_error=False) after ordinary text content
+    ends the turn as a normal "turn_end", exactly as before this fix."""
+    client = _LiveSDKClient()
+    try:
+        text_message = claude_agent_sdk.AssistantMessage(
+            content=[claude_agent_sdk.TextBlock(text="done")], model="claude-x"
+        )
+        client._client = _FakeInnerSDKClient(  # type: ignore[assignment]  # noqa: SLF001
+            [text_message, _result_message(is_error=False)]
+        )
+
+        asyncio.run_coroutine_threadsafe(
+            client._consume_turn(), client._loop  # noqa: SLF001
+        ).result(timeout=5)
+
+        assert client.receive() == {"type": "text", "text": "done"}
+        assert client.receive() == {"type": "turn_end"}
+    finally:
+        client.close()
+
+
+class _FakeProbeClient:
+    """Stands in for `claude_agent_sdk.ClaudeSDKClient` for handshake-loop tests
+    only: scripts a fixed message sequence and ignores the options passed in.
+    Installed via monkeypatching `claude_agent_sdk.ClaudeSDKClient` itself --
+    `_handshake_async` calls it by the module-qualified name, so patching the
+    module attribute reaches it without touching `_LiveSDKClient`."""
+
+    def __init__(self, messages: list[object], *, disconnect_exc: Exception | None = None) -> None:
+        self._messages = messages
+        self._disconnect_exc = disconnect_exc
+
+    def __call__(self, options: object) -> _FakeProbeClient:
+        del options
+        return self
+
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, text: str) -> None:
+        del text
+
+    async def receive_response(self) -> AsyncIterator[object]:
+        for message in self._messages:
+            yield message
+
+    async def disconnect(self) -> None:
+        if self._disconnect_exc is not None:
+            raise self._disconnect_exc
+
+
+def test_contract_handshake_stops_draining_once_a_verdict_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once an AssistantMessage settles the handshake verdict (auth failure),
+    the probe loop stops draining rather than continuing into the turn's
+    terminating ResultMessage -- a real auth failure also marks that
+    ResultMessage is_error=True (the CLI still emits it before exiting), which
+    would otherwise raise a plain RuntimeError and discard the already-correct
+    "not logged in" verdict this handshake exists to detect (R12)."""
+    auth_failed = claude_agent_sdk.AssistantMessage(
+        content=[], model="claude-x", error="authentication_failed"
+    )
+    terminating_result = _result_message(is_error=True, subtype="error_during_execution")
+    fake_probe_class = _FakeProbeClient([auth_failed, terminating_result])
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", fake_probe_class)
+
+    client = _LiveSDKClient()
+    try:
+        result = client.handshake()  # must not raise
+        assert result.ready is False
+    finally:
+        client.close()
+
+
+def test_failure_handshake_disconnect_failure_does_not_mask_the_real_sdk_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe.disconnect() failure in the handshake's finally block must not
+    replace a real SDK error already propagating out of the try block (plain
+    try/finally semantics would otherwise let it) -- mirroring why
+    _LiveSDKClient.close() itself suppresses the same kind of failure."""
+    rate_limited = claude_agent_sdk.AssistantMessage(
+        content=[], model="claude-x", error="rate_limit"
+    )
+    fake_probe_class = _FakeProbeClient(
+        [rate_limited], disconnect_exc=RuntimeError("transport already gone")
+    )
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", fake_probe_class)
+
+    client = _LiveSDKClient()
+    try:
+        with pytest.raises(RuntimeError, match="rate_limit") as exc_info:
+            client.handshake()
+        assert "transport already gone" not in str(exc_info.value)
+    finally:
+        client.close()
+
+
+def test_contract_live_client_send_tool_result_resolves_pending_call() -> None:
+    """send() with a tool_result event resolves the matching pending bridge call
+    on the client's own background event loop -- it does not transmit anything
+    of its own: the SDK's registered handler task already owns delivering the
+    result back to the model once its awaited future resolves."""
+    client = _LiveSDKClient()
+    try:
+        bridge = client._bridge  # noqa: SLF001
+        loop = client._loop  # noqa: SLF001
+
+        async def _dispatch() -> dict[str, object]:
+            return await bridge.dispatch("propose_edits", {"phase": 1})
+
+        future = asyncio.run_coroutine_threadsafe(_dispatch(), loop)
+        event = client.receive()
+        assert event["type"] == "tool_use"
+
+        client.send(
+            {
+                "type": "tool_result",
+                "tool_use_id": event["id"],
+                "result": {"ok": True, "message": "ok"},
+            }
+        )
+
+        result = future.result(timeout=5)
+        assert result == {"content": [{"type": "text", "text": "ok"}], "is_error": False}
+    finally:
+        client.close()
+
+
+def test_failure_live_client_send_malformed_tool_result_raises() -> None:
+    """A tool_result event missing a string tool_use_id or dict result raises a
+    plain RuntimeError (not AgentSessionError, for the same "must reach
+    AgentSession._call_client's generic branch" reason as the handshake's own
+    non-auth-error raise) rather than silently doing nothing."""
+    client = _LiveSDKClient()
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            client.send({"type": "tool_result", "tool_use_id": 123, "result": "not-a-dict"})
+        assert not isinstance(exc_info.value, AgentSessionError)
+    finally:
+        client.close()
+
+
+def test_failure_live_client_send_without_text_field_raises() -> None:
+    """An event carrying no "text" field (and not a tool_result) has nothing for
+    the live client to turn into a real turn, so send() raises a plain
+    RuntimeError (not AgentSessionError, same reasoning as above)."""
+    client = _LiveSDKClient()
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            client.send({"type": "phase_prompt", "phase": 1})
+        assert not isinstance(exc_info.value, AgentSessionError)
+    finally:
+        client.close()
+
+
+def test_failure_live_client_receive_reraises_transport_error() -> None:
+    """A background-task transport exception pushed as a `_transport_error`
+    sentinel is re-raised verbatim by receive() -- caught by AgentSession's own
+    generic exception wrapping -- rather than vanishing in the detached task
+    that observed it."""
+    client = _LiveSDKClient()
+    try:
+        exc = claude_agent_sdk.CLIConnectionError("dropped")
+        client._events.put({"type": "_transport_error", "error": exc})  # noqa: SLF001
+
+        with pytest.raises(claude_agent_sdk.CLIConnectionError):
+            client.receive()
+    finally:
+        client.close()
+
+
+def test_failure_live_client_receive_raises_plain_error_on_sdk_error() -> None:
+    """A mid-turn SDK error (rate limit, billing, ...) surfaced as a `_sdk_error`
+    sentinel raises a plain RuntimeError naming the SDK's own error string --
+    not AgentSessionError, so it reaches AgentSession._call_client's generic
+    exception branch instead of its "already enriched" branch (see
+    test_failure_live_client_sdk_error_reaches_agent_session_enriched for the
+    integration-level proof that this actually gets the phase context and
+    session close it needs once it does)."""
+    client = _LiveSDKClient()
+    try:
+        client._events.put({"type": "_sdk_error", "error": "rate_limit"})  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match="rate_limit") as exc_info:
+            client.receive()
+
+        assert not isinstance(exc_info.value, AgentSessionError)
+    finally:
+        client.close()
+
+
+def test_contract_live_client_close_is_idempotent_and_safe_before_configure() -> None:
+    """close() before configure_session ever ran (e.g. handshake failed) is safe
+    and idempotent -- AgentSession.start() closes proactively on a failed
+    handshake, before configure_worktree_root/configure_session ever run."""
+    client = _LiveSDKClient()
+    client.close()
+    client.close()  # idempotent -- must not raise
 
 
 # ==== handshake / auth =============================================================
@@ -958,6 +1463,27 @@ def test_failure_rate_overload_raises_agent_session_error_with_distinguishable_m
 
     assert "529" in exc_info.value.cause
     assert "overloaded_error" in exc_info.value.cause
+
+
+def test_failure_live_client_sdk_error_reaches_agent_session_enriched(tmp_path: Path) -> None:
+    """A mid-turn SDK error the live client's receive() surfaces as a plain
+    RuntimeError (T2.6 -- see _LiveSDKClient.receive()'s `_sdk_error` handling)
+    must reach AgentSession._call_client's generic exception branch, not its
+    "already enriched" AgentSessionError branch: it needs the same phase-context
+    label and session close every other client-raised failure gets here. A
+    FakeSDKClient scripts the exact RuntimeError _LiveSDKClient.receive() raises
+    for this case, rather than driving the real live client end to end."""
+    fake = FakeSDKClient()
+    fake.raise_on_next_receive(RuntimeError("assistant turn reported SDK error: rate_limit"))
+    session, _, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    with pytest.raises(AgentSessionError) as exc_info:
+        session.run_phase(Phase.METRIC_COVERAGE)
+
+    assert "phase 3" in exc_info.value.cause
+    assert "rate_limit" in exc_info.value.cause
+    assert fake.close_calls == 1
 
 
 def test_failure_protocol_failure_out_of_contract_event_raises(tmp_path: Path) -> None:
