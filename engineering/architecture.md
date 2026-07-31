@@ -304,7 +304,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   global rule that it gates the first release.
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
-- [ ] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for
+- [x] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for
   every tool call, including the SDK's own filesystem-read tools, not only `propose_edits`/
   `run_control`), the orchestrator's per-driving-call ticker (injected clock, per
   orchestrator.md's Test plan), and `cli`'s new `progress` rendering. Discovered via live

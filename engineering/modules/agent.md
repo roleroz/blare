@@ -253,6 +253,12 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   T2.2 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/auth-required/scenario.jsonl` for its R12 refusal e2e test;
   a release-suite capture still supersedes it
+- progress feedback (R25) — a slow phase 1 turn with scripted filesystem-read
+  `"activity"` events (each carrying a real `delay_before`) ahead of the ordinary
+  `propose_edits` round trip, giving the e2e test real wall-clock time to observe
+  genuine progress ticks against. T4.3 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/progress-feedback/scenario.jsonl`; a release-suite capture
+  still supersedes it
 The transport-error and rate/overload shapes are deliberately *not* fixture entries: both
 are typed exception classes of the pinned SDK, verified by unit tests importing those
 classes from the real package — the fakes script the SDK's own types, so there is no wire
