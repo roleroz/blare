@@ -295,13 +295,17 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T4 — Release readiness
 
-- [ ] **T4.1 release suite**: the scripted PTY scenarios against
-  `~/external_git/miniflux_v2` in record mode — one per entry on agent.md's provisional
-  list, which is the binding enumeration (analyze and re-analyze runs, every update
-  variant, chat alterations, all amendment variants including cascade and rejection, the
-  diff-mode redirect, the logged-out auth capture); captured fixtures replace the
-  provisional set, and emptying that list is this task's definition of done, per the
-  global rule that it gates the first release.
+- [ ] **T4.1 release suite** (in progress — 3 of 16 scenarios captured, driver built): the
+  scripted PTY scenarios against `~/external_git/miniflux_v2` in record mode — one per entry
+  on agent.md's provisional list, which is the binding enumeration; captured fixtures
+  replace the provisional set, and emptying that list is this task's definition of done, per
+  the global rule that it gates the first release. Driver and 3 real captures landed
+  (analyze-happy-path, analyze-reanalysis-update, update-load-seeded-repair — see agent.md).
+  Remaining, blocked on a decision: 5 update-mode scenarios need the `patch_text=""` gap
+  closed first (agent.md's provisional list explains). Remaining, not diff-content-blocked:
+  analyze-reanalysis-noop (3 live attempts didn't converge — needs a different approach, not
+  necessarily a code fix), auth-required, amendment-system, amendment-agent (×2),
+  amendment-cascade (×2), analyze-checkpoint-chat (not yet attempted).
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
 - [x] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for

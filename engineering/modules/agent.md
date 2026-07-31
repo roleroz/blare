@@ -209,27 +209,41 @@ release-suite run against `~/external_git/miniflux_v2`; emptying this list is a
 precondition for the first release. Entries are captured by the release suite's scripted
 scenarios (architecture, Test strategy) unless a dedicated capture path is named:
 
-- analyze happy path (four phases, approvals only) — T2.1 hand-authored a provisional
-  instance at `tests/fixtures/claude-sdk/analyze-happy-path/scenario.jsonl` (marked
-  provisional in the file, generated from the real phase-prompt/stack code to keep the
-  prompt text byte-exact); a release-suite capture still supersedes it
-- analyze re-run over an existing state file (R16 re-analysis, edits against existing IDs)
-  — T2.5 hand-authored two provisional instances at
-  `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl` (unchanged
-  conclusions) and `tests/fixtures/claude-sdk/analyze-reanalysis-update/scenario.jsonl`
-  (one entry changed); a release-suite capture still supersedes both
+Captured for real (no longer provisional): ~~analyze happy path (four phases, approvals
+only)~~ — T4.1 replaced T2.1's hand-authored instance at
+`tests/fixtures/claude-sdk/analyze-happy-path/scenario.jsonl` with a real capture (123
+entries, clean, no amendments) against `~/external_git/miniflux_v2`. ~~analyze re-run with
+one entry changed (R16 re-analysis)~~ — T4.1 replaced T2.5's hand-authored instance at
+`tests/fixtures/claude-sdk/analyze-reanalysis-update/scenario.jsonl` with a real capture: a
+genuinely messy re-analysis (duplicated work, self-diagnosis via `.blare/`, a 3-phase
+`amend_proposal` escalation, converged correctly). The load-seeded-repair capture below is
+also real.
+
+- analyze re-run, unchanged conclusions (R16 re-analysis noop) — T2.5 hand-authored a
+  provisional instance at `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl`;
+  still unverified — T4.1 tried three live captures against `~/external_git/miniflux_v2`
+  and none converged to a genuine zero-diff (a real re-analysis has no way to learn prior
+  analysis exists except its own initiative; the phase prompts never mention it). A
+  release-suite capture still supersedes it once that's resolved.
 - update with an affected subset of phases — T3.1 hand-authored provisional instances at
   `tests/fixtures/claude-sdk/update-happy-path/scenario.jsonl` and
-  `update-multi-commit/scenario.jsonl` (R8's multi-commit delta); a release-suite capture
-  still supersedes both
+  `update-multi-commit/scenario.jsonl` (R8's multi-commit delta); still unverified — T4.1
+  found `orchestrator.py` hardcodes `patch_text=""` for update-mode triage (a documented,
+  never-actually-closed T2.2/T3.1 gap: `gitrepo.md`'s `effective_delta` exposes name-status
+  only, never diff text), confirmed live: given no real diff, the model correctly noticed it
+  had nothing to review and defaulted to no-impact for a substantive commit. Blocks a real
+  capture of this scenario and of update-dynamic-expansion and a genuine
+  update-no-impact/-redirect below, until this gap is closed — see the pending decision on
+  how to close it, flagged to the user.
 - update no-impact conclusion (R18) — T3.1 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; T3.2 hand-authored its
-  chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`; a release-suite
-  capture still supersedes all three
+  chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`; still unverified —
+  a *genuine* no-impact conclusion needs the model to see real diff content to correctly
+  judge nothing matters, so this is blocked by the same `patch_text=""` gap noted above.
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
   a behind-position phase — T3.2 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`; a release-suite
-  capture still supersedes it
+  `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`; still unverified,
+  blocked by the same `patch_text=""` gap noted above.
 - checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/analyze-checkpoint-chat/scenario.jsonl`; a release-suite
   capture still supersedes it
@@ -244,10 +258,14 @@ scenarios (architecture, Test strategy) unless a dedicated capture path is named
   hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/amendment-system/scenario.jsonl`; a release-suite capture
   still supersedes it
-- update whose affected phases were seeded by a load-time semantic violation (R18),
-  repaired via `request_repair` — T3.2 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/update-load-seeded-repair/scenario.jsonl`; a release-suite
-  capture still supersedes it
+- ~~update whose affected phases were seeded by a load-time semantic violation (R18),
+  repaired via `request_repair`~~ — **captured for real** by T4.1 against
+  `~/external_git/miniflux_v2`: a genuine 3-round proactive-repair escalation (two
+  phase-4-only patches rejected as `linkage_inconsistency`, then an escalation into phase 2
+  that reclassified the unmappable entry as `excluded`), replacing the provisional instance
+  at `tests/fixtures/claude-sdk/update-load-seeded-repair/scenario.jsonl`. Unaffected by the
+  `patch_text=""` gap above — its behavior is orchestrator-driven (a hand-seeded R18
+  violation), not diff-content-driven.
 - auth-failure handshake shape (R12) — captured by a dedicated logged-out release
   scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials.
   T2.2 hand-authored a provisional instance at
