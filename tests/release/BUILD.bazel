@@ -1,0 +1,100 @@
+load("@rules_python//python:py_library.bzl", "py_library")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+# The release suite's driving library (T4.1): shared PTY-driving primitives,
+# read-only miniflux_v2 navigation, and the per-scenario capture functions. The
+# live-tagged py_test targets that `bazel test --test_tag_filters=live //...`
+# discovers are declared below as each scenario's own capture is finalized.
+#
+# Not every entry on agent.md's provisional-fixtures list has a target here yet:
+# a real live analyze-mode re-analysis run (analyze-reanalysis-noop's intended
+# scenario) has no way to learn a prior analysis exists except by its own
+# initiative -- the phase prompts never mention it -- so it reliably produces
+# noisy duplicate-then-reconcile content rather than a clean no-op after three
+# separate attempts; and orchestrator.py's `patch_text=""` (a documented,
+# never-closed T2.2/T3.1 gap -- gitrepo.md's interface exposes name-status only,
+# never full diff text) means every update-mode scenario needing the model to
+# judge *real diff content* (update-happy-path, update-multi-commit,
+# update-dynamic-expansion, and a genuine update-no-impact/-redirect) currently
+# gets an empty patch body, which a real live run correctly notices and
+# complains about. Both are reported findings for the parent session, not
+# something this task routes around; update-load-seeded-repair below is
+# unaffected since its behaviour is orchestrator-driven (a hand-seeded R18
+# violation), not diff-content-driven.
+py_library(
+    name = "release_lib",
+    srcs = [
+        "__init__.py",
+        "capture.py",
+        "miniflux_repo.py",
+        "scenario_driver.py",
+    ],
+    imports = [".."],
+    deps = [
+        "//src/blare:blare_lib",
+        "//tests/e2e:pty_harness",
+    ],
+)
+
+py_test(
+    name = "test_capture_analyze_happy_path",
+    srcs = [
+        "test_capture_analyze_happy_path.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_analyze_happy_path.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    # no-sandbox/local: this test's own side effect (finalize_capture) writes
+    # back into the source tree's tests/fixtures/claude-sdk/ -- and it drives
+    # a subprocess against ~/external_git/miniflux_v2, an absolute path outside
+    # the workspace a sandboxed action couldn't reach at all. exclusive: every
+    # live target shares mutable state (the same real checkout's .blare/) and
+    # must not run concurrently with another one.
+    data = ["//src/blare:blare"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_analyze_reanalysis_update",
+    srcs = [
+        "test_capture_analyze_reanalysis_update.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_analyze_reanalysis_update.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_update_load_seeded_repair",
+    srcs = [
+        "test_capture_update_load_seeded_repair.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_update_load_seeded_repair.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)

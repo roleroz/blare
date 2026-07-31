@@ -49,10 +49,10 @@ def test_e2e_abort_at_second_checkpoint_writes_nothing(tmp_path: Path) -> None:
     assert "aborted" in result.output
     assert "discarded:" in result.output
     # By the time phase 2's checkpoint presents, its edits already landed in the
-    # pending candidate (checkpoints follow run_phase): phase 1's system component
-    # (1), plus phase 2's 3 failure modes and their 3 mechanically created coverage
-    # entries -- 7 entries total, all discarded by the abort.
-    assert "discarded: 7 added · 0 updated · 0 removed" in result.output
+    # pending candidate (checkpoints follow run_phase): phase 1's 26 system
+    # components, plus phase 2's 27 failure modes and their 27 mechanically created
+    # coverage entries -- 80 entries total, all discarded by the abort.
+    assert "discarded: 80 added · 0 updated · 0 removed" in result.output
     assert not (repo_dir / ".blare").exists()
 
     # R14: the transcript still exists and is named, even though nothing under

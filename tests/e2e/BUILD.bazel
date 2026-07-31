@@ -1,4 +1,15 @@
+load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_python//python:py_test.bzl", "py_test")
+
+# Exposed for tests/release (T4.1), which reuses this harness to drive live-SDK
+# captures the same way every e2e test drives replayed ones. Existing py_test
+# targets below keep listing the file directly in their own srcs (pre-existing,
+# unchanged) rather than depending on this library, to avoid touching settled code.
+py_library(
+    name = "pty_harness",
+    srcs = ["pty_harness.py"],
+    visibility = ["//tests/release:__pkg__"],
+)
 
 py_test(
     name = "test_r11_refusal",

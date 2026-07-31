@@ -11,6 +11,7 @@ a genuinely interactive multi-checkpoint scenario drivable.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import select
 import subprocess
@@ -91,7 +92,13 @@ class PtyProcess:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._process.kill()
-                self._process.wait(timeout=5)
+                # Suppressed, not propagated: a `wait()` that itself doesn't
+                # reap within 5s (e.g. an uninterruptible child) must not skip
+                # this method's own `_close()` below, which callers (T4.1's
+                # `on_commit` context manager among them) rely on running
+                # unconditionally once they've decided to stop waiting.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._process.wait(timeout=5)
                 break
             ready, _, _ = select.select([self._master_fd], [], [], min(remaining, 0.2))
             if ready:
@@ -111,6 +118,17 @@ class PtyProcess:
             exit_code=exit_code if exit_code is not None else -1,
             output=self._output.decode(errors="replace"),
         )
+
+    def terminate(self, timeout: float = 5.0) -> None:
+        """Kill the process if it's still running and close the pty -- for a
+        caller giving up on a stuck scenario without draining to exit (e.g. a
+        driving loop's own iteration cap), so the child is never left running
+        past the point its own harness stopped waiting on it."""
+        if self._process.poll() is None:
+            self._process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self._process.wait(timeout=timeout)
+        self._close()
 
     def _close(self) -> None:
         if not self._closed:
