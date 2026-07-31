@@ -9,10 +9,10 @@ This section contains only open items — the absence of a topic means it is set
 configuration, D8 agent session structure) are settled and logged in
 `engineering/decisions.md`; D6 and D7 close the two items the spec deferred to this phase.
 
-Changes since last approval: the Tasks section below is new (the pipeline's task phase —
-fourteen tasks in four delivery stages, awaiting delta approval); the module-design-docs note
-reflects their approval. Everything above the Tasks section is as approved, including the
-amendment-re-freeze delta approved separately.
+Changes since last approval: the Tasks section gained **T2.6 live SDK client**, inserted after
+T2.5 — building `create_client`'s real (`unset`) branch, discovered missing while scoping T4.1
+(no prior task's scope ever included it). Everything else in the Tasks section, and everything
+above it, is as previously approved.
 
 ---
 
@@ -259,6 +259,17 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   (amendment clauses), R3–R5 invariants at the gate.
 - [x] **T2.5 re-analysis**: `blare analyze` over an existing state file, ID and byte
   stability. Traces: R16, R9.
+- [ ] **T2.6 live SDK client**: `create_client`'s `unset` branch — construct the real
+  `claude_agent_sdk.ClaudeSDKClient` via `ClaudeAgentOptions` with no model override (2026-07-30
+  decision: unpinned, the Claude Code subscription default), wired into `start`'s existing
+  auth-handshake preflight (T2.1/T2.2's `AuthRequiredError` path) and the two in-process MCP
+  tools already built in T2.1. Also wires the `record:<dir>` branch's real client into the
+  already-complete, already-unit-tested `_RecordingSDKClient` it wraps — no new recorder logic,
+  just the live client to pass it. Discovered missing while scoping T4.1: no prior task's scope
+  included it (T2.1 explicitly scoped only the replay/record fixture machinery), and T4.1
+  cannot run without it. No new e2e coverage of its own — this task's own correctness surfaces
+  through T4.1's live release run, which is the first thing that ever exercises this branch for
+  real.
 
 ### T3 — Diff mode
 
