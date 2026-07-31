@@ -21,6 +21,18 @@ default), wired into `start`'s auth-handshake preflight and the two in-process M
 tools. Also wires a `_LiveSDKClient` into the `record:<dir>` branch's already-complete
 `_RecordingSDKClient`.
 
+T4.3 scope: `AgentSession.__init__`'s `on_activity` callback (R25) -- fired with
+the dispatched tool's name for every tool call in a driving call's turn, not only
+`propose_edits`/`run_control`'s round trip but also every SDK filesystem-read
+tool (`Read`, `Grep`, `Glob`, ...), which the live client (`_LiveSDKClient
+._consume_turn`) now translates from `ToolUseBlock` content into a new, additive
+"activity" wire event (`_ReplayingSDKClient`/`_RecordingSDKClient` need no
+special-casing: both already pass an arbitrary event dict through verbatim).
+Also adds `_ReplayingSDKClient`'s optional `delay_before` fixture field, a
+hand-authored-only e2e seam letting a scripted scenario take real wall-clock
+time so the orchestrator's real-clock progress ticker has something to tick
+against before a slow phase's turn ends.
+
 Design note on the client/wire boundary: the real `claude_agent_sdk.ClaudeSDKClient`
 takes the system prompt, tool registrations, and disallowed-tools policy as
 *construction-time options* (`ClaudeAgentOptions`), not as messages exchanged over the
@@ -43,6 +55,7 @@ import json
 import os
 import queue
 import threading
+import time
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -376,6 +389,15 @@ class _ReplayingSDKClient:
         if entry.get("direction") != "inbound":
             raise self._fail(f"entry {self._pos} is not inbound where one was expected")
         self._pos += 1
+        # T4.3 (R25): an optional, hand-authored-only delay sibling to
+        # "direction"/"event" -- never produced by the recorder, additive to the
+        # wire format (absent on every existing fixture) -- so an e2e scenario
+        # can make a scripted phase take real wall-clock time, giving the
+        # orchestrator's real-clock progress ticker something to actually tick
+        # against before the turn ends.
+        delay = entry.get("delay_before")
+        if isinstance(delay, int | float) and delay > 0:
+            time.sleep(delay)
         event = entry.get("event")
         if not isinstance(event, dict):
             raise self._fail(f"entry {self._pos - 1} has a non-object event")
@@ -541,6 +563,18 @@ def _interpret_handshake_message(message: object) -> bool | None:
     return None
 
 
+def _is_own_tool_wire_name(name: str, own_names: frozenset[str]) -> bool:
+    """True when `name` -- a `ToolUseBlock`'s wire-reported name -- refers to one
+    of Blare's own registered tools (`propose_edits`/`run_control`) rather than
+    an SDK built-in (`Read`, `Grep`, `Glob`, ...). The CLI may report an
+    in-process MCP tool's name bare or prefixed (`mcp__<server>__<tool>`); both
+    forms are matched. Blare's own two tools already get `on_activity` (R25)
+    fired from the bridge's own "tool_use" round trip
+    (`AgentSession._handle_tool_use`) -- translating their `ToolUseBlock` in
+    `_consume_turn` too would fire it a second time for the same call."""
+    return name in own_names or any(name.endswith(f"__{n}") for n in own_names)
+
+
 def _to_mcp_tool_result(result: dict[str, object]) -> dict[str, Any]:
     """Map this module's `{"ok": bool, "message": str | None}` verdict shape (the
     `propose_edits`/`run_control` tool result, agent.md) to the SDK MCP tool
@@ -688,6 +722,11 @@ class _LiveSDKClient:
         self._events: queue.Queue[dict[str, object]] = queue.Queue()
         self._bridge = _ToolBridge(self._events)
         self._closed = False
+        # R25 (T4.3): the registered tool names for this session, set by
+        # `configure_session` -- lets `_consume_turn` tell Blare's own two tools'
+        # `ToolUseBlock`s (already covered by the bridge's "tool_use" round trip)
+        # apart from every SDK built-in it must translate to an "activity" event.
+        self._own_tool_names: frozenset[str] = frozenset()
 
     def _run_coro(self, coro: Coroutine[Any, Any, _T]) -> _T:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
@@ -750,6 +789,7 @@ class _LiveSDKClient:
         options = _build_live_options(
             system_prompt, tools, disallowed_tools, self._worktree_root, self._bridge
         )
+        self._own_tool_names = frozenset(t.name for t in tools)
         self._client = claude_agent_sdk.ClaudeSDKClient(options)
         self._run_coro(self._client.connect())
 
@@ -791,6 +831,20 @@ class _LiveSDKClient:
                     for block in message.content:
                         if isinstance(block, claude_agent_sdk.TextBlock) and block.text:
                             self._events.put({"type": "text", "text": block.text})
+                        elif isinstance(
+                            block, claude_agent_sdk.ToolUseBlock
+                        ) and not _is_own_tool_wire_name(block.name, self._own_tool_names):
+                            # R25 (T4.3): every tool call the SDK itself executes
+                            # (Read, Grep, Glob, ...) dominates a phase's actual
+                            # wall-clock time, so on_activity must see these too,
+                            # not only propose_edits/run_control's round trip --
+                            # agent.md's on_activity contract. A dedicated event
+                            # kind, distinct from "tool_use" (still reserved for
+                            # Blare's own two tools' request/response round trip
+                            # via _ToolBridge below): AgentSession._drain_turn
+                            # fires on_activity for it and keeps draining, no
+                            # tool_result ever expected.
+                            self._events.put({"type": "activity", "name": block.name})
                     continue
                 if isinstance(message, claude_agent_sdk.ResultMessage):
                     # A CLI-reported turn failure (error_max_turns,
@@ -804,13 +858,14 @@ class _LiveSDKClient:
                         )
                         return
                     continue  # the turn ends right after; "turn_end" is pushed below
-                # ToolUseBlock content is not translated here: the registered SDK
-                # MCP tool handler itself pushes the "tool_use" event (_ToolBridge
-                # .dispatch) under this module's own canonical tool name, decoupled
-                # from whatever name the CLI reports on the wire for an in-process
-                # MCP tool -- translating the same call a second time here would
-                # double-report it. Any other message type is skipped, draining
-                # to the next one.
+                # Blare's own two tools' ToolUseBlock content is not translated
+                # here: the registered SDK MCP tool handler itself pushes the
+                # "tool_use" event (_ToolBridge.dispatch) under this module's own
+                # canonical tool name, decoupled from whatever name the CLI
+                # reports on the wire for an in-process MCP tool -- translating
+                # the same call a second time here would double-report it (see
+                # _is_own_tool_wire_name's filter above). Any other message type
+                # is skipped, draining to the next one.
         except Exception as exc:  # noqa: BLE001 - must reach receive(), not vanish in this task
             self._events.put({"type": "_transport_error", "error": exc})
             return
@@ -1061,7 +1116,11 @@ class AgentSession:
 
     T2.1 built `start`, `run_phase`, `chat`, `close`, and `transcript_path` in full,
     plus the two-tool dispatch over the injected `sink`/`control` handlers. T2.4 adds
-    `request_repair` and `notify_amendment_outcome`. T3.1 adds `triage`.
+    `request_repair` and `notify_amendment_outcome`. T3.1 adds `triage`. T4.3 adds
+    `on_activity` (R25): fired with the dispatched tool's name for every tool call
+    in a turn -- `propose_edits`/`run_control` (via `_handle_tool_use`) and every
+    SDK filesystem-read tool alike (via the new "activity" event `_drain_turn`
+    handles) -- feeding the orchestrator's progress ticker.
     """
 
     def __init__(
@@ -1071,12 +1130,14 @@ class AgentSession:
         control: RunControlHandler,
         stack: ObservabilityStack,
         transcript: TranscriptWriter,
+        on_activity: Callable[[str], None] | None = None,
     ) -> None:
         self._client = client
         self._sink = sink
         self._control = control
         self._stack = stack
         self._transcript = transcript
+        self._on_activity = on_activity
         self._closed = False
         self._current_phase: Phase | None = None
         self._current_driving_call = ""
@@ -1389,6 +1450,17 @@ class AgentSession:
         except Exception as exc:  # noqa: BLE001 - R14 is hard: unwritable aborts the run
             self._raise_error(f"transcript write failed: {exc}", self._tool_call_in_flight)
 
+    def _fire_activity(self, name: str) -> None:
+        """R25: notify the injected `on_activity` callback of one dispatched tool
+        call. A pure notification -- its return value is ignored, and any
+        exception it raises is caught and dropped here rather than propagated:
+        R25 is presentation-only and must never affect a run's outcome or
+        interrupt the turn (agent.md). A no-op when no callback was injected."""
+        if self._on_activity is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_activity(name)
+
     def _drain_turn(self) -> str:
         text_parts: list[str] = []
         while True:
@@ -1401,6 +1473,15 @@ class AgentSession:
                 text_parts.append(text)
             elif event_type == "tool_use":
                 self._handle_tool_use(event)
+            elif event_type == "activity":
+                # R25: a tool call the SDK executed itself (a filesystem-read
+                # tool such as Read/Grep/Glob) that never goes through Blare's
+                # own propose_edits/run_control round trip -- fire on_activity
+                # and keep draining; no tool_result is ever expected or sent
+                # for this event kind (agent.md, on_activity).
+                name = event.get("name")
+                if isinstance(name, str):
+                    self._fire_activity(name)
             elif event_type == "turn_end":
                 return "".join(text_parts)
             else:
@@ -1411,6 +1492,7 @@ class AgentSession:
         name = event.get("name")
         if not isinstance(tool_use_id, str) or not isinstance(name, str):
             self._raise_error("malformed tool_use event: missing id or name", True)
+        self._fire_activity(name)
         raw_input = event.get("input")
         self._tool_call_in_flight = True
         try:

@@ -67,6 +67,8 @@ import datetime as _dt
 import json
 import os
 import signal
+import threading
+import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
@@ -268,6 +270,8 @@ class Presenter(Protocol):
         self, text: str, prompt: PromptKind | None
     ) -> AmendmentReply | None: ...
 
+    def progress(self, label: str, elapsed_seconds: float, last_activity: str | None) -> None: ...
+
     def notice(self, text: str) -> None: ...
 
     def error(self, cause: str, next_action: str, detail: str | None = None) -> None: ...
@@ -285,6 +289,159 @@ RunFn = Callable[[RunMode, Path, Presenter], int]
 # below so a unit opening, a cascade join, a unit's closure, and a gate check
 # are all as visible in the run log as an ordinary phase transition.
 _Log = Callable[[dict[str, object]], None]
+
+
+# --- Progress ticker (R25, T4.3) -----------------------------------------------------
+#
+# Every agent-driving call (`run_phase`, `triage`, `chat`, `request_repair`,
+# `notify_amendment_outcome`) is wrapped in a background ticker that periodically
+# reports elapsed time plus the model's most recent tool-call activity through the
+# presenter, for as long as the call is in flight -- discovered missing via live user
+# testing (a real run gave no indication of which phase was active, or whether it was
+# still alive, across phases that ran for minutes to nearly two hours). Presentation
+# only: it never alters turn-taking (architecture, "Progress feedback (R25)").
+
+# A "short interval" (orchestrator.md, Progress ticker): not user-configurable, and
+# deliberately not a spec-level decision -- see this doc's own "no open items" note on
+# conventional mappings documented as fact.
+_PROGRESS_TICK_INTERVAL_SECONDS = 1.0
+
+# Mirrors cli.py's own `_PHASE_TITLES` (architecture: cli owns all text formatting for
+# *views*, but a progress line's `label` arrives at the presenter as an already-built
+# plain string -- cli.md's Interface takes `label: str`, not a phase to format itself
+# -- so the orchestrator needs this same small mapping to build it.
+_PHASE_TITLES: dict[Phase, str] = {
+    Phase.SYSTEM_MAP: "system map",
+    Phase.FAILURE_MODES: "failure modes",
+    Phase.METRIC_COVERAGE: "metric coverage",
+    Phase.ALERT_RECOMMENDATIONS: "alert recommendations",
+}
+
+
+def _phase_label(phase: Phase) -> str:
+    return f"phase {int(phase)} — {_PHASE_TITLES[phase]}"
+
+
+class _ActivityCell:
+    """Thread-safe holder for the most recent tool-call name `AgentSession`'s
+    injected `on_activity` callback (agent.md, R25) reports -- read by the
+    progress ticker below. `reset()` clears it at the start of every driving
+    call so a tick can never show a previous, already-finished call's stale
+    activity; `on_activity` itself only ever calls `set`, from whatever thread
+    is draining the turn (today: the same thread blocked in the driving call)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value: str | None = None
+
+    def set(self, name: str) -> None:
+        with self._lock:
+            self._value = name
+
+    def reset(self) -> None:
+        with self._lock:
+            self._value = None
+
+    def get(self) -> str | None:
+        with self._lock:
+            return self._value
+
+
+@dataclass
+class _ProgressContext:
+    """Bundles the two pieces the progress ticker needs across a run, alongside
+    `presenter` (already threaded through every phase-engine/amendment function
+    individually) -- one extra parameter instead of two everywhere `_drive` is
+    called. `clock` is the module's own test seam for this behavior (orchestrator
+    .md's Test plan): real time is never faked by patching the standard library;
+    a test supplies a fake clock here instead."""
+
+    activity: _ActivityCell
+    clock: Callable[[], float]
+
+
+class _ProgressTicker:
+    """Background thread rendering one R25 progress line on a short interval for
+    the duration of one agent-driving call (orchestrator.md, "Progress ticker
+    (R25)"). The first tick is always emitted at exactly `elapsed=0.0`,
+    `last_activity=None` -- hardcoded, never read from the clock or the activity
+    cell, so it can never race whatever the driving call's own first tool
+    dispatch does concurrently. Every later tick reads real elapsed time from the
+    injected clock and the most recent name from the shared cell. `stop()` joins
+    the thread, so the caller (`_drive`) can guarantee no progress line is ever
+    rendered after it -- the ticker is always stopped before the driving call's
+    own result is used for anything further. A `presenter.progress` call raising
+    is swallowed: R25 is presentation-only and must never affect the run's
+    outcome (orchestrator.md, cli.md)."""
+
+    def __init__(
+        self,
+        presenter: Presenter,
+        label: str,
+        activity: _ActivityCell,
+        clock: Callable[[], float],
+        interval: float = _PROGRESS_TICK_INTERVAL_SECONDS,
+    ) -> None:
+        self._presenter = presenter
+        self._label = label
+        self._activity = activity
+        self._clock = clock
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._start_time = 0.0
+        self._thread = threading.Thread(
+            target=self._run, name="blare-progress-ticker", daemon=True
+        )
+
+    def start(self) -> None:
+        self._start_time = self._clock()
+        self._thread.start()
+
+    def _run(self) -> None:
+        self._emit(0.0, None)
+        while not self._stop_event.wait(self._interval):
+            self._emit(self._clock() - self._start_time, self._activity.get())
+
+    def _emit(self, elapsed_seconds: float, last_activity: str | None) -> None:
+        with contextlib.suppress(Exception):  # noqa: BLE001 - R25 is presentation-only
+            self._presenter.progress(self._label, elapsed_seconds, last_activity)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join()
+
+
+def _drive[DrivenT](
+    presenter: Presenter,
+    progress_ctx: _ProgressContext,
+    label: str,
+    call: Callable[[], DrivenT],
+) -> DrivenT:
+    """Wrap one agent-driving call with R25's progress ticker: reset the shared
+    activity cell (so this call's first tick, and any that follow before its own
+    first tool dispatch, never show a previous call's stale activity), start the
+    ticker, run `call`, then stop and join the ticker *before* returning -- so a
+    progress line can never interleave with or follow the call's own result
+    rendering (a checkpoint, a chat reply, `notify_amendment_outcome`'s
+    caller) (orchestrator.md, "Progress ticker (R25)").
+
+    Reads `_PROGRESS_TICK_INTERVAL_SECONDS` by name here (never captured as a
+    default parameter value, which Python would bind once at import time) so a
+    test can `monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS",
+    ...)` to shrink the tick cadence and observe several ticks without a
+    real ~1s-per-tick wait -- the clock argument stays the module's documented
+    seam for elapsed-time *values*; this is what makes exercising tick *cadence*
+    in a test practical alongside it."""
+    progress_ctx.activity.reset()
+    ticker = _ProgressTicker(
+        presenter, label, progress_ctx.activity, progress_ctx.clock,
+        _PROGRESS_TICK_INTERVAL_SECONDS,
+    )
+    ticker.start()
+    try:
+        return call()
+    finally:
+        ticker.stop()
 
 
 # --- Preflight-owned errors (orchestrator.md: steps 2, 3, 5, 8) ---------------------
@@ -963,6 +1120,8 @@ def _advance_unit(
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     holder: _CandidateHolder,
     session: agent.AgentSession,
+    presenter: Presenter,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """Drive the open unit to a state ready for presentation (orchestrator.md,
@@ -1002,7 +1161,10 @@ def _advance_unit(
             unit.announced.update(pending)
             if not same_turn_complete:
                 violations = [v for p in pending for v in unit.pending_violations.get(p, ())]
-                session.request_repair(list(pending), violations)
+                _drive(
+                    presenter, progress_ctx, "repair",
+                    lambda: session.request_repair(list(pending), violations),  # noqa: B023
+                )
             continue
         if not unit.dirty:
             return
@@ -1141,6 +1303,8 @@ def _close_unit(
     phase_status: dict[Phase, _PhaseStatus],
     holder: _CandidateHolder,
     session: agent.AgentSession,
+    presenter: Presenter,
+    progress_ctx: _ProgressContext,
     log: _Log,
     *,
     approved: bool,
@@ -1173,7 +1337,13 @@ def _close_unit(
             "restored_phases": sorted(int(p) for p in restored),
         }
     )
-    session.notify_amendment_outcome(approved=approved, restored_phases=sorted(restored, key=int))
+    restored_sorted = sorted(restored, key=int)
+    _drive(
+        presenter, progress_ctx, "amendment outcome",
+        lambda: session.notify_amendment_outcome(
+            approved=approved, restored_phases=restored_sorted
+        ),
+    )
 
 
 def _present_amendment_once(
@@ -1182,6 +1352,7 @@ def _present_amendment_once(
     holder: _CandidateHolder,
     session: agent.AgentSession,
     presenter: Presenter,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """Present the (closure-ready) unit once and drive its reply to a terminal
@@ -1198,7 +1369,10 @@ def _present_amendment_once(
     reply: AmendmentReply = presenter.present_amendment(view, rejectable)
     while True:
         if isinstance(reply, Approve):
-            _close_unit(unit_holder, phase_status, holder, session, log, approved=True)
+            _close_unit(
+                unit_holder, phase_status, holder, session, presenter, progress_ctx, log,
+                approved=True,
+            )
             return
         if isinstance(reply, Abort):
             raise _AbortRun
@@ -1208,11 +1382,17 @@ def _present_amendment_once(
                     "Reject returned for a non-rejectable (system-originated) "
                     "amendment prompt -- a protocol violation"
                 )
-            _close_unit(unit_holder, phase_status, holder, session, log, approved=False)
+            _close_unit(
+                unit_holder, phase_status, holder, session, presenter, progress_ctx, log,
+                approved=False,
+            )
             return
         if isinstance(reply, Chat):
             before_phases = set(unit.opened_from)
-            chat_reply_text = session.chat(reply.text)
+            chat_text = reply.text
+            chat_reply_text = _drive(
+                presenter, progress_ctx, "chat", lambda: session.chat(chat_text)  # noqa: B023
+            )
             kind = PromptKind.REJECTABLE_AMENDMENT if rejectable else PromptKind.AMENDMENT
             next_reply = presenter.show_chat_reply(chat_reply_text, kind)
             assert next_reply is not None, (
@@ -1240,14 +1420,20 @@ def _resolve_unit_to_presentation(
     holder: _CandidateHolder,
     session: agent.AgentSession,
     presenter: Presenter,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """Drive any open unit through the closure loop and its (possibly repeated)
     re-presentation until it closes (T2.4; orchestrator.md: "An open unit defers
     everything downstream of it"). A no-op if no unit is open."""
     while unit_holder.current is not None:
-        _advance_unit(unit_holder, phase_status, phase_baselines, holder, session, log)
-        _present_amendment_once(unit_holder, phase_status, holder, session, presenter, log)
+        _advance_unit(
+            unit_holder, phase_status, phase_baselines, holder, session, presenter,
+            progress_ctx, log,
+        )
+        _present_amendment_once(
+            unit_holder, phase_status, holder, session, presenter, progress_ctx, log
+        )
 
 
 def _open_system_unit(
@@ -1302,6 +1488,7 @@ def _repair_residual_violations(
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     session: agent.AgentSession,
     presenter: Presenter,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """T3.2: update mode's own post-triage check for R18's load-seeded violation
@@ -1332,7 +1519,8 @@ def _repair_residual_violations(
     )
     _open_system_unit(violations, phase_status, unit_holder, phase_baselines, holder, log)
     _resolve_unit_to_presentation(
-        unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+        unit_holder, phase_status, phase_baselines, holder, session, presenter,
+        progress_ctx, log,
     )
 
 
@@ -1445,6 +1633,7 @@ def _run_checkpoint(
     phase_status: dict[Phase, _PhaseStatus],
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     holder: _CandidateHolder,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """Present one checkpoint and drive its chat loop to approval (architecture:
@@ -1462,11 +1651,15 @@ def _run_checkpoint(
         if isinstance(reply, Abort):
             raise _AbortRun
         if isinstance(reply, Chat):
-            chat_reply_text = session.chat(reply.text)
+            chat_text = reply.text
+            chat_reply_text = _drive(
+                presenter, progress_ctx, "chat", lambda: session.chat(chat_text)  # noqa: B023
+            )
             if unit_holder.current is not None:
                 presenter.show_chat_reply(chat_reply_text, None)
                 _resolve_unit_to_presentation(
-                    unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+                    unit_holder, phase_status, phase_baselines, holder, session, presenter,
+                    progress_ctx, log,
                 )
                 view = build_view()
                 reply = presenter.present_checkpoint(view)
@@ -1492,6 +1685,7 @@ def _run_no_impact_checkpoint(
     phase_status: dict[Phase, _PhaseStatus],
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     holder: _CandidateHolder,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """Present the R18 no-impact conclusion as a checkpoint -- approve/abort/chat,
@@ -1526,7 +1720,10 @@ def _run_no_impact_checkpoint(
         if isinstance(reply, Abort):
             raise _AbortRun
         if isinstance(reply, Chat):
-            chat_reply_text = session.chat(reply.text)
+            chat_text = reply.text
+            chat_reply_text = _drive(
+                presenter, progress_ctx, "chat", lambda: session.chat(chat_text)  # noqa: B023
+            )
             redirect = unit_holder.current is not None or any(
                 status is _PhaseStatus.OPEN for status in phase_status.values()
             )
@@ -1535,7 +1732,7 @@ def _run_no_impact_checkpoint(
                 if unit_holder.current is not None:
                     _resolve_unit_to_presentation(
                         unit_holder, phase_status, phase_baselines, holder, session,
-                        presenter, log,
+                        presenter, progress_ctx, log,
                     )
                 if any(status is _PhaseStatus.OPEN for status in phase_status.values()):
                     return
@@ -1563,6 +1760,7 @@ def _drain_phase_queue(
     phase_status: dict[Phase, _PhaseStatus],
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     unit_holder: _UnitHolder,
+    progress_ctx: _ProgressContext,
     log: _Log,
 ) -> None:
     """Run exactly the queue's phases, in phase order (T3.1; architecture: update
@@ -1590,14 +1788,18 @@ def _drain_phase_queue(
         if not queue:
             return
         phase = queue[0]
-        session.run_phase(phase)
+        _drive(
+            presenter, progress_ctx, _phase_label(phase),
+            lambda: session.run_phase(phase),  # noqa: B023
+        )
         log({"event": "phase_run", "phase": int(phase)})
 
         if unit_holder.current is not None:
             # orchestrator.md, Approval gate: any driving call returning with a
             # unit open resumes it immediately before anything else proceeds.
             _resolve_unit_to_presentation(
-                unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+                unit_holder, phase_status, phase_baselines, holder, session, presenter,
+                progress_ctx, log,
             )
 
         def _build_checkpoint_view(phase: Phase = phase) -> CheckpointView:
@@ -1612,7 +1814,7 @@ def _drain_phase_queue(
 
         _run_checkpoint(
             session, presenter, _build_checkpoint_view, unit_holder, phase_status,
-            phase_baselines, holder, log,
+            phase_baselines, holder, progress_ctx, log,
         )
         phase_status[phase] = _PhaseStatus.FROZEN
         log({"event": "phase_frozen", "phase": int(phase)})
@@ -1625,6 +1827,7 @@ def _finalize_and_write(
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     session: agent.AgentSession,
     presenter: Presenter,
+    progress_ctx: _ProgressContext,
     log: _Log,
     repo: gitrepo.GitRepo,
     end_sha: str,
@@ -1647,7 +1850,8 @@ def _finalize_and_write(
     draining it is a no-op there."""
     while True:
         _drain_phase_queue(
-            session, presenter, holder, phase_status, phase_baselines, unit_holder, log
+            session, presenter, holder, phase_status, phase_baselines, unit_holder,
+            progress_ctx, log,
         )
         violations = artifacts.semantic_violations(holder.current)
         if not violations:
@@ -1661,7 +1865,8 @@ def _finalize_and_write(
         )
         _open_system_unit(violations, phase_status, unit_holder, phase_baselines, holder, log)
         _resolve_unit_to_presentation(
-            unit_holder, phase_status, phase_baselines, holder, session, presenter, log
+            unit_holder, phase_status, phase_baselines, holder, session, presenter,
+            progress_ctx, log,
         )
     log({"event": "gate_passed"})
 
@@ -1787,7 +1992,11 @@ def _log(run_state: _RunState, presenter: Presenter, event: dict[str, object]) -
 
 
 def _execute(
-    mode: RunMode, repo_path: Path, presenter: Presenter, run_state: _RunState
+    mode: RunMode,
+    repo_path: Path,
+    presenter: Presenter,
+    run_state: _RunState,
+    clock: Callable[[], float],
 ) -> int:
     # Step 1: repo discovery; no-commits check (R11). No repo-id exists yet, so a
     # failure here has no run log -- its diagnosis is the R13 message alone.
@@ -1952,6 +2161,11 @@ def _execute(
     transcript = _RealTranscriptWriter(
         state_dir / _TRANSCRIPTS_DIRNAME / f"{run_id}.jsonl"
     )
+    # R25 (T4.3): the activity cell AgentSession's on_activity callback updates,
+    # and the clock/presenter bundle every driving call's progress ticker reads
+    # (see "Progress ticker (R25)" above).
+    activity_cell = _ActivityCell()
+    progress_ctx = _ProgressContext(activity=activity_cell, clock=clock)
     client = agent.create_client()
     session = agent.AgentSession(
         client,
@@ -1959,6 +2173,7 @@ def _execute(
         control=control,
         stack=artifact_set.stack,
         transcript=transcript,
+        on_activity=activity_cell.set,
     )
     session.start(
         mode,
@@ -1991,7 +2206,7 @@ def _execute(
         # analyze's own try/except/finally (see that block's comment for the
         # abort/close rationale).
         try:
-            session.triage()
+            _drive(presenter, progress_ctx, "triage", session.triage)
             _log(run_state, presenter, {"event": "triage_complete"})
 
             if unit_holder.current is not None:
@@ -2000,7 +2215,7 @@ def _execute(
                 # (orchestrator.md, Approval gate).
                 _resolve_unit_to_presentation(
                     unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                    _log_event,
+                    progress_ctx, _log_event,
                 )
 
             # T3.2: R18's load-seeded violation repairs -- request_repair is the
@@ -2012,7 +2227,7 @@ def _execute(
             # no_impact conclusion or draining the queue.
             _repair_residual_violations(
                 holder, phase_status, unit_holder, phase_baselines, session, presenter,
-                _log_event,
+                progress_ctx, _log_event,
             )
 
             # T3.2: a same-turn sequence within triage() itself -- an accepted
@@ -2043,19 +2258,19 @@ def _execute(
                 # rejected -- nothing further to do here once it returns.
                 _run_no_impact_checkpoint(
                     session, presenter, view, unit_holder, phase_status, phase_baselines,
-                    holder, _log_event,
+                    holder, progress_ctx, _log_event,
                 )
             # `_drain_phase_queue` is a no-op over an empty queue, so this
             # unconditional call covers both the no_impact-withdrawn path (a
             # phase is now open) and the ordinary affected_verdict path.
             _drain_phase_queue(
                 session, presenter, holder, phase_status, phase_baselines, unit_holder,
-                _log_event,
+                progress_ctx, _log_event,
             )
 
             _finalize_and_write(
                 holder, phase_status, unit_holder, phase_baselines, session, presenter,
-                _log_event, repo, end_sha, blare_root,
+                progress_ctx, _log_event, repo, end_sha, blare_root,
             )
         except _AbortRun:
             counts = _overall_counts(artifact_set, holder.current)
@@ -2096,7 +2311,10 @@ def _execute(
     try:
         for phase in _ANALYZE_PHASES:
             _mark_phase_open(phase, phase_status, phase_baselines, holder)
-            session.run_phase(phase)
+            _drive(
+                presenter, progress_ctx, _phase_label(phase),
+                lambda: session.run_phase(phase),  # noqa: B023
+            )
             _log(run_state, presenter, {"event": "phase_run", "phase": int(phase)})
 
             if unit_holder.current is not None:
@@ -2106,7 +2324,7 @@ def _execute(
                 # checkpoint."
                 _resolve_unit_to_presentation(
                     unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                    _log_event,
+                    progress_ctx, _log_event,
                 )
 
             def _build_checkpoint_view(phase: Phase = phase) -> CheckpointView:
@@ -2126,7 +2344,7 @@ def _execute(
 
             _run_checkpoint(
                 session, presenter, _build_checkpoint_view, unit_holder, phase_status,
-                phase_baselines, holder, _log_event,
+                phase_baselines, holder, progress_ctx, _log_event,
             )
             phase_status[phase] = _PhaseStatus.FROZEN
             _log(run_state, presenter, {"event": "phase_frozen", "phase": int(phase)})
@@ -2137,7 +2355,7 @@ def _execute(
         # (T3.1) rather than a duplicated implementation.
         _finalize_and_write(
             holder, phase_status, unit_holder, phase_baselines, session, presenter,
-            _log_event, repo, end_sha, blare_root,
+            progress_ctx, _log_event, repo, end_sha, blare_root,
         )
     except _AbortRun:
         counts = _overall_counts(artifact_set, holder.current)
@@ -2202,8 +2420,22 @@ def _discarded_summary_fields(run_state: _RunState) -> _DiscardedSummaryFields:
         return _DiscardedSummaryFields(gap_counts=None, entry_counts=None, discarded=True)
 
 
-def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
+def run(
+    mode: RunMode,
+    repo_path: Path,
+    presenter: Presenter,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
     """Blare's one entry contract: run a mode against a repo, render through presenter.
+
+    `clock` (R25, T4.3) is the progress ticker's injected clock -- `time.monotonic`
+    by default, the module's own test seam for the ticker's elapsed-time behavior
+    (orchestrator.md's Test plan). A keyword-only parameter with a default so
+    `RunFn = Callable[[RunMode, Path, Presenter], int]` (cli's fixed entry
+    contract) stays satisfied: every ordinary caller (cli.main) calls `run` with
+    exactly the three positional arguments and gets the real clock; only tests
+    override it.
 
     Exit-code taxonomy (orchestrator.md), assigned by run stage, not by which module
     raised: `0` success (including R7 up-to-date); `1` refusal -- any `BlareError`
@@ -2235,7 +2467,7 @@ def run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
     """
     run_state = _RunState()
     try:
-        return _execute(mode, repo_path, presenter, run_state)
+        return _execute(mode, repo_path, presenter, run_state, clock)
     except KeyboardInterrupt:
         if run_state.transcript_path is not None:
             fields = _discarded_summary_fields(run_state)

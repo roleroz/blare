@@ -636,3 +636,27 @@ py_test(
         "@rules_python//python/runfiles",
     ],
 )
+
+py_test(
+    name = "test_progress_feedback",
+    srcs = [
+        "__init__.py",
+        "pty_harness.py",
+        "repo_fixtures.py",
+        "test_progress_feedback.py",
+        "//:pytest_main.py",
+        "//tests:__init__.py",
+    ],
+    args = ["$(location :test_progress_feedback.py)"],
+    data = [
+        "//src/blare:blare",
+        "//tests/fixtures/claude-sdk/progress-feedback:scenario.jsonl",
+    ],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    tags = ["e2e"],
+    deps = [
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)

@@ -8,7 +8,9 @@ amendment kinds -- it only needed the kind, never the amendment view itself), an
 `present_amendment`: the amendment screen (origin line, one section per involved
 phase, the reply alphabet including `reject` when rejectable). T3.1 builds
 `present_no_impact`: the R18 no-impact screen (header, changed-file summary, the
-agent's conclusion text, then the ordinary checkpoint prompt).
+agent's conclusion text, then the ordinary checkpoint prompt). T4.3 builds
+`progress` (R25): the periodic `· ` status line the orchestrator's ticker renders
+while a driving call is in flight.
 """
 
 from __future__ import annotations
@@ -36,6 +38,8 @@ __version__ = "0.1.0"
 
 _RESULT_PREFIX = "→ "  # brand §6: "→" for results
 _PROMPT_MARKER = "$ "  # brand §6: "$" for the prompt
+_PROGRESS_PREFIX = "· "  # R25: distinct from both, since a progress line is neither
+_WAITING_ACTIVITY = "waiting"  # cli.md: rendered when last_activity is None
 
 # brand/design-language.md §2: --blare-alert (#FF5A1F) and --blare-alert-hi (#FFB020),
 # as 24-bit ANSI SGR sequences -- the only two words this module ever colors (§6:
@@ -191,6 +195,19 @@ class TerminalPresenter:
         if reply is None:
             return orchestrator.Abort()
         return reply
+
+    def progress(self, label: str, elapsed_seconds: float, last_activity: str | None) -> None:
+        """R25: one status line while an agent-driving call is in flight, e.g.
+        `· phase 3 — metric coverage (12s, propose_edits)` or `(12s, waiting)`
+        before any tool call has arrived. Void like `notice`: swallows a stream
+        failure and never raises -- the orchestrator's ticker calls this off the
+        thread draining the turn, purely to inform, and no reply was ever
+        expected here (cli.md's Error handling: "progress" is in the void class)."""
+        activity = last_activity if last_activity is not None else _WAITING_ACTIVITY
+        self._write(
+            self._stdout,
+            f"{_PROGRESS_PREFIX}{label} ({int(elapsed_seconds)}s, {activity})",
+        )
 
     # --- Non-view methods -------------------------------------------------------------
 

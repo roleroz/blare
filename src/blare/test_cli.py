@@ -148,6 +148,28 @@ def test_contract_notice_renders_plain_line_without_prefix() -> None:
     assert stdout.getvalue() == "a stale lock was reclaimed\n"
 
 
+def test_contract_progress_renders_dot_prefix_label_elapsed_and_activity() -> None:
+    """progress() (R25) renders "· label (Ns, activity)", byte-exact for a fixed
+    set of arguments -- distinct from both "→ " (results) and "$ " (prompts)."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("phase 3 — metric coverage", 12.0, "propose_edits")
+
+    assert stdout.getvalue() == "· phase 3 — metric coverage (12s, propose_edits)\n"
+
+
+def test_contract_progress_renders_waiting_when_last_activity_is_none() -> None:
+    """progress() renders "waiting" in place of last_activity when it is None --
+    no tool call has arrived yet (cli.md's Rendering rules)."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("triage", 3.0, None)
+
+    assert stdout.getvalue() == "· triage (3s, waiting)\n"
+
+
 def test_contract_is_interactive_reflects_stdin_isatty() -> None:
     """is_interactive() is stdin.isatty() (R22's criterion)."""
 
@@ -186,6 +208,15 @@ def test_failure_stdout_broken_pipe_in_notice_is_swallowed() -> None:
     presenter = TerminalPresenter(io.StringIO(), _BrokenPipeStream(), io.StringIO())
 
     presenter.notice("a notice")  # must not raise
+
+
+def test_failure_stdout_broken_pipe_in_progress_is_swallowed() -> None:
+    """A BrokenPipeError inside progress() (R25, a void method like notice) is
+    swallowed, no traceback, no effect on the run (cli.md's Error handling: the
+    same void-class rule as notice)."""
+    presenter = TerminalPresenter(io.StringIO(), _BrokenPipeStream(), io.StringIO())
+
+    presenter.progress("phase 1 — system map", 5.0, "Read")  # must not raise
 
 
 # --- T2.3: checkpoint screen, chat loop, full summary content -----------------------

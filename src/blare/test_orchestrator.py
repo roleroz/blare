@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,9 +81,16 @@ class FakePresenter:
     amendment_replies: list[AmendmentReply] = field(default_factory=list)
     no_impact_views: list[NoImpactView] = field(default_factory=list)
     no_impact_replies: list[CheckpointReply] = field(default_factory=list)
+    # R25 (T4.3): every `progress()` call, in order, and a single ordered event
+    # log spanning progress *and* every presentation/reply method -- unlike the
+    # per-kind lists above, this is what lets a test assert relative order (a
+    # progress tick happened before the checkpoint it precedes, none after).
+    progress_calls: list[tuple[str, float, str | None]] = field(default_factory=list)
+    event_order: list[str] = field(default_factory=list, init=False)
 
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
         self.checkpoint_views.append(view)
+        self.event_order.append("checkpoint")
         if self.checkpoint_replies:
             return self.checkpoint_replies.pop(0)
         return orchestrator.Approve()
@@ -89,12 +98,14 @@ class FakePresenter:
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply:
         self.amendment_views.append(view)
         self.amendment_rejectable_seen.append(rejectable)
+        self.event_order.append("amendment")
         if self.amendment_replies:
             return self.amendment_replies.pop(0)
         return orchestrator.Approve()
 
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
         self.no_impact_views.append(view)
+        self.event_order.append("no_impact")
         if self.no_impact_replies:
             return self.no_impact_replies.pop(0)
         return orchestrator.Approve()
@@ -103,9 +114,14 @@ class FakePresenter:
         self, text: str, prompt: PromptKind | None
     ) -> AmendmentReply | None:
         self.chat_reply_calls.append((text, prompt))
+        self.event_order.append("chat_reply")
         if self.chat_reply_script:
             return self.chat_reply_script.pop(0)
         return orchestrator.Approve()
+
+    def progress(self, label: str, elapsed_seconds: float, last_activity: str | None) -> None:
+        self.progress_calls.append((label, elapsed_seconds, last_activity))
+        self.event_order.append("progress")
 
     def notice(self, text: str) -> None:
         self.notices.append(text)
@@ -217,6 +233,20 @@ class FakeAgentSession:
     # turn -- the turn-by-turn reminder/raise mechanics are agent.py's own unit
     # concern, test_agent.py).
     triage_run_control_calls: list[RunControlCall] = field(default_factory=list)
+    # R25 (T4.3): mirrors the real AgentSession.__init__'s on_activity parameter,
+    # so a factory built from this class can replace agent.AgentSession
+    # transparently even now that the real one takes it too.
+    on_activity: Callable[[str], None] | None = None
+    # Which driving call (by its `call_order` tag prefix, e.g. "run_phase",
+    # "triage", "chat", "request_repair", "notify_amendment_outcome") should run
+    # `activity_script` -- (real, tiny sleep_seconds, activity_name) pairs fired
+    # in order via `on_activity` -- before returning. Lets a test make exactly
+    # one driving call "slow" (a few tens of milliseconds) so the orchestrator's
+    # progress ticker, with its interval shrunk via monkeypatching
+    # `orchestrator._PROGRESS_TICK_INTERVAL_SECONDS`, genuinely ticks more than
+    # once while it is in flight, without faking real time itself.
+    slow_call: str | None = None
+    activity_script: list[tuple[float, str]] = field(default_factory=list)
     started_with: tuple[RunMode, RunContext] | None = field(default=None, init=False)
     ran_phases: list[Phase] = field(default_factory=list, init=False)
     triage_called: bool = field(default=False, init=False)
@@ -253,10 +283,23 @@ class FakeAgentSession:
         self.started_with = (mode, context)
         self._write_transcript("outbound", {"type": "session_init", "mode": mode.value})
 
+    def _run_activity_script(self, tag: str) -> None:
+        """R25 (T4.3): if `tag` matches the scripted `slow_call`, sleep and fire
+        `on_activity` for each scripted (sleep_seconds, name) pair in order."""
+        if self.slow_call != tag:
+            return
+        for sleep_seconds, name in self.activity_script:
+            time.sleep(sleep_seconds)
+            if self.on_activity is not None:
+                self.on_activity(name)
+
     def run_phase(self, phase: Phase) -> None:
         self.ran_phases.append(phase)
         self.call_order.append(f"run_phase:{int(phase)}")
         self._write_transcript("outbound", {"type": "phase_prompt", "phase": int(phase)})
+        # Tagged per phase number so a test can make exactly one phase "slow"
+        # (e.g. "run_phase:1") without every other phase paying the same delay.
+        self._run_activity_script(f"run_phase:{int(phase)}")
         if phase in self.raise_in_phase:
             raise self.raise_in_phase[phase]
         for batch in self.edits_by_phase.get(phase, []):
@@ -271,6 +314,7 @@ class FakeAgentSession:
         self.chat_calls.append(text)
         self.call_order.append("chat")
         self._write_transcript("outbound", {"type": "chat", "text": text})
+        self._run_activity_script("chat")
         for batch in self.chat_edits_by_text.get(text, []):
             verdict = self.sink(batch)
             if not verdict.ok:
@@ -295,6 +339,7 @@ class FakeAgentSession:
         self.triage_called = True
         self.call_order.append("triage")
         self._write_transcript("outbound", {"type": "triage"})
+        self._run_activity_script("triage")
         for call in self.triage_run_control_calls:
             self.run_control_verdicts.append(self.control(call))
         self._write_transcript("inbound", {"type": "turn_end"})
@@ -306,6 +351,7 @@ class FakeAgentSession:
         self._write_transcript(
             "outbound", {"type": "request_repair", "phases": [int(p) for p in key]}
         )
+        self._run_activity_script("request_repair")
         for batch in self.repair_edits_by_phases.get(key, []):
             verdict = self.sink(batch)
             if not verdict.ok:
@@ -323,6 +369,7 @@ class FakeAgentSession:
         self._write_transcript(
             "outbound", {"type": "amendment_outcome", "approved": approved}
         )
+        self._run_activity_script("notify_amendment_outcome")
 
 
 def _ready_session(
@@ -338,6 +385,8 @@ def _ready_session(
     repair_run_control_by_phases: dict[tuple[Phase, ...], list[RunControlCall]] | None = None,
     withhold_amend_complete: bool = False,
     triage_run_control_calls: list[RunControlCall] | None = None,
+    slow_call: str | None = None,
+    activity_script: list[tuple[float, str]] | None = None,
 ) -> list[FakeAgentSession]:
     """Patch `agent.create_client` and `agent.AgentSession` so the phase engine runs
     against a scripted `FakeAgentSession` instead of real SDK wire replay -- what
@@ -345,6 +394,10 @@ def _ready_session(
     step 9's auth success) wants. Returns the list `FakeAgentSession` instances get
     appended to as they are constructed (one per `orchestrator.run()` call), so a
     test driving multiple runs can inspect each one afterward.
+
+    `slow_call`/`activity_script` (R25, T4.3) forward to `FakeAgentSession` so a
+    test can make exactly one driving call sleep briefly while firing scripted
+    `on_activity` names -- see `FakeAgentSession._run_activity_script`.
     """
     monkeypatch.setattr(agent, "create_client", lambda: FakeSDKClient(ready=ready))
     scripted_edits = edits_by_phase or {}
@@ -356,6 +409,7 @@ def _ready_session(
     scripted_repair_edits = repair_edits_by_phases or {}
     scripted_repair_run_control = repair_run_control_by_phases or {}
     scripted_triage_run_control = list(triage_run_control_calls or [])
+    scripted_activity_script = list(activity_script or [])
     sessions: list[FakeAgentSession] = []
 
     def _factory(
@@ -364,6 +418,7 @@ def _ready_session(
         control: agent.RunControlHandler,
         stack: object,
         transcript: object,
+        on_activity: Callable[[str], None] | None = None,
     ) -> FakeAgentSession:
         session = FakeAgentSession(
             client=client,
@@ -381,6 +436,9 @@ def _ready_session(
             repair_run_control_by_phases=scripted_repair_run_control,
             withhold_amend_complete=withhold_amend_complete,
             triage_run_control_calls=list(scripted_triage_run_control),
+            on_activity=on_activity,
+            slow_call=slow_call,
+            activity_script=list(scripted_activity_script),
         )
         sessions.append(session)
         return session
@@ -4431,3 +4489,371 @@ def test_contract_update_no_impact_redirect_bare_verdict_withdraws_for_good(
     assert len(presenter.no_impact_views) == 1
     assert session.ran_phases == [Phase.METRIC_COVERAGE]
     assert [v.phase for v in presenter.checkpoint_views] == [Phase.METRIC_COVERAGE]
+
+
+# ==== T4.3: progress ticker (R25) ===================================================
+#
+# `FakePresenter.progress`/`event_order` and `FakeAgentSession.slow_call`
+# /`activity_script`/`on_activity` (defined above) are this section's own fakes,
+# per orchestrator.md's Test plan. `_PROGRESS_TICK_INTERVAL_SECONDS` is
+# monkeypatched down to a few tens of milliseconds so a driving call held open
+# for a handful of scripted, tiny real sleeps still ticks more than once for
+# real without costing seconds of test time; `_sequential_clock` supplies the
+# module's own documented seam (`Callable[[], float]`) so every *reported*
+# elapsed-time value is exact and independent of real timing precision -- only
+# how many ticks occur (never what they report) depends on real scheduling.
+
+
+def _sequential_clock(step: float = 5.0) -> Callable[[], float]:
+    """A deterministic elapsed-time source: returns 0.0, step, 2*step, ... on
+    successive calls, decoupled from real wall-clock time -- the module's own
+    test seam for the ticker's clock (orchestrator.md's Test plan)."""
+    values = iter(float(n) * step for n in range(100_000))
+
+    def _clock() -> float:
+        return next(values)
+
+    return _clock
+
+
+def test_contract_activity_cell_set_get_reset() -> None:
+    """The activity cell starts at None, reflects the most recent `set`, and
+    `reset` clears it back to None -- the primitive `AgentSession`'s
+    `on_activity` callback and the ticker share across threads."""
+    cell = orchestrator._ActivityCell()
+    assert cell.get() is None
+    cell.set("propose_edits")
+    assert cell.get() == "propose_edits"
+    cell.set("Read")
+    assert cell.get() == "Read"
+    cell.reset()
+    assert cell.get() is None
+
+
+def test_contract_progress_ticker_first_tick_is_always_zero_and_none() -> None:
+    """The very first tick is always exactly elapsed=0.0/last_activity=None --
+    hardcoded, never read from the clock or the activity cell, so it can never
+    race whatever the driving call's own first tool dispatch does concurrently
+    (orchestrator.md, "Progress ticker (R25)")."""
+    presenter = FakePresenter()
+    cell = orchestrator._ActivityCell()
+    cell.set("stale-from-a-previous-call")  # must not leak into the first tick
+    ticker = orchestrator._ProgressTicker(
+        presenter, "phase 1 — system map", cell, _sequential_clock(), interval=10.0
+    )
+
+    ticker.start()
+    try:
+        # The interval (10s) is far longer than this test can wait, so only the
+        # hardcoded first tick is observed -- deterministic, no timing race.
+        time.sleep(0.02)
+    finally:
+        ticker.stop()
+
+    assert presenter.progress_calls == [("phase 1 — system map", 0.0, None)]
+
+
+def test_contract_progress_ticker_later_ticks_reflect_clock_and_activity_cell() -> None:
+    """Ticks after the first read real elapsed time from the injected clock and
+    the most recent name from the shared activity cell -- both deterministic
+    here via the fake clock and manual `set` calls, no real sleep needed beyond
+    what it takes the background thread to iterate a few times at a tiny
+    interval."""
+    presenter = FakePresenter()
+    cell = orchestrator._ActivityCell()
+    clock = _sequential_clock(step=3.0)
+    ticker = orchestrator._ProgressTicker(presenter, "triage", cell, clock, interval=0.01)
+
+    ticker.start()
+    try:
+        cell.set("Grep")
+        time.sleep(0.05)
+    finally:
+        ticker.stop()
+
+    assert len(presenter.progress_calls) >= 2
+    assert presenter.progress_calls[0] == ("triage", 0.0, None)
+    for label, elapsed, activity in presenter.progress_calls[1:]:
+        assert label == "triage"
+        assert elapsed > 0.0
+        assert elapsed % 3.0 == 0.0  # every non-first tick is a multiple of the step
+        assert activity == "Grep"
+
+
+def test_contract_progress_ticker_swallows_a_raising_presenter() -> None:
+    """A `presenter.progress` call raising is swallowed -- the ticker keeps
+    running (or at least does not crash the calling thread), per R25's
+    presentation-only guarantee."""
+
+    class _RaisingPresenter:
+        def progress(self, label: str, elapsed_seconds: float, last_activity: str | None) -> None:
+            raise RuntimeError("presenter is on fire")
+
+    cell = orchestrator._ActivityCell()
+    ticker = orchestrator._ProgressTicker(
+        _RaisingPresenter(),  # type: ignore[arg-type]
+        "chat", cell, _sequential_clock(), interval=0.01,
+    )
+
+    ticker.start()  # must not raise
+    time.sleep(0.03)
+    ticker.stop()  # must not raise
+
+
+def test_contract_drive_stops_ticker_before_returning_and_returns_calls_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_drive` returns the wrapped call's own result, and the ticker is stopped
+    (joined) before `_drive` returns -- no further progress calls can arrive
+    after the caller resumes. The interval is shrunk so this is a genuine
+    regression check rather than a race the default ~1s interval would pass
+    trivially: with the ticker's thread left running (a broken `stop()`), a
+    0.01s interval would produce roughly twenty more ticks in the 0.2s this
+    test waits afterward -- this is the check a code-review mutation test
+    (removing `ticker.stop()` from `_drive`) actually catches, unlike a
+    default-interval version of this same assertion."""
+    monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS", 0.01)
+    presenter = FakePresenter()
+    progress_ctx = orchestrator._ProgressContext(
+        activity=orchestrator._ActivityCell(), clock=_sequential_clock()
+    )
+
+    result = orchestrator._drive(presenter, progress_ctx, "chat", lambda: "the reply")
+
+    assert result == "the reply"
+    # The ticker's background thread is guaranteed joined by the time _drive
+    # returns; nothing more will ever be appended from here on, even after
+    # waiting twenty times the (shrunk) tick interval.
+    count_immediately_after = len(presenter.progress_calls)
+    time.sleep(0.2)
+    assert len(presenter.progress_calls) == count_immediately_after
+
+
+def test_contract_progress_ticker_stop_joins_the_background_thread() -> None:
+    """`stop()` blocks until the background thread has actually exited -- not
+    merely signaled to stop -- so a caller resuming immediately after `stop()`
+    can never race a still-running tick against its own next action. Checked
+    directly on thread liveness (immediately after `stop()` returns) rather
+    than by waiting and counting ticks, which a slow-to-wake but eventually
+    -stopping thread could still pass."""
+    presenter = FakePresenter()
+    ticker = orchestrator._ProgressTicker(
+        presenter, "chat", orchestrator._ActivityCell(), _sequential_clock(), interval=0.01
+    )
+
+    ticker.start()
+    ticker.stop()
+
+    assert not ticker._thread.is_alive()  # noqa: SLF001
+
+
+def test_contract_progress_ticker_run_phase_ticks_only_before_its_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ticker wraps `run_phase`: phase 1 held open past several (shrunk)
+    tick intervals produces a first tick at elapsed=0/last_activity=None
+    naming phase 1, then further ticks naming the scripted activity -- all
+    strictly before phase 1's checkpoint is presented (asserted via the fake
+    presenter's unified event order), and never interleaved with it."""
+    monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS", 0.02)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(
+        monkeypatch,
+        slow_call="run_phase:1",
+        activity_script=[(0.03, "Read"), (0.03, "propose_edits")],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, clock=_sequential_clock())
+
+    assert code == 0
+    first_checkpoint_index = presenter.event_order.index("checkpoint")
+    before = presenter.event_order[:first_checkpoint_index]
+    assert before  # at least one tick happened before phase 1's checkpoint
+    assert all(kind == "progress" for kind in before)
+    phase_1_ticks = presenter.progress_calls[: len(before)]
+    assert phase_1_ticks[0] == ("phase 1 — system map", 0.0, None)
+    assert all(label == "phase 1 — system map" for label, _e, _a in phase_1_ticks)
+    assert any(activity in ("Read", "propose_edits") for _l, _e, activity in phase_1_ticks[1:])
+
+
+def test_contract_progress_ticker_chat_ticks_between_checkpoint_and_chat_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ticker wraps `chat`: a checkpoint's chat reply held open past several
+    (shrunk) tick intervals ticks strictly between the checkpoint's own
+    presentation and `show_chat_reply` -- proof the ticker is stopped before
+    the caller's next presenter call, not merely eventually."""
+    monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS", 0.02)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(
+        monkeypatch,
+        chat_script=["noted"],
+        slow_call="chat",
+        activity_script=[(0.03, "Grep"), (0.03, "propose_edits")],
+    )
+    presenter = FakePresenter()
+    presenter.checkpoint_replies = [orchestrator.Chat("please reconsider")]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, clock=_sequential_clock())
+
+    assert code == 0
+    checkpoint_index = presenter.event_order.index("checkpoint")
+    chat_reply_index = presenter.event_order.index("chat_reply")
+    assert chat_reply_index > checkpoint_index
+    between = presenter.event_order[checkpoint_index + 1 : chat_reply_index]
+    assert between  # at least one tick happened during chat
+    assert all(kind == "progress" for kind in between)
+    progress_before = presenter.event_order[:checkpoint_index].count("progress")
+    between_calls = presenter.progress_calls[progress_before : progress_before + len(between)]
+    assert between_calls[0] == ("chat", 0.0, None)
+    assert any(name in ("Grep", "propose_edits") for _l, _e, name in between_calls[1:])
+
+
+def test_contract_progress_ticker_triage_first_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ticker wraps `triage` (update mode's first driving call): held open
+    past several (shrunk) tick intervals, it ticks with the "triage" label
+    before triage's own outcome is acted on, and stops before the no-impact
+    confirmation is ever presented."""
+    monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS", 0.02)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.NO_IMPACT, {"reasoning": "nothing relevant"})
+        ],
+        slow_call="triage",
+        activity_script=[(0.03, "Grep"), (0.03, "Read")],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter, clock=_sequential_clock())
+
+    assert code == 0
+    assert presenter.progress_calls[0] == ("triage", 0.0, None)
+    assert any(
+        label == "triage" and activity in ("Grep", "Read")
+        for label, _e, activity in presenter.progress_calls[1:]
+    )
+    # The ticker had fully stopped (joined) before the no-impact confirmation
+    # was ever presented -- no "progress" entries appear from that point on.
+    no_impact_index = presenter.event_order.index("no_impact")
+    assert "progress" not in presenter.event_order[no_impact_index:]
+
+
+def test_contract_progress_ticker_request_repair_and_notify_amendment_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ticker wraps both `request_repair` (resuming an agent-proposed
+    amendment) and `notify_amendment_outcome` (closing it): each ticks with its
+    own label ("repair" / "amendment outcome") while held open past several
+    (shrunk) tick intervals, and request_repair's ticks land before the
+    amendment's re-presentation (orchestrator.md: "every driving call... is
+    wrapped")."""
+    monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS", 0.02)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    sessions = _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_edits_by_text={"please amend phase 1": []},
+        chat_run_control_by_text={
+            "please amend phase 1": [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ]
+        },
+        repair_edits_by_phases={
+            (Phase.SYSTEM_MAP,): [
+                EditBatch(
+                    phase=Phase.SYSTEM_MAP,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "system_components",
+                            {
+                                "id": "sm-web",
+                                "name": "web",
+                                "kind": "service",
+                                "description": "revised during the amendment",
+                                "depends_on": [],
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+        slow_call="request_repair",
+        activity_script=[(0.03, "Read"), (0.03, "propose_edits")],
+    )
+    presenter = FakePresenter()
+    presenter.checkpoint_replies = [
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Approve(),
+        orchestrator.Chat("please amend phase 1"),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, clock=_sequential_clock())
+
+    assert code == 0
+    session = sessions[0]
+    assert session.request_repair_calls == [((Phase.SYSTEM_MAP,), ())]
+    assert session.notify_outcomes == [(True, ())]
+    repair_ticks = [c for c in presenter.progress_calls if c[0] == "repair"]
+    assert repair_ticks
+    assert repair_ticks[0] == ("repair", 0.0, None)
+    assert any(name in ("Read", "propose_edits") for _l, _e, name in repair_ticks[1:])
+    # request_repair's ticks all land strictly before the amendment's
+    # re-presentation.
+    amendment_index = presenter.event_order.index("amendment")
+    before_amendment = presenter.event_order[:amendment_index]
+    progress_before_amendment = before_amendment.count("progress")
+    assert progress_before_amendment >= len(repair_ticks)
+    # notify_amendment_outcome's own ticker (label "amendment outcome") fired
+    # too, distinct from request_repair's -- both driving calls got their own
+    # ticker.
+    outcome_ticks = [c for c in presenter.progress_calls if c[0] == "amendment outcome"]
+    assert outcome_ticks
+    assert outcome_ticks[0] == ("amendment outcome", 0.0, None)
+
+
+def test_failure_progress_raising_on_activity_does_not_break_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising `on_activity` callback (fired from the agent side, T4.3) never
+    propagates through the orchestrator's ticker or interrupts the run --
+    swallowed at the source (agent.py's own `_fire_activity`), verified here
+    end to end through `orchestrator.run`."""
+    monkeypatch.setattr(orchestrator, "_PROGRESS_TICK_INTERVAL_SECONDS", 0.02)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(
+        monkeypatch,
+        slow_call="run_phase:1",
+        activity_script=[(0.01, "Read")],
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, clock=_sequential_clock())
+
+    assert code == 0  # the run completed normally
+    assert presenter.summaries[0].outcome == "analysis complete"

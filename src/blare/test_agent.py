@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -193,6 +194,7 @@ def _session(
     sink: RecordingSink | None = None,
     control: RecordingControl | None = None,
     transcript: FakeTranscriptWriter | None = None,
+    on_activity: Callable[[str], None] | None = None,
 ) -> tuple[AgentSession, RecordingSink, RecordingControl, FakeTranscriptWriter]:
     sink = sink if sink is not None else RecordingSink()
     control = control if control is not None else RecordingControl()
@@ -204,6 +206,7 @@ def _session(
         control,
         PrometheusStack(),
         transcript,
+        on_activity,
     )
     return session, sink, control, transcript
 
@@ -1012,6 +1015,165 @@ def test_contract_run_control_reaches_handler_verbatim_for_each_action(
     assert control.calls == [RunControlCall(action=action, payload=payload)]
     tool_result = next(e for e in fake.sent_events if e.get("type") == "tool_result")
     assert tool_result["result"] == {"ok": True, "message": "noted"}
+
+
+# ==== on_activity (R25, T4.3) =======================================================
+
+
+def test_contract_on_activity_fires_for_every_tool_call_in_order(tmp_path: Path) -> None:
+    """on_activity fires with the tool's name for propose_edits and run_control
+    calls, and for a scripted filesystem-read tool call ("activity" event, the
+    kind the SDK's own built-in tools use), in call order (agent.md's Test
+    plan)."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {"type": "activity", "name": "Read"},
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "propose_edits",
+                    "input": {"phase": 1, "edits": []},
+                },
+                {"type": "activity", "name": "Grep"},
+                {
+                    "type": "tool_use",
+                    "id": "t2",
+                    "name": "run_control",
+                    "input": {"action": "amend_complete", "payload": {}},
+                },
+                {"type": "text", "text": "done"},
+            ]
+        ]
+    )
+    seen: list[str] = []
+    session, _, _, _ = _session(fake, tmp_path, on_activity=seen.append)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+    session.run_phase(Phase.SYSTEM_MAP)
+    session.close()
+
+    assert seen == ["Read", "propose_edits", "Grep", "run_control"]
+
+
+def test_contract_on_activity_none_drives_turn_normally(tmp_path: Path) -> None:
+    """A session constructed with on_activity=None (the default) drives a turn
+    with tool calls -- including a scripted filesystem-read "activity" event --
+    normally, raising nothing."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {"type": "activity", "name": "Read"},
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "propose_edits",
+                    "input": {"phase": 1, "edits": []},
+                },
+                {"type": "text", "text": "done"},
+            ]
+        ]
+    )
+    session, sink, _, _ = _session(fake, tmp_path)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.run_phase(Phase.SYSTEM_MAP)  # must not raise
+
+    session.close()
+    assert len(sink.calls) == 1
+
+
+def test_contract_on_activity_raising_is_caught_and_does_not_interrupt_turn(
+    tmp_path: Path,
+) -> None:
+    """A callback that raises is caught and dropped: the turn still completes and
+    the driving call still returns normally, never surfacing as
+    AgentSessionError (agent.md: "an exception it raises must not be allowed to
+    break the turn")."""
+    fake = FakeSDKClient(
+        turns=[
+            [
+                {"type": "activity", "name": "Read"},
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "propose_edits",
+                    "input": {"phase": 1, "edits": []},
+                },
+                {"type": "activity", "name": "Grep"},
+                {"type": "text", "text": "done"},
+            ]
+        ]
+    )
+
+    def _raising_callback(name: str) -> None:
+        raise RuntimeError(f"boom on {name}")
+
+    session, sink, _, _ = _session(fake, tmp_path, on_activity=_raising_callback)
+    session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
+
+    session.run_phase(Phase.SYSTEM_MAP)  # must not raise
+
+    session.close()
+    assert len(sink.calls) == 1
+
+
+def test_contract_live_client_consume_turn_translates_tool_use_block_to_activity() -> None:
+    """_consume_turn translates a ToolUseBlock the SDK itself executed (no
+    registered own tool matches its name) into an "activity" event carrying the
+    tool's name, ahead of the eventual turn_end."""
+    client = _LiveSDKClient()
+    try:
+        message = claude_agent_sdk.AssistantMessage(
+            content=[
+                claude_agent_sdk.ToolUseBlock(id="tu1", name="Read", input={"file_path": "x"}),
+                claude_agent_sdk.TextBlock(text="looked at it"),
+            ],
+            model="claude-x",
+        )
+        client._client = _FakeInnerSDKClient([message])  # type: ignore[assignment]  # noqa: SLF001
+
+        asyncio.run_coroutine_threadsafe(
+            client._consume_turn(), client._loop  # noqa: SLF001
+        ).result(timeout=5)
+
+        assert client.receive() == {"type": "activity", "name": "Read"}
+        assert client.receive() == {"type": "text", "text": "looked at it"}
+        assert client.receive() == {"type": "turn_end"}
+    finally:
+        client.close()
+
+
+def test_contract_live_client_consume_turn_skips_activity_for_own_registered_tools() -> None:
+    """A ToolUseBlock naming one of Blare's own registered tools (bare, or
+    prefixed mcp__<server>__<tool> the way the CLI may report an in-process MCP
+    tool) is not translated to an "activity" event: that call already gets
+    on_activity fired via the bridge's own "tool_use" round trip elsewhere, and
+    translating it here too would fire it a second time for the same call."""
+    client = _LiveSDKClient()
+    try:
+        client._own_tool_names = frozenset({"propose_edits", "run_control"})  # noqa: SLF001
+        message = claude_agent_sdk.AssistantMessage(
+            content=[
+                claude_agent_sdk.ToolUseBlock(
+                    id="tu1", name="mcp__blare__propose_edits", input={}
+                ),
+                claude_agent_sdk.ToolUseBlock(id="tu2", name="run_control", input={}),
+                claude_agent_sdk.TextBlock(text="done"),
+            ],
+            model="claude-x",
+        )
+        client._client = _FakeInnerSDKClient([message])  # type: ignore[assignment]  # noqa: SLF001
+
+        asyncio.run_coroutine_threadsafe(
+            client._consume_turn(), client._loop  # noqa: SLF001
+        ).result(timeout=5)
+
+        # Neither ToolUseBlock produced an "activity" event -- the next queued
+        # event is straight to the text block.
+        assert client.receive() == {"type": "text", "text": "done"}
+        assert client.receive() == {"type": "turn_end"}
+    finally:
+        client.close()
 
 
 # ==== amendments: request_repair / notify_amendment_outcome (T2.4) ================
@@ -1931,6 +2093,34 @@ def test_contract_replay_close_with_unconsumed_entries_is_legal(tmp_path: Path) 
     session.start(RunMode.ANALYZE, RunContext(worktree_root=tmp_path))
 
     session.close()  # must not raise despite two unconsumed entries
+
+
+def test_contract_replay_delay_before_sleeps_real_wall_clock_time(tmp_path: Path) -> None:
+    """An inbound entry's optional "delay_before" (T4.3, R25's e2e seam) makes
+    receive() sleep real wall-clock time before returning that event -- additive
+    to the wire format: every existing fixture lacks the field and is unaffected
+    (no delay, per the default-absent case exercised by every other test in this
+    file)."""
+    _write_scenario(
+        tmp_path,
+        [
+            {"direction": "inbound", "event": {"type": "session_ready"}},
+            {
+                "direction": "inbound",
+                "event": {"type": "text", "text": "slow"},
+                "delay_before": 0.05,
+            },
+        ],
+    )
+    client = _ReplayingSDKClient(tmp_path)
+    client.handshake()
+
+    before = time.monotonic()
+    event = client.receive()
+    elapsed = time.monotonic() - before
+
+    assert event == {"type": "text", "text": "slow"}
+    assert elapsed >= 0.05
 
 
 # ==== the hand-authored analyze-happy-path fixture (provisional) ===================
