@@ -351,9 +351,11 @@ first established, not their scope.
   one; it is not a path to non-interactive/scripted invocation (see Non-goals). A hard cap on
   the total number of amendment rounds aborts the run, writing nothing (R20), if repairs have
   not converged within it — a bound `--unattended` needs precisely because nobody is present
-  to notice or steer a non-converging loop the way interactive chat could. On completion —
-  success or this abort — the terminal rings a bell in addition to the ordinary summary
-  (R13), so a user who has stepped away is notified without needing to watch the screen.
+  to notice or steer a non-converging loop the way interactive chat could. Once
+  `--unattended` was given, the terminal rings a bell in addition to the ordinary summary or
+  error (R13) at whatever ending the run actually reaches — success, this abort, a refusal,
+  or any other failure — so a user who has stepped away is notified regardless of outcome
+  without needing to watch the screen.
 
 ### Configuration & environment
 

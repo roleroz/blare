@@ -8,7 +8,8 @@ conventional mapping documented as fact; say so if you want it surfaced as a cho
 **Changes since last approval**: a progress ticker wraps every agent-driving call (R25,
 added 2026-07-31). See Phase engine. Step 6 of the preflight sequence now also captures the
 delta's full patch text via `gitrepo.patch_text` (new in gitrepo.md), closing a gap
-hardcoded empty since T2.2 and discovered via live testing.
+hardcoded empty since T2.2 and discovered via live testing. `run()` gains `unattended` (R26,
+added 2026-07-31) and an amendment round cap; see Amendments and the exit-code taxonomy.
 
 
 ## Responsibility
@@ -27,7 +28,8 @@ up-to-date); `1` refusal — any failure during the preflight sequence below, wh
 module raised it (an auth failure inside `AgentSession.start` is step 9 and exits 1; a
 state-directory filesystem error at step 2 or a lock error at step 3 exits 1); `2` run failure — any failure
 after preflight completes (agent session death, a `GitCommandError` from the write-time
-re-check, a write failure); `3` user abort — SIGINT, the `abort` command, or any `Abort` reply from the presenter,
+re-check, a write failure, an `--unattended` run exceeding the amendment round cap — R26,
+Amendments); `3` user abort — SIGINT, the `abort` command, or any `Abort` reply from the presenter,
 which per the cli's contract includes its mapping of stream death (EOF, broken stdin) to
 `Abort`: the orchestrator sees a reply, never a stream exception; a presenter that
 *raises* is an unexpected exception, exit 2. Two
@@ -169,6 +171,28 @@ orchestrator immediately resumes the unit via `request_repair` — the agent mod
 resume path — through closure and atomic re-presentation, and only then presents the
 pending checkpoint. No unit can be open at final confirmation, so unit repairs can
 neither be written without their R2 re-presentation nor silently dropped.
+
+**Unattended mode (R26)**: `run()` gains a keyword-only `unattended: bool = False` parameter
+(same pattern as `clock`, T4.3) — `cli.main` passes `parsed.unattended` through; the
+presenter it constructs is a separate concern (cli.md) that independently never reads a
+reply in this mode, so every checkpoint/no-impact/amendment call this module makes already
+gets back an immediate `Approve()` with no further wiring needed here for that half.
+Only the round cap is this module's own responsibility: a counter, incremented each time
+`unit_holder.current` is set to a *newly opened* unit — origin-agnostic and call-site
+agnostic, so it counts a system-originated unit however it was opened (`_open_system_unit`,
+called both from `_finalize_and_write`'s gate-failure loop and from
+`_repair_residual_violations`'s T3.2 load-seeded-violation path) *and* an agent-originated
+one (`_handle_amend_proposal`) the same way — R26 auto-approves both origins, so both must
+count toward the same bound, or an unattended run could loop forever on whichever origin the
+counter ignored. A cascade joining more phases into an *already-open* unit is not a new
+round; only a transition from no unit open to a new one is. When `unattended` and the
+counter exceeds a fixed cap (10 — an order of magnitude above the 4 rounds a real run has
+been observed needing, generous headroom for a genuinely converging repair while still
+bounding a non-converging one), the run fails without writing (R20): a run failure (exit 2,
+per the taxonomy — this is the system not converging, not a user abort), naming the cap and
+that re-running interactively (dropping `--unattended`) allows steering it by chat instead.
+The counter is irrelevant, and never checked, when `unattended` is false — interactive
+mode's existing circuit breaker is the user's own `abort`/Ctrl-C.
 
 ## Amendments
 
@@ -374,6 +398,22 @@ R20's nothing-written on observable filesystem state):
   driving call returns, before the caller's next presenter call (a checkpoint, a chat
   reply) is made — asserted on call order in the fake presenter's recording; this holds for
   each of `run_phase`, `triage`, `chat`, `request_repair`, and `notify_amendment_outcome`.
+- unattended mode (R26): `unattended=True` over a scenario needing several genuine amendment
+  rounds (fewer than the cap) completes successfully with no reply ever read from the
+  presenter (the fake presenter's reply queue stays untouched — asserting it was never
+  drained is what distinguishes "auto-approved" from "happened to always reply approve");
+  every view (checkpoint, amendment, no-impact) is still passed to the presenter for
+  rendering. The round counter advances identically regardless of origin or call site: one
+  test drives a scenario whose non-convergence comes from repeated system-originated units
+  (`_open_system_unit`, e.g. via `_repair_residual_violations`'s update-mode path), another
+  from repeated agent-proposed amendments (`_handle_amend_proposal`, each auto-approved and
+  each immediately reopening) — both hit the same cap and fail the same way: exit 2, nothing
+  written (R20), naming the cap and the interactive-retry next action. A round that only
+  cascades into more phases of an already-open unit (no transition from no-unit-open to a
+  new one) does not advance the counter, tested against both origins.
+  `unattended=False` (the default) never checks the counter at all, even given an identical
+  non-converging fixture — asserted by confirming that same fixture, run non-unattended with
+  enough scripted approvals, proceeds past what would have been the cap.
 
 Failure-mode tests, per dependency:
 

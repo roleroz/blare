@@ -17,8 +17,11 @@ rendering), added as a new cross-cutting decision and reflected in the agent/orc
 module bullets above. And **T4.4 real patch text for triage**, after T4.3 — `gitrepo` gains
 `patch_text` (real diff content, no size cap), wired into `RunContext.patch_text` at
 preflight step 9, closing a gap hardcoded empty since T2.2 and discovered via T4.1's live
-testing. The gitrepo module bullet above is updated to match. Everything else in the Tasks
-section, and everything above it, is as previously approved.
+testing. The gitrepo module bullet above is updated to match. And **T4.5 unattended mode**,
+after T4.4 — R26's `--unattended` (cli flag, an auto-approving presenter, orchestrator's
+amendment round cap, a completion bell), added as a new cross-cutting decision and reflected
+in the cli/orchestrator module bullets above. Everything else in the Tasks section, and
+everything above it, is as previously approved.
 
 ---
 
@@ -44,18 +47,21 @@ graph TD
 
 ## Modules
 
-- **cli** — entry point and terminal surface: command parsing, checkpoint presentation, the
-  free-form chat loop, periodic progress rendering during a driving call (R25), result
-  summaries and error rendering (per `brand/design-language.md` §6), TTY detection. Contains
-  no run logic: it renders what the orchestrator reports and forwards what the user types.
+- **cli** — entry point and terminal surface: command parsing (including `--unattended`,
+  R26), checkpoint presentation, the free-form chat loop, periodic progress rendering during
+  a driving call (R25), a completion bell for unattended runs, result summaries and error
+  rendering (per `brand/design-language.md` §6), TTY detection. Contains no run logic: it
+  renders what the orchestrator reports and forwards what the user types.
 - **orchestrator** — the run lifecycle: preflight sequence (environment, lock, validation),
   the phase state machine with checkpoints, amendments and their atomic cascades, final
   confirmation including the write-time re-check, atomic write ordering, run summary. Owns
   the lock, the exit-code taxonomy, the phase-state rule (which phases are open), and the
   run's pending edit set: it injects the edit sink and run-control handler that the agent's
   tools call into. Times every agent-driving call and periodically renders elapsed time plus
-  the agent's last tool-call activity through the presenter (R25). The only module that
-  coordinates the others.
+  the agent's last tool-call activity through the presenter (R25). In `--unattended` mode
+  (R26), auto-approves every checkpoint/no-impact/amendment presentation instead of reading a
+  reply, and aborts (writing nothing, R20) if the amendment round cap is exceeded. The only
+  module that coordinates the others.
 - **gitrepo** — all git access, via the `git` subprocess: repo discovery, SHA resolution and
   ancestry, dirty-tree check (excluding `.blare/` and git-ignored files), effective-delta
   computation and its full patch text, and the repo-id (a hash of the repository's
@@ -167,6 +173,18 @@ The spec assigns the exact `.blare/` layout to this document:
   result/checkpoint rendering proceeds — progress lines and result rendering never
   interleave. **cli** renders these as a distinct line kind, never a result (`→ `) or a
   prompt.
+- **Unattended mode (R26)**: **cli** parses `--unattended` and passes it through to
+  **orchestrator**'s entry contract; the presenter it constructs never reads a reply in this
+  mode — every checkpoint, no-impact confirmation, and amendment (system-originated or
+  agent-proposed) still renders its full content (unattended output is meant to be reviewed
+  later, e.g. redirected to a file) but resolves as an immediate approval, no prompt ever
+  offered, so chat can never happen. **orchestrator** counts total amendment rounds since run
+  start and aborts (R20: nothing written) once a fixed cap is exceeded — the bound
+  `--unattended` needs precisely because no chat exists to notice or steer a non-converging
+  loop. Whatever ending an unattended invocation reaches — success, the round-cap abort, an
+  ordinary preflight refusal, any other failure — **cli** rings a terminal bell alongside the
+  ordinary summary or error (R13); it needs no awareness of *which* ending occurred, only
+  that `--unattended` was passed.
 - **Errors**: one error type carrying cause and next action (R13); the orchestrator maps it to
   the exit-code taxonomy; **cli** renders it. No module prints directly except **cli**.
 - **Agent session**: one continuous SDK session per run — all four phases and all checkpoint
@@ -344,3 +362,22 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   update-happy-path, update-multi-commit, update-dynamic-expansion, and a genuine
   update-no-impact/-redirect against the live SDK once merged (T4.1's continuation, not this
   task's own scope).
+- [ ] **T4.5 unattended mode**: R26 — `cli`'s `--unattended` flag on `analyze`/`update`,
+  threaded into the presenter so every checkpoint/no-impact/amendment presentation still
+  renders full view content but omits the reserved-word prompt line and resolves as an
+  immediate approval with no reply ever read (chat is therefore unreachable); `orchestrator`'s
+  amendment round counter — origin-agnostic and call-site-agnostic (counts a
+  system-originated unit opened via `_open_system_unit` from either `_finalize_and_write`'s
+  gate-failure loop or `_repair_residual_violations`'s T3.2 path, and an agent-originated one
+  via `_handle_amend_proposal`, identically) — and its fixed cap, aborting (nothing written,
+  R20) when exceeded; `cli`'s completion bell on any unattended ending regardless of exit
+  code. Discovered via a timing analysis of a real live run: two multi-hour waits where the
+  model had already finished and nobody was watching dominated the run far more than any
+  actual model compute time. e2e: two non-convergence scenarios (one driven by repeated
+  system-originated repairs, one by repeated agent-proposed amendments — both hand-authored,
+  since a real capture won't reliably reproduce non-convergence) each hit the round cap and
+  abort writing nothing; an unattended run over a fixture needing several genuine rounds
+  (reuse `update-load-seeded-repair`'s real 3-round content, opened via
+  `_repair_residual_violations` — this specifically exercises that the counter advances on
+  that path too) completes with no prompt ever offered and the bell character present in the
+  output. Traces: R26.

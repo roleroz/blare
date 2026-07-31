@@ -8,7 +8,9 @@ exact reserved words `approve` / `abort`, anything else is chat) is settled and 
 
 **Changes since last approval**: `TerminalPresenter` gained `progress` (R25, added
 2026-07-31) — periodic status rendering during a driving call. See Interface and Rendering
-rules. 
+rules. `parse_args` gained `--unattended` (R26, added 2026-07-31); `TerminalPresenter` gained
+an `unattended` constructor flag changing every reply-pending method's behavior, plus a
+completion bell. See Interface, Error handling, and Rendering rules.
 
 ## Responsibility
 
@@ -21,12 +23,18 @@ user types.
 
 ```python
 def parse_args(argv: list[str]) -> ParsedCommand    # argparse wrapper, unit-testable
+# ParsedCommand gains `unattended: bool` (R26) -- `--unattended` on both `analyze` and
+# `update`; false by default, no other subcommand accepts it
 def main(argv: list[str], run: RunFn = orchestrator.run) -> int   # console entry point
 # main passes the invocation cwd as run()'s repo_path (gitrepo discovers the root from
-# it) and constructs the TerminalPresenter over the process's real stdin/stdout/stderr as
-# run()'s presenter argument
+# it), passes parsed.unattended as run()'s keyword-only unattended argument, and
+# constructs the TerminalPresenter over the process's real stdin/stdout/stderr with
+# unattended=parsed.unattended; when parsed.unattended, main rings the terminal bell
+# once after run() returns, regardless of the exit code -- one bell per invocation,
+# independent of which ending kind occurred (R26)
 
 class TerminalPresenter:                            # orchestrator's presenter protocol
+    def __init__(self, stdin, stdout, stderr, *, unattended: bool = False) -> None
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply
@@ -44,7 +52,20 @@ agent — the prompt names the two verbs. `AmendmentReply` adds `Reject`: at a
 `rejectable=True` amendment prompt, exactly `reject` is a third reserved word (named in
 that prompt), returning the rejection verdict the orchestrator acts on (R2's
 reject-and-restore is a mechanical action, not chat); at a non-rejectable prompt `reject`
-is ordinary chat. `notice` renders one informational line outside any view (a reclaimed
+is ordinary chat.
+
+With `unattended=True` (R26), `present_checkpoint`/`present_amendment`/`present_no_impact`
+still render the view in full — unattended output is meant to be reviewed later, e.g.
+redirected to a file — but skip the reserved-word prompt line (`$ approve · ...`) and never
+call the stdin-reading step at all, returning `Approve()` immediately: the prompt naming
+words nobody will type is exactly the confusing artifact the timing analysis that motivated
+R26 already found once, and there is nothing to gain by leaving it in a log meant for later
+review. `show_chat_reply` is simply never reached, since nothing ever produces a `Chat`
+reply to route through it. This is a rendering-layer decision entirely: the orchestrator
+gets back the identical `Approve()` an interactive user's own typed `approve` would produce,
+and needs no awareness that nobody actually typed it.
+
+`notice` renders one informational line outside any view (a reclaimed
 stale lock, a phase opening) — plain, no `→ ` prefix; that prefix marks results and next
 actions, which a notice is neither.
 `progress` (R25) renders one status line while an agent-driving call is in flight —
@@ -78,8 +99,9 @@ landed — the split describes the pending edits that were discarded and is rend
 an explicit "discarded" label, never as if applied
 (R14's line appears on every session-bearing ending — success, abort, or failure — and
 never on the R7 path, which has no transcript). Argument parsing is stdlib
-`argparse`: subcommands `analyze` and `update`, no options in the MVP beyond `--help` and
-`--version`; unknown usage exits 2 with usage text, argparse's convention. Exit codes are
+`argparse`: subcommands `analyze` and `update`, each accepting `--unattended` (R26; false by
+default) alongside `--help` and `--version`; unknown usage exits 2 with usage text,
+argparse's convention. Exit codes are
 the orchestrator's to define — its taxonomy records that usage errors share code 2 with
 run failures, an overlap it tolerates because a usage error occurs before any run exists.
 
@@ -99,6 +121,11 @@ run failures, an overlap it tolerates because a usage error occurs before any ru
   `(12s, waiting)` before any tool call has arrived. No color, no motion beyond appearing —
   brand's "nothing loops, nothing pulses idly" (§7) rules out a spinner or cursor tricks;
   each tick is one plain appended line.
+- The unattended completion bell (R26) is the single ASCII BEL byte (`\a`, `0x07`) written
+  to stdout by `main`, once, after `run()` returns — no text, no prefix, nothing else added
+  to the summary/error rendering that already happens; terminals that honor BEL (most do)
+  surface it as an audible or visual alert with no code on Blare's side beyond writing the
+  byte.
 
 Checkpoint screen: phase name as header, then this module's rendering of the structured
 `CheckpointView` (entries added/updated/removed with their content, gap summary — the
@@ -121,7 +148,11 @@ failures split by method kind — the split follows whether the *call* reads a r
 the next reply-pending call converts the dead stream to `Abort`): a reply-pending method
 (checkpoint, amendment, no-impact, a prompting `show_chat_reply`) hit by a broken pipe or
 closed stdout returns `Abort` — the run cannot continue without a user, and before final
-confirmation R20 guarantees nothing is written; a void method (`notice`, `error`,
+confirmation R20 guarantees nothing is written; with `unattended=True`, a reply-pending
+method's stdin-read step never runs at all, so a broken stdin can never surface there
+(rendering the view is still subject to the same stdout write-failure handling as any other
+call) — an `Abort` from a reply-pending method is therefore only reachable when
+`unattended=False`; a void method (`notice`, `error`,
 `summary`, `progress`) swallows the write failure and continues — for `error` and
 `summary` because the run's outcome is already determined and a render crash would
 corrupt it, and for `notice`/`progress` as a deliberate call: a mid-run notice or progress
@@ -195,6 +226,16 @@ Contract tests, one per behaviour:
 - `progress` rendering: `· ` prefix, the label verbatim, elapsed seconds, and
   `last_activity` when set; `last_activity=None` renders `waiting` in its place —
   byte-exact assertions for a fixed set of arguments.
+- `--unattended` parses on both `analyze` and `update`, defaulting false; `TerminalPresenter
+  (unattended=True)`'s `present_checkpoint`/`present_amendment`/`present_no_impact` render
+  the view content in full (byte-exact assertions matching the interactive case's view
+  rendering) but omit the reserved-word prompt line, and return `Approve()` without reading
+  the injected stdin stream at all — asserted by constructing the presenter over a stdin
+  double that raises on any read, confirming it is never touched; `main` writes exactly one
+  `\a` to stdout after `run()` returns whenever `parsed.unattended`, regardless of the exit
+  code — asserted across a success, the round-cap failure, an ordinary preflight refusal,
+  and an ordinary run failure, one test per ending kind — and writes none when `unattended`
+  was never passed.
 
 Failure-mode tests, dependency = the terminal streams:
 
