@@ -259,7 +259,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   (amendment clauses), R3–R5 invariants at the gate.
 - [x] **T2.5 re-analysis**: `blare analyze` over an existing state file, ID and byte
   stability. Traces: R16, R9.
-- [ ] **T2.6 live SDK client**: `create_client`'s `unset` branch — construct the real
+- [x] **T2.6 live SDK client**: `create_client`'s `unset` branch — construct the real
   `claude_agent_sdk.ClaudeSDKClient` via `ClaudeAgentOptions` with no model override (2026-07-30
   decision: unpinned, the Claude Code subscription default), wired into `start`'s existing
   auth-handshake preflight (T2.1/T2.2's `AuthRequiredError` path) and the two in-process MCP
