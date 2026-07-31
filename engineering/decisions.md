@@ -203,3 +203,34 @@ compute totaled only ~16 minutes. R25/T4.3 (already merged) fixes silence *durin
 computation but not a finished checkpoint sitting unnoticed; a further fix (see the
 architecture/module docs once designed) is needed before another long live run is worth the
 cost.
+
+## 2026-07-31 — Add R26: `--unattended` mode, plus its four sub-decisions
+
+**Chosen**: `--unattended` auto-approves every checkpoint, no-impact confirmation, and
+amendment — system-originated *and* agent-proposed alike, not just mechanical repairs; a
+fixed cap on the total number of amendment rounds aborts the run (writing nothing, R20) if
+repairs haven't converged within it; on completion the terminal rings a bell alongside the
+ordinary summary — no desktop notification, staying inside "no UI beyond the CLI."
+**Rejected**: distrusting agent-proposed amendments specifically (auto-approve system repairs
+only, refuse agent-proposed ones) — rejected in favor of trusting the agent fully, with the
+round cap as the actual safety net rather than a per-origin trust distinction; a wall-clock
+timeout instead of (or alongside) a round cap — rejected as the sole/primary bound, since it
+could cut off a slow-but-genuinely-converging run the way a round cap wouldn't; a desktop
+notification in addition to the bell — rejected for now to avoid the "no UI beyond the CLI"
+non-goal tension, revisit if the bell proves insufficient.
+**Why**: a timing analysis of a real ~10-hour run against `~/blare_test/oauth2-proxy` found
+it was dominated by two long waits where the model had already finished and nobody was
+watching — this closes that gap by removing the wait entirely (opt-in) rather than just
+making the wait more visible (R25/T4.3, already merged, which fixes visibility *during*
+computation but not a finished checkpoint sitting unattended).
+
+## 2026-07-31 — Defer `blare review` to future work, not designed now
+
+**Chosen**: record a passive review command (walk existing `.blare/` phases read-only, agent
+session and inference only on explicit chat) as a named, deferred non-goal rather than
+designing or building it as part of closing out the timing concern.
+**Rejected**: designing it now alongside `--unattended` — the user asked for both in the same
+message but explicitly said to add review to future work instead, once the two options
+(separate command vs. a flag on `blare analyze`) were on the table.
+**Why**: the user's own instruction, given directly rather than defaulting silently to
+either build option.

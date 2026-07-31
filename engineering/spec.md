@@ -20,7 +20,12 @@ agent-driving call), approved 2026-07-31 — discovered via live user testing ag
 `~/blare_test/oauth2-proxy`, where a run gave zero console indication of which phase was
 active or whether it was still alive across phases that ran for minutes to nearly two hours.
 Architecture and cli.md/orchestrator.md now need to work out R25's implications before it's
-implemented.
+implemented. Run lifecycle gained **R26** (`--unattended`: auto-approve everything, a round
+cap, a completion bell), approved 2026-07-31 — a timing analysis of that same run found ~10
+hours dominated by two checkpoints the model finished in minutes and nobody was watching.
+Non-goals also gained a named, deferred future-work item, a passive `blare review` command —
+explicitly not designed or built now. Architecture and the affected module docs still need
+to work out R26's implications before it's implemented.
 
 ---
 
@@ -116,7 +121,8 @@ Command names are provisional until the architecture doc.
 - **Inventorying existing alerting configuration** (e.g. alert rule files in the repo): the
   MVP recommends alerts but cannot verify they exist, so no gap is ever reported closed.
 - **CI/CD integration** (e.g. GitHub Actions running diff mode on merge) and any
-  non-interactive operation.
+  non-interactive operation. `--unattended` (R26) does not reopen this: it still needs an
+  interactive session to start (R22 unchanged), it just never pauses once running.
 - **Monorepos and git submodules.**
 - **Concurrent analysis on divergent branches**: merging two independently produced artifact
   sets. The MVP serializes analysis on one branch lineage and fails safely when that assumption
@@ -133,6 +139,12 @@ Command names are provisional until the architecture doc.
 - **Artifact schema migration**: the MVP refuses on a schema-version mismatch (R24) rather than
   migrating.
 - **Resuming an interrupted run**: MVP runs are atomic (R20); an aborted run is re-run.
+- **A passive review command** (`blare review`, working name) over an already-written
+  `.blare/`: walk the existing phases for read-only browsing straight from disk, with no
+  agent session and no inference at all unless the user chats — at which point any resulting
+  edit would flow through the same propose_edits/amendment/write machinery every other mode
+  already uses. Complements `--unattended` (R26): run unattended, then review and steer
+  after the fact instead of during. Not designed or built in the MVP.
 - **Additional metrics/alerting stacks** beyond Prometheus; the stack interface is abstracted
   from the start, but only the Prometheus implementation ships.
 - **API-billing mode**: Blare uses the Claude Agent SDK in subscription mode only.
@@ -331,6 +343,17 @@ first established, not their scope.
   check is itself a preflight check, firing before any agent session: such a run needs no
   login (R12) and writes no transcript (R14). A run that ends before any checkpoint would be
   presented — R7's up-to-date path, preflight failures — is unaffected by this rule.
+- **R26** — Either mode accepts `--unattended`: every checkpoint, no-impact confirmation, and
+  amendment (system-originated or agent-proposed) auto-approves without prompting or reading
+  input, and the run proceeds straight through to the write; chat never happens, since
+  nothing ever offers a prompt to type into. R22's TTY requirement is unchanged — unattended
+  is a scoped exception to *pausing*, not to needing an interactive session to have started
+  one; it is not a path to non-interactive/scripted invocation (see Non-goals). A hard cap on
+  the total number of amendment rounds aborts the run, writing nothing (R20), if repairs have
+  not converged within it — a bound `--unattended` needs precisely because nobody is present
+  to notice or steer a non-converging loop the way interactive chat could. On completion —
+  success or this abort — the terminal rings a bell in addition to the ordinary summary
+  (R13), so a user who has stepped away is notified without needing to watch the screen.
 
 ### Configuration & environment
 
