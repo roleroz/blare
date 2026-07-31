@@ -169,3 +169,19 @@ chose the simpler default for now over the reproducibility gain.
 **Why**: surfaced while scoping T4.1 (release suite), which needs `create_client`'s live
 branch built and therefore needs a model stance before that construction can happen; the user
 decided directly rather than defaulting silently to either option.
+
+## 2026-07-31 — Add R25: progress feedback during any agent-driving call
+
+**Chosen**: while a phase run, triage, chat, or repair is in progress, the terminal must show
+which phase/operation is active and periodic evidence the run is alive (at minimum an
+elapsed-time tick and the most recent tool call's name), presentation-only, never altering
+turn-taking.
+**Rejected**: leaving this unspecified and treating it as an ordinary code bug to patch
+directly — rejected because no existing document ever specified any progress-visibility
+requirement during phase execution, so there was no "documented behavior was right, code was
+wrong" bug to fix; the behavior needed deciding first, not just implementing.
+**Why**: discovered via the user's own live test run against `~/blare_test/oauth2-proxy`: a
+run gave zero terminal output while a phase computed, including one phase that ran for nearly
+two hours during an amendment repair loop, leaving the user unable to tell whether the process
+was working or hung. `_drain_turn` in `agent.py` confirmed the root cause directly — it fully
+blocks on the live SDK's event queue with no hook to report intermediate activity.

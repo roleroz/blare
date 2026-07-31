@@ -15,7 +15,12 @@ layer is needed in the MVP.
 runs on the Claude Code subscription's default model rather than pinning one; a config field
 to select or pin a model is future work. Surfaced during T4.1 (release suite) prep, since
 `create_client`'s live branch needs a model-selection stance before it can be built; logged in
-`engineering/decisions.md`.
+`engineering/decisions.md`. Diagnosability gained **R25** (progress feedback during any
+agent-driving call), approved 2026-07-31 — discovered via live user testing against
+`~/blare_test/oauth2-proxy`, where a run gave zero console indication of which phase was
+active or whether it was still alive across phases that ran for minutes to nearly two hours.
+Architecture and cli.md/orchestrator.md now need to work out R25's implications before it's
+implemented.
 
 ---
 
@@ -358,6 +363,12 @@ first established, not their scope.
   run's output, so any artifact change can be traced to the run and reasoning that made it.
   Runs that end before any agent session — R7's up-to-date path, preflight failures — write no
   transcript; their diagnosis is the R13 message.
+- **R25** — While any agent-driving call is in progress (a phase run, triage, chat, or a
+  repair), the terminal shows which phase or operation is active and periodic evidence the run
+  is still alive — at minimum an elapsed-time tick and the name of the most recent tool call the
+  model made — so a user watching a live session that runs for many minutes can distinguish
+  "working" from "hung" without inspecting the transcript. This is presentation only: it never
+  alters turn-taking and is never mistaken for a chat exchange.
 
 ## Constraints
 
