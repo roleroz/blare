@@ -2037,6 +2037,7 @@ def _execute(
     _log(run_state, presenter, {"event": "preflight_step", "step": 4, "detail": "artifacts_loaded"})
 
     delta_files: tuple[str, ...] = ()
+    patch_text = ""
     if mode is RunMode.UPDATE:
         # Step 5 (update only): recorded SHA resolves and is an ancestor (R15).
         analyzed_sha = artifact_set.analyzed_sha
@@ -2091,6 +2092,12 @@ def _execute(
             presenter.summary(RunSummary(outcome="up to date", gap_counts=gaps))
             return 0
         delta_files = tuple(f.path for f in delta.files)
+        # T4.4: the delta's full patch text, same range and exclude as
+        # effective_delta above -- carried through to RunContext.patch_text at
+        # step 9. Only fetched once the delta is known non-empty: the R7
+        # short-circuit above must never invoke this (or any) git call beyond
+        # what deciding emptiness itself needs.
+        patch_text = repo.patch_text(analyzed_sha, end_sha, ".blare")
         _log(
             run_state,
             presenter,
@@ -2180,13 +2187,10 @@ def _execute(
         RunContext(
             worktree_root=repo.worktree_root,
             delta_files=delta_files,
-            # The effective delta's patch text (agent.md's RunContext.patch_text) has
-            # no producer yet: gitrepo.md's interface exposes name-status only, not
-            # full diff text. T2.2 leaves this empty rather than shelling out to git
-            # itself (forbidden -- "no other module invokes git") or inventing an
-            # undocumented gitrepo method; the real triage flow that consumes this
-            # (agent.md) is T3.1's build, which is where this gap needs closing.
-            patch_text="",
+            # T4.4: the delta's real diff content, captured at step 6 above
+            # (empty for a full-analysis run, which never populates either
+            # field -- RunContext's own default).
+            patch_text=patch_text,
         ),
     )
     run_state.preflight_complete = True

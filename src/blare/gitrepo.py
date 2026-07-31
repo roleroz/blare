@@ -263,6 +263,25 @@ class GitRepo:
         files = _parse_name_status(result.stdout, self._git_executable, args)
         return Delta(files=tuple(files))
 
+    def patch_text(self, base_sha: str, end_sha: str, exclude: str) -> str:
+        """The same range's full unified diff text (T4.4): real diff content for
+        triage, not just the file/status pairs `effective_delta` returns.
+
+        Same net-diff semantics as `effective_delta` over the identical range --
+        empty for a same-SHA range and for a change-plus-revert -- for the same
+        reason: it must answer "what would triage see," not "what happened
+        commit-by-commit." No output parsing beyond the subprocess call: the
+        text is opaque to this module, consumed only by the model
+        (`RunContext.patch_text`, agent.md). No size cap (gitrepo.md's
+        Decisions).
+        """
+        pathspec = f":(exclude){exclude}"
+        args = ["diff", "--no-renames", base_sha, end_sha, "--", ".", pathspec]
+        result = self._git(args)
+        if result.returncode != 0:
+            raise _command_error(self._git_executable, args, result)
+        return result.stdout
+
     def tree_matches(self, sha: str, exclude: str) -> bool:
         """True when the working tree outside `exclude` is byte-identical to `sha` (R20).
 

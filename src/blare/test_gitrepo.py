@@ -315,6 +315,80 @@ def test_contract_delta_typechange_is_modified(tmp_path: Path) -> None:
     assert delta.files == (ChangedFile(path="path.txt", status="modified"),)
 
 
+def test_contract_patch_text_returns_real_diff_content(tmp_path: Path) -> None:
+    """patch_text returns the real unified diff, containing the changed lines."""
+    _init_repo(tmp_path)
+    _write(tmp_path, "modme.txt", "before\n")
+    base = _commit(tmp_path)
+    _write(tmp_path, "modme.txt", "after\n")
+    end = _commit(tmp_path)
+    repo = GitRepo.discover(tmp_path)
+
+    text = repo.patch_text(base, end, ".blare")
+
+    assert "-before" in text
+    assert "+after" in text
+    assert "modme.txt" in text
+
+
+def test_contract_patch_text_same_sha_empty(tmp_path: Path) -> None:
+    """patch_text between a commit and itself is empty (zero diff)."""
+    _init_repo(tmp_path)
+    sha = _commit(tmp_path, allow_empty=True)
+    repo = GitRepo.discover(tmp_path)
+
+    assert repo.patch_text(sha, sha, ".blare") == ""
+
+
+def test_contract_patch_text_change_plus_revert_empty(tmp_path: Path) -> None:
+    """A change followed by its exact revert nets to empty patch text (R7 semantics)."""
+    _init_repo(tmp_path)
+    _write(tmp_path, "file.txt", "original\n")
+    base = _commit(tmp_path)
+    _write(tmp_path, "file.txt", "changed\n")
+    _commit(tmp_path)
+    _write(tmp_path, "file.txt", "original\n")
+    end = _commit(tmp_path)
+    repo = GitRepo.discover(tmp_path)
+
+    assert repo.patch_text(base, end, ".blare") == ""
+
+
+def test_contract_patch_text_excludes_dir(tmp_path: Path) -> None:
+    """Files under the excluded directory never appear in the patch text."""
+    _init_repo(tmp_path)
+    base = _commit(tmp_path, allow_empty=True)
+    _write(tmp_path, ".blare/state.yaml", "sha: abc\n")
+    _write(tmp_path, "real.txt", "content\n")
+    end = _commit(tmp_path)
+    repo = GitRepo.discover(tmp_path)
+
+    text = repo.patch_text(base, end, ".blare")
+
+    assert "real.txt" in text
+    assert ".blare" not in text
+    assert "state.yaml" not in text
+
+
+def test_contract_patch_text_independent_of_diff_renames_config(tmp_path: Path) -> None:
+    """patch_text's content does not depend on the user's diff.renames config."""
+    _init_repo(tmp_path)
+    _git(tmp_path, "config", "diff.renames", "true")
+    _write(tmp_path, "orig.txt", "same content\n")
+    base = _commit(tmp_path)
+    _git(tmp_path, "mv", "orig.txt", "renamed.txt")
+    end = _commit(tmp_path)
+    repo = GitRepo.discover(tmp_path)
+
+    text = repo.patch_text(base, end, ".blare")
+
+    # --no-renames always shows a rename as a full delete-plus-add, regardless of
+    # the user's diff.renames config (mirrors effective_delta's own guarantee).
+    assert "rename from" not in text
+    assert "orig.txt" in text
+    assert "renamed.txt" in text
+
+
 def test_contract_repo_id_stable_across_calls(tmp_path: Path) -> None:
     """repo_id() returns the same value on repeated calls against the same repo."""
     _init_repo(tmp_path)
@@ -427,7 +501,12 @@ def test_failure_git_missing_executable(tmp_path: Path) -> None:
 
 
 def test_failure_git_command_error(tmp_path: Path) -> None:
-    """A corrupted object store surfaces git's stderr as a GitCommandError (effective_delta)."""
+    """A corrupted object store surfaces git's stderr as a GitCommandError (effective_delta).
+
+    `patch_text` shares this identical subprocess/error path (same failure-mode
+    dependency -- the git subprocess -- no separate test needed: the two-set
+    testing rule enumerates failure modes per dependency, not per method).
+    """
     _init_repo(tmp_path)
     _write(tmp_path, "file.txt", "one\n")
     base = _commit(tmp_path)

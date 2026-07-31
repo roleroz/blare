@@ -4064,6 +4064,73 @@ def test_contract_update_r6_r8_r9_multi_commit_delta_only_affected_change(
         assert (root / name).read_bytes() == content, f"{name} changed unexpectedly"
 
 
+def test_contract_update_t4_4_patch_text_flows_into_run_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T4.4: for a non-empty delta, RunContext.patch_text carries gitrepo.patch_text's
+    return value for the captured (analyzed_sha, end_sha, '.blare') range -- asserted
+    via the fake GitRepo's recorded arguments, not by re-deriving the diff text here,
+    alongside the existing context.delta_files assertion."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_valid_update_state(repo, first_sha)
+    final_sha = commit_file_update(repo, "src/a.py", "# change a\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+
+    recorded_args: list[tuple[str, str, str]] = []
+    sentinel_patch_text = "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-old\n+# change a\n"
+
+    def _fake_patch_text(
+        self: gitrepo.GitRepo, base_sha: str, end_sha: str, exclude: str
+    ) -> str:
+        recorded_args.append((base_sha, end_sha, exclude))
+        return sentinel_patch_text
+
+    monkeypatch.setattr(gitrepo.GitRepo, "patch_text", _fake_patch_text)
+    sessions = _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]})
+        ],
+        edits_by_phase={
+            Phase.FAILURE_MODES: [
+                EditBatch(
+                    phase=Phase.FAILURE_MODES,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "failure_modes",
+                            {
+                                "id": "fm-timeout",
+                                "title": "upstream timeout (revised)",
+                                "description": "a call to an upstream service times out",
+                                "severity": "warning",
+                                "user_visible": False,
+                                "caused_by": [],
+                                "coverage_status": "excluded",
+                                "exclusion_reason": "not independently detectable",
+                            },
+                        ),
+                    ),
+                )
+            ]
+        },
+    )
+    presenter = FakePresenter()
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter)
+
+    assert code == 0
+    assert recorded_args == [(first_sha, final_sha, ".blare")]
+    session = sessions[0]
+    assert session.started_with is not None
+    _, context = session.started_with
+    assert set(context.delta_files) == {"src/a.py"}
+    assert context.patch_text == sentinel_patch_text
+
+
 def test_contract_update_r7_empty_delta_still_exits_0_with_no_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
