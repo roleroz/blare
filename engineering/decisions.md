@@ -157,3 +157,15 @@ named-unvisited phase (a system repair target) it would freeze a phase whose man
 checkpoint never fired, letting repairs reach the write without the phase ever running.
 **Why**: discovered during the orchestrator design's review loop; opening a phase for a
 repair must never substitute for running it (R18's checkpoint requirement).
+
+## 2026-07-30 — Model selection: the Claude Code subscription default, not pinned
+
+**Chosen**: the live agent session runs on whatever model the user's Claude Code subscription
+resolves as its default; Blare never names a model string. A config field to select or pin a
+specific model is deferred to future work (spec Non-goals).
+**Rejected**: pinning `ClaudeAgentOptions` to a specific model string for reproducible release
+captures — the project's general pin-everything principle would favor this, but the user
+chose the simpler default for now over the reproducibility gain.
+**Why**: surfaced while scoping T4.1 (release suite), which needs `create_client`'s live
+branch built and therefore needs a model stance before that construction can happen; the user
+decided directly rather than defaulting silently to either option.

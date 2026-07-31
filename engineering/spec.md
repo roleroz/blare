@@ -11,13 +11,11 @@ are settled and logged in `engineering/decisions.md`. Two items are explicitly d
 architecture phase, not open here: the CLI command names, and whether the personal configuration
 layer is needed in the MVP.
 
-This document has not yet been approved. Changes in this revision (fifth review round): the
-empty-effective-delta test is the net range diff, covering change-plus-revert (R7, Terms); the
-empty-edit-set guarantee is scoped to entry-based files, with the state SHA and derived-doc
-restoration named as the only writes outside the edit set (Artifacts); phase ownership of
-every artifact is defined, the coverage mapping spanning phases 3 and 4 (Scope); preflight
-refusals precede the up-to-date success (R7); the non-TTY check is preflight — no login, no
-transcript (R22); R24 names its recovery options.
+**Changes since last approval**: Non-goals gained "configurable model selection" — the MVP
+runs on the Claude Code subscription's default model rather than pinning one; a config field
+to select or pin a model is future work. Surfaced during T4.1 (release suite) prep, since
+`create_client`'s live branch needs a model-selection stance before it can be built; logged in
+`engineering/decisions.md`.
 
 ---
 
@@ -133,6 +131,9 @@ Command names are provisional until the architecture doc.
 - **Additional metrics/alerting stacks** beyond Prometheus; the stack interface is abstracted
   from the start, but only the Prometheus implementation ships.
 - **API-billing mode**: Blare uses the Claude Agent SDK in subscription mode only.
+- **Configurable model selection**: the MVP always runs on the Claude Code subscription's
+  default model rather than pinning one. A config field to select or pin a specific model is
+  future work.
 - **Non-git codebases; non-Linux hosts; any UI beyond the CLI.**
 
 ## Artifacts
