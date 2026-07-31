@@ -10,12 +10,16 @@ phase, the reply alphabet including `reject` when rejectable). T3.1 builds
 `present_no_impact`: the R18 no-impact screen (header, changed-file summary, the
 agent's conclusion text, then the ordinary checkpoint prompt). T4.3 builds
 `progress` (R25): the periodic `· ` status line the orchestrator's ticker renders
-while a driving call is in flight.
+while a driving call is in flight. T4.5 builds `--unattended` (R26): `parse_args`'
+new flag, `TerminalPresenter`'s `unattended` constructor flag (every
+reply-pending method renders its view then returns `Approve()` immediately,
+never reading stdin), and `main`'s completion bell.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 from dataclasses import dataclass
@@ -100,6 +104,7 @@ class ParsedCommand:
     """The result of parsing argv: which mode to run."""
 
     mode: RunMode
+    unattended: bool = False
 
 
 def parse_args(argv: list[str]) -> ParsedCommand:
@@ -110,12 +115,15 @@ def parse_args(argv: list[str]) -> ParsedCommand:
     parser = argparse.ArgumentParser(prog="blare")
     parser.add_argument("--version", action="version", version=f"blare {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("analyze")
-    subparsers.add_parser("update")
+    for name in ("analyze", "update"):
+        subparser = subparsers.add_parser(name)
+        # R26: `--unattended` on both subcommands, false by default -- no other
+        # subcommand accepts it (cli.md's Interface).
+        subparser.add_argument("--unattended", action="store_true", default=False)
 
     args = parser.parse_args(argv)
     mode = RunMode.ANALYZE if args.command == "analyze" else RunMode.UPDATE
-    return ParsedCommand(mode=mode)
+    return ParsedCommand(mode=mode, unattended=args.unattended)
 
 
 def main(argv: list[str], run: orchestrator.RunFn = orchestrator.run) -> int:
@@ -126,10 +134,27 @@ def main(argv: list[str], run: orchestrator.RunFn = orchestrator.run) -> int:
     stdin/stdout/stderr, per `cli.md`. Catches nothing itself: argparse's own
     `SystemExit` (usage errors, `--help`, `--version`) propagates untouched, and
     every other exit code is `run`'s to assign.
+
+    R26 (T4.5): `parsed.unattended` is passed both to the constructed
+    `TerminalPresenter` and as `run`'s own keyword-only `unattended` argument.
+    After `run` returns, whenever `--unattended` was given, this writes a single
+    ASCII BEL byte (`\\a`) to stdout -- once, regardless of the exit code, so a
+    user who stepped away is notified of *any* ending (success, the round-cap
+    abort, an ordinary refusal, any other failure) without watching the screen.
     """
     parsed = parse_args(argv)
-    presenter = TerminalPresenter(sys.stdin, sys.stdout, sys.stderr)
-    return run(parsed.mode, Path.cwd(), presenter)
+    presenter = TerminalPresenter(
+        sys.stdin, sys.stdout, sys.stderr, unattended=parsed.unattended
+    )
+    exit_code = run(parsed.mode, Path.cwd(), presenter, unattended=parsed.unattended)
+    if parsed.unattended:
+        # Void, like every other terminal write in this module once the run's
+        # outcome is already decided: a dead stdout here must not turn a
+        # completed run into an unhandled traceback.
+        with contextlib.suppress(BrokenPipeError, OSError):
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+    return exit_code
 
 
 class TerminalPresenter:
@@ -138,14 +163,28 @@ class TerminalPresenter:
     Implements `orchestrator.Presenter` in full.
     """
 
-    def __init__(self, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> None:
+    def __init__(
+        self, stdin: TextIO, stdout: TextIO, stderr: TextIO, *, unattended: bool = False
+    ) -> None:
         self._stdin = stdin
         self._stdout = stdout
         self._stderr = stderr
+        self._unattended = unattended
 
     # --- Checkpoint (T2.3) ----------------------------------------------------------
 
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
+        if self._unattended:
+            # R26: the view still renders in full (unattended output is meant to
+            # be reviewed later, e.g. redirected to a file), but the
+            # reserved-word prompt line is never printed and stdin is never
+            # read -- an immediate Approve(), the same reply an interactive
+            # user's own typed "approve" would produce. A stream failure while
+            # rendering is not mapped to Abort here (unlike the interactive
+            # branch below): unattended never returns Abort from a reply-pending
+            # method (cli.md's Error handling).
+            self._write_lines(self._stdout, self._checkpoint_lines(view))
+            return orchestrator.Approve()
         if not self._write_lines(self._stdout, self._checkpoint_lines(view)):
             # cli.md: a reply-pending method hit by a broken stream returns Abort --
             # the run cannot continue without a user, and R20 guarantees nothing is
@@ -160,6 +199,9 @@ class TerminalPresenter:
         return reply
 
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply:
+        if self._unattended:
+            self._write_lines(self._stdout, self._amendment_lines(view))
+            return orchestrator.Approve()
         if not self._write_lines(self._stdout, self._amendment_lines(view)):
             return orchestrator.Abort()
         prompt_text = _REJECTABLE_AMENDMENT_PROMPT if rejectable else _CHECKPOINT_PROMPT
@@ -169,6 +211,9 @@ class TerminalPresenter:
         return reply
 
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
+        if self._unattended:
+            self._write_lines(self._stdout, self._no_impact_lines(view))
+            return orchestrator.Approve()
         if not self._write_lines(self._stdout, self._no_impact_lines(view)):
             return orchestrator.Abort()
         reply = self._prompt_and_read(_CHECKPOINT_PROMPT, rejectable=False)

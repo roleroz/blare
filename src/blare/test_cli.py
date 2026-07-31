@@ -78,15 +78,31 @@ def test_contract_parse_args_help_exits_0(capsys: pytest.CaptureFixture[str]) ->
     assert "usage" in capsys.readouterr().out
 
 
+def test_contract_parse_args_unattended_parses_on_both_subcommands_default_false() -> None:
+    """`--unattended` (R26) parses on both `analyze` and `update`, defaulting
+    false when omitted."""
+    assert parse_args(["analyze"]) == ParsedCommand(mode=RunMode.ANALYZE, unattended=False)
+    assert parse_args(["update"]) == ParsedCommand(mode=RunMode.UPDATE, unattended=False)
+    assert parse_args(["analyze", "--unattended"]) == ParsedCommand(
+        mode=RunMode.ANALYZE, unattended=True
+    )
+    assert parse_args(["update", "--unattended"]) == ParsedCommand(
+        mode=RunMode.UPDATE, unattended=True
+    )
+
+
 def test_contract_main_wiring_passes_mode_cwd_and_a_terminal_presenter() -> None:
     """main() passes parse_args's mode, the invocation cwd, and a TerminalPresenter
     to the injected `run` callable."""
     received: dict[str, object] = {}
 
-    def _recording_run(mode: RunMode, repo_path: Path, presenter: Presenter) -> int:
+    def _recording_run(
+        mode: RunMode, repo_path: Path, presenter: Presenter, *, unattended: bool = False
+    ) -> int:
         received["mode"] = mode
         received["repo_path"] = repo_path
         received["presenter"] = presenter
+        received["unattended"] = unattended
         return 0
 
     code = main(["analyze"], run=_recording_run)
@@ -95,6 +111,68 @@ def test_contract_main_wiring_passes_mode_cwd_and_a_terminal_presenter() -> None
     assert received["mode"] == RunMode.ANALYZE
     assert received["repo_path"] == Path.cwd()
     assert isinstance(received["presenter"], TerminalPresenter)
+    assert received["unattended"] is False
+
+
+def test_contract_main_wiring_passes_unattended_through_to_run_and_presenter() -> None:
+    """main() passes `parsed.unattended` as `run`'s keyword-only `unattended`
+    argument and constructs the `TerminalPresenter` with `unattended=True` too
+    (R26) -- confirmed by behavior (the presenter never reads the real stdin
+    it was constructed over), not a private attribute."""
+    received: dict[str, object] = {}
+
+    def _recording_run(
+        mode: RunMode, repo_path: Path, presenter: Presenter, *, unattended: bool = False
+    ) -> int:
+        received["unattended"] = unattended
+        received["presenter"] = presenter
+        return 0
+
+    code = main(["analyze", "--unattended"], run=_recording_run)
+
+    assert code == 0
+    assert received["unattended"] is True
+    presenter = received["presenter"]
+    assert isinstance(presenter, TerminalPresenter)
+    reply = presenter.present_checkpoint(_fixed_view())
+    assert reply == Approve()
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 2, 3])
+def test_contract_main_writes_bell_once_after_run_returns_when_unattended(
+    exit_code: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main() writes exactly one ASCII BEL to stdout after `run()` returns
+    whenever `parsed.unattended`, regardless of the exit code (R26) -- asserted
+    across a success (0), an ordinary preflight refusal (1), the round-cap
+    failure and any other run failure (2), and a user abort (3), one ending
+    kind per parametrized case."""
+
+    def _recording_run(
+        mode: RunMode, repo_path: Path, presenter: Presenter, *, unattended: bool = False
+    ) -> int:
+        return exit_code
+
+    code = main(["analyze", "--unattended"], run=_recording_run)
+
+    assert code == exit_code
+    assert capsys.readouterr().out == "\a"
+
+
+def test_contract_main_writes_no_bell_when_unattended_never_passed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """main() writes no bell at all when `--unattended` was never passed."""
+
+    def _recording_run(
+        mode: RunMode, repo_path: Path, presenter: Presenter, *, unattended: bool = False
+    ) -> int:
+        return 0
+
+    code = main(["analyze"], run=_recording_run)
+
+    assert code == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_contract_error_renders_cause_then_next_action_on_stderr() -> None:
@@ -307,6 +385,29 @@ def test_contract_checkpoint_screen_renders_byte_exact() -> None:
     assert stdout.getvalue() == expected
 
 
+def test_contract_unattended_present_checkpoint_renders_view_skips_prompt_never_reads_stdin() -> (
+    None
+):
+    """R26: `TerminalPresenter(unattended=True).present_checkpoint` renders the
+    view content in full (byte-exact, matching the interactive rendering minus
+    the reserved-word prompt line) but never prints that prompt and never reads
+    stdin at all -- a stdin double that raises on any read confirms it is never
+    touched -- returning `Approve()` immediately."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(
+        _RaisingStream(AssertionError("stdin must never be read when unattended")),
+        stdout,
+        io.StringIO(),
+        unattended=True,
+    )
+
+    reply = presenter.present_checkpoint(_fixed_view())
+
+    assert reply == Approve()
+    expected = "".join(line + "\n" for line in _FIXED_VIEW_LINES[:-1])  # no prompt line
+    assert stdout.getvalue() == expected
+
+
 def test_contract_checkpoint_reply_mapping() -> None:
     """Exact `approve`/`abort` act; anything else, including near-misses, is chat;
     empty line re-prompts; EOF is Abort (D9's exact-match contract)."""
@@ -500,6 +601,27 @@ def test_contract_amendment_screen_renders_byte_exact() -> None:
 
     assert reply == Approve()
     expected = "".join(line + "\n" for line in _FIXED_AMENDMENT_LINES)
+    assert stdout.getvalue() == expected
+
+
+def test_contract_unattended_present_amendment_renders_view_skips_prompt_never_reads_stdin() -> (
+    None
+):
+    """R26: `TerminalPresenter(unattended=True).present_amendment` renders the
+    view content in full but skips the prompt line (rejectable or not) and
+    never reads stdin, returning `Approve()` immediately."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(
+        _RaisingStream(AssertionError("stdin must never be read when unattended")),
+        stdout,
+        io.StringIO(),
+        unattended=True,
+    )
+
+    reply = presenter.present_amendment(_fixed_amendment_view(), rejectable=True)
+
+    assert reply == Approve()
+    expected = "".join(line + "\n" for line in _FIXED_AMENDMENT_LINES[:-1])  # no prompt line
     assert stdout.getvalue() == expected
 
 
@@ -705,6 +827,27 @@ def test_contract_no_impact_screen_renders_byte_exact() -> None:
 
     assert reply == Approve()
     expected = "".join(line + "\n" for line in _FIXED_NO_IMPACT_LINES)
+    assert stdout.getvalue() == expected
+
+
+def test_contract_unattended_present_no_impact_renders_view_skips_prompt_never_reads_stdin() -> (
+    None
+):
+    """R26: `TerminalPresenter(unattended=True).present_no_impact` renders the
+    view content in full but skips the checkpoint prompt line and never reads
+    stdin, returning `Approve()` immediately."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(
+        _RaisingStream(AssertionError("stdin must never be read when unattended")),
+        stdout,
+        io.StringIO(),
+        unattended=True,
+    )
+
+    reply = presenter.present_no_impact(_fixed_no_impact_view())
+
+    assert reply == Approve()
+    expected = "".join(line + "\n" for line in _FIXED_NO_IMPACT_LINES[:-1])  # no prompt line
     assert stdout.getvalue() == expected
 
 

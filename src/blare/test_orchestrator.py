@@ -66,9 +66,18 @@ class FakePresenter:
     `checkpoint_replies` scripts `present_checkpoint`'s replies in order (defaulting
     to auto-approve once exhausted, which is what every preflight-focused test
     wants); `chat_reply_script` does the same for `show_chat_reply`.
+
+    `unattended` (R26, T4.5) mirrors `cli.TerminalPresenter`'s own contract for
+    the orchestrator's benefit: when true, `present_checkpoint`/`present_amendment`
+    /`present_no_impact` still record the view (rendering happens regardless) but
+    never pop from their scripted reply list -- returning `Approve()` immediately,
+    exactly like the real presenter -- so a test can assert the scripted reply
+    queue was never drained, distinguishing genuine auto-approval from "happened
+    to always reply approve" (orchestrator.md's Test plan).
     """
 
     interactive: bool = True
+    unattended: bool = False
     notices: list[str] = field(default_factory=list)
     errors: list[tuple[str, str, str | None]] = field(default_factory=list)
     summaries: list[RunSummary] = field(default_factory=list)
@@ -91,6 +100,8 @@ class FakePresenter:
     def present_checkpoint(self, view: CheckpointView) -> CheckpointReply:
         self.checkpoint_views.append(view)
         self.event_order.append("checkpoint")
+        if self.unattended:
+            return orchestrator.Approve()
         if self.checkpoint_replies:
             return self.checkpoint_replies.pop(0)
         return orchestrator.Approve()
@@ -99,6 +110,8 @@ class FakePresenter:
         self.amendment_views.append(view)
         self.amendment_rejectable_seen.append(rejectable)
         self.event_order.append("amendment")
+        if self.unattended:
+            return orchestrator.Approve()
         if self.amendment_replies:
             return self.amendment_replies.pop(0)
         return orchestrator.Approve()
@@ -106,6 +119,8 @@ class FakePresenter:
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply:
         self.no_impact_views.append(view)
         self.event_order.append("no_impact")
+        if self.unattended:
+            return orchestrator.Approve()
         if self.no_impact_replies:
             return self.no_impact_replies.pop(0)
         return orchestrator.Approve()
@@ -4924,3 +4939,396 @@ def test_failure_progress_raising_on_activity_does_not_break_the_run(
 
     assert code == 0  # the run completed normally
     assert presenter.summaries[0].outcome == "analysis complete"
+
+
+# --- Unattended mode (R26, T4.5) -----------------------------------------------------
+
+
+def test_contract_unattended_converges_without_reading_presenter_replies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R26: an unattended run over a fixture needing a genuine (system-originated,
+    opened via `_repair_residual_violations`) amendment round -- well under the
+    cap -- completes successfully with no reply ever read from the presenter:
+    the scripted reply queues are never drained (proving auto-approval, not
+    "happened to always reply approve"), and every view (checkpoint, amendment)
+    is still recorded for rendering."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    first_sha = repo_head(repo)
+    _write_update_state_with_semantic_violation(repo, first_sha)
+    commit_file_update(repo, "src/x.py", "# change\n")
+    _isolate_state_home(monkeypatch, tmp_path)
+    _ready_session(
+        monkeypatch,
+        triage_run_control_calls=[
+            RunControlCall(RunControlAction.AFFECTED_VERDICT, {"phases": [2]}),
+        ],
+        repair_edits_by_phases={
+            (Phase.ALERT_RECOMMENDATIONS,): [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(
+                        _alert_edit("ar-orphan", ["fm-orphan"], severity="warning"),
+                        _coverage_alert_edit("fm-orphan", ["ar-orphan"]),
+                    ),
+                )
+            ]
+        },
+    )
+    # Sentinels: if the presenter's reply queues were ever drained, popping an
+    # Abort() would abort the run (exit 3) instead of succeeding -- the
+    # assertion below that they are untouched is what proves auto-approval
+    # rather than a lucky scripted reply.
+    presenter = FakePresenter(
+        unattended=True,
+        checkpoint_replies=[orchestrator.Abort(), orchestrator.Abort()],
+        amendment_replies=[orchestrator.Abort()],
+    )
+
+    code = orchestrator.run(RunMode.UPDATE, repo, presenter, unattended=True)
+
+    assert code == 0
+    assert presenter.checkpoint_replies == [orchestrator.Abort(), orchestrator.Abort()]
+    assert presenter.amendment_replies == [orchestrator.Abort()]
+    assert len(presenter.checkpoint_views) == 2  # phase 2, phase 4
+    assert len(presenter.amendment_views) == 1
+    assert presenter.amendment_views[0].origin is orchestrator.AmendmentOrigin.SYSTEM
+    loaded = artifacts.load(_blare_root(repo), RunMode.UPDATE)
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_contract_unattended_system_originated_non_convergence_hits_round_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R26: a system-originated non-convergence -- the approval gate re-opens a
+    unit for the same never-fixed violation every time it closes
+    (`_finalize_and_write`'s gate-failure loop, one of `_open_system_unit`'s two
+    call sites) -- hits the round cap (monkeypatched down to 1 so the test
+    needs only two rounds) and aborts writing nothing, exit 2, naming the cap
+    and the interactive-retry next action."""
+    monkeypatch.setattr(orchestrator, "_UNATTENDED_AMENDMENT_ROUND_CAP", 1)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-orphan", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+        # Phase 4 runs and freezes without ever mapping fm-orphan to an alert --
+        # nothing ever fixes it (no repair_edits_by_phases scripted), so the
+        # gate re-opens the same violation every time its unit closes.
+    }
+    _ready_session(monkeypatch, edits_by_phase=edits)
+    presenter = FakePresenter(unattended=True)
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, unattended=True)
+
+    assert code == 2
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    assert presenter.errors
+    cause, next_action, _detail = presenter.errors[-1]
+    assert "amendment rounds" in cause
+    assert "exceeding the cap of 1" in cause
+    assert "--unattended" in next_action
+    # Round 1 opened, was presented and auto-approved (closing without fixing
+    # anything); round 2 exceeded the cap before ever reaching presentation.
+    assert len(presenter.amendment_views) == 1
+    assert all(v.origin is orchestrator.AmendmentOrigin.SYSTEM for v in presenter.amendment_views)
+
+
+def test_contract_unattended_agent_originated_non_convergence_hits_round_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R26: an agent-originated non-convergence -- two separate phase turns each
+    propose a fresh `amend_proposal` on the same already-frozen phase
+    (`_handle_amend_proposal`'s path; `run_control_calls_by_phase` stands in for
+    the model doing this since chat can never happen when unattended) -- hits
+    the same cap the same way a system-originated non-convergence does."""
+    monkeypatch.setattr(orchestrator, "_UNATTENDED_AMENDMENT_ROUND_CAP", 1)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        run_control_calls_by_phase={
+            # Round 1: proposed during phase 2's own turn, naming phase 1
+            # (already frozen). Round 2: proposed during phase 3's own turn,
+            # naming phase 1 again (re-frozen after round 1 closed).
+            Phase.FAILURE_MODES: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ],
+            Phase.METRIC_COVERAGE: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [1]})
+            ],
+        },
+    )
+    presenter = FakePresenter(unattended=True)
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, unattended=True)
+
+    assert code == 2
+    assert not (_blare_root(repo) / "state.yaml").exists()
+    assert presenter.errors
+    cause, next_action, _detail = presenter.errors[-1]
+    assert "amendment rounds" in cause
+    assert "exceeding the cap of 1" in cause
+    assert "--unattended" in next_action
+    assert len(presenter.amendment_views) == 1
+    assert all(v.origin is orchestrator.AmendmentOrigin.AGENT for v in presenter.amendment_views)
+
+
+def test_contract_unattended_cascade_join_does_not_advance_round_counter_system_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R26: a cascade join into an *already-open* system-originated unit (a pure
+    `referencing_phases` pull, no new violation involved -- the same fixture as
+    `test_contract_amendment_cascade_reference_and_invariant_approved`) does not
+    advance the round counter: with the cap monkeypatched down to 1, a unit that
+    cascades into a *second* phase without ever closing and reopening still
+    completes successfully, proving the cascade round was never counted as a
+    fresh one."""
+    monkeypatch.setattr(orchestrator, "_UNATTENDED_AMENDMENT_ROUND_CAP", 1)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(_fm_edit("fm-a", severity="critical", coverage_status="alertable"),),
+            )
+        ],
+        Phase.METRIC_COVERAGE: [
+            EditBatch(
+                phase=Phase.METRIC_COVERAGE,
+                edits=(
+                    Edit(
+                        EditOp.ADD,
+                        "metrics",
+                        {
+                            "id": "mx-1",
+                            "name": "some_metric_total",
+                            "type": "counter",
+                            "labels": [],
+                            "emitted_at": ["a.go:1"],
+                            "description": "d",
+                        },
+                    ),
+                    # A metric recommendation with no failure modes named yet --
+                    # the EMPTY_LINKAGE_METRIC_RECOMMENDATION violation the gate
+                    # will find, deliberately left broken for this test.
+                    Edit(
+                        EditOp.ADD,
+                        "metric_recommendations",
+                        {
+                            "id": "mr-bad",
+                            "kind": "new",
+                            "failure_mode_ids": [],
+                            "rationale": "r",
+                            "details": "d",
+                        },
+                    ),
+                ),
+            )
+        ],
+        Phase.ALERT_RECOMMENDATIONS: [
+            EditBatch(
+                phase=Phase.ALERT_RECOMMENDATIONS,
+                edits=(_alert_edit("ar-a", ["fm-a"]), _coverage_alert_edit("fm-a", ["ar-a"])),
+            )
+        ],
+    }
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        repair_edits_by_phases={
+            (Phase.METRIC_COVERAGE,): [
+                EditBatch(
+                    phase=Phase.METRIC_COVERAGE,
+                    edits=(
+                        Edit(
+                            EditOp.UPDATE,
+                            "metric_recommendations",
+                            {
+                                "id": "mr-bad",
+                                "kind": "new",
+                                "failure_mode_ids": ["fm-a"],
+                                "rationale": "r",
+                                "details": "d",
+                            },
+                        ),
+                        _coverage_metric_edit("fm-a", []),
+                    ),
+                )
+            ],
+        },
+    )
+    presenter = FakePresenter(unattended=True)
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, unattended=True)
+
+    assert code == 0
+    # Re-presented once, after the cascade folded in the second phase -- one
+    # round total, well within the monkeypatched cap of 1.
+    assert len(presenter.amendment_views) == 1
+    assert presenter.amendment_views[0].origin is orchestrator.AmendmentOrigin.SYSTEM
+    assert {s.phase for s in presenter.amendment_views[0].sections} == {
+        Phase.METRIC_COVERAGE,
+        Phase.ALERT_RECOMMENDATIONS,
+    }
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert artifacts.semantic_violations(loaded) == []
+
+
+def test_contract_unattended_cascade_join_does_not_advance_round_counter_agent_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R26: the same cascade-does-not-count property, for an agent-originated
+    unit (`_handle_amend_proposal`'s path this time) -- proposed during phase
+    4's own turn (`run_control_calls_by_phase` stands in for chat, which can
+    never happen when unattended), renaming fm-503, which mr-x references,
+    pulls metric coverage in via pure `referencing_phases`, all within the one
+    round the monkeypatched cap of 1 allows."""
+    monkeypatch.setattr(orchestrator, "_UNATTENDED_AMENDMENT_ROUND_CAP", 1)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits = dict(_happy_path_edits())
+    edits[Phase.METRIC_COVERAGE] = [
+        *edits[Phase.METRIC_COVERAGE],
+        EditBatch(
+            phase=Phase.METRIC_COVERAGE,
+            edits=(
+                Edit(
+                    EditOp.ADD,
+                    "metric_recommendations",
+                    {
+                        "id": "mr-x",
+                        "kind": "new",
+                        "failure_mode_ids": ["fm-503"],
+                        "rationale": "r",
+                        "details": "d",
+                    },
+                ),
+            ),
+        ),
+    ]
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        run_control_calls_by_phase={
+            Phase.ALERT_RECOMMENDATIONS: [
+                RunControlCall(RunControlAction.AMEND_PROPOSAL, {"phases": [2]})
+            ],
+        },
+        repair_edits_by_phases={
+            (Phase.FAILURE_MODES,): [
+                EditBatch(
+                    phase=Phase.FAILURE_MODES,
+                    edits=(
+                        _fm_update_edit(
+                            "fm-503",
+                            title="web returns 503 (renamed)",
+                            severity="critical",
+                            user_visible=True,
+                            caused_by=["fm-timeout"],
+                            coverage_status="alertable",
+                        ),
+                    ),
+                )
+            ],
+        },
+    )
+    presenter = FakePresenter(unattended=True)
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter, unattended=True)
+
+    assert code == 0
+    assert len(presenter.amendment_views) == 1
+    assert presenter.amendment_views[0].origin is orchestrator.AmendmentOrigin.AGENT
+    assert {s.phase for s in presenter.amendment_views[0].sections} == {
+        Phase.FAILURE_MODES,
+        Phase.METRIC_COVERAGE,
+    }
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert loaded.failure_modes["fm-503"].title == "web returns 503 (renamed)"
+
+
+def test_contract_unattended_false_never_checks_round_cap_even_with_non_converging_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R26: `unattended=False` (the default) never consults the round counter at
+    all. The exact fixture from
+    `test_contract_gate_loop_residual_violation_raises_second_system_unit`
+    needs two full system-originated units to converge; with the cap
+    monkeypatched down to 1, an ordinary interactive run that manually steers
+    each re-opened unit through chat still proceeds past what would have been
+    the cap and converges for real -- proving the cap is never checked here."""
+    monkeypatch.setattr(orchestrator, "_UNATTENDED_AMENDMENT_ROUND_CAP", 1)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _isolate_state_home(monkeypatch, tmp_path)
+    edits: dict[Phase, list[EditBatch]] = {
+        Phase.FAILURE_MODES: [
+            EditBatch(
+                phase=Phase.FAILURE_MODES,
+                edits=(
+                    _fm_edit("fm-a", severity="critical", coverage_status="alertable"),
+                    _fm_edit("fm-b", severity="critical", coverage_status="alertable"),
+                ),
+            )
+        ],
+    }
+    _ready_session(
+        monkeypatch,
+        edits_by_phase=edits,
+        chat_script=["fixed fm-a", "fixed fm-b"],
+        chat_run_control_by_text={
+            "fix fm-a": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})],
+            "fix fm-b": [RunControlCall(RunControlAction.AMEND_COMPLETE, {})],
+        },
+        chat_edits_by_text={
+            "fix fm-a": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(_alert_edit("ar-a", ["fm-a"]), _coverage_alert_edit("fm-a", ["ar-a"])),
+                )
+            ],
+            "fix fm-b": [
+                EditBatch(
+                    phase=Phase.ALERT_RECOMMENDATIONS,
+                    edits=(_alert_edit("ar-b", ["fm-b"]), _coverage_alert_edit("fm-b", ["ar-b"])),
+                )
+            ],
+        },
+    )
+    presenter = FakePresenter()  # unattended defaults False
+    presenter.amendment_replies = [
+        orchestrator.Chat("fix fm-a"),
+        orchestrator.Approve(),
+        orchestrator.Chat("fix fm-b"),
+        orchestrator.Approve(),
+    ]
+
+    code = orchestrator.run(RunMode.ANALYZE, repo, presenter)
+
+    assert code == 0
+    # Two full units presented (four presentations across the open/chat/close
+    # cycle of each) -- two rounds, past the monkeypatched cap of 1, with no
+    # abort: the cap is simply never consulted when unattended is False.
+    assert len(presenter.amendment_views) == 4
+    assert all(v.origin is orchestrator.AmendmentOrigin.SYSTEM for v in presenter.amendment_views)
+    loaded = artifacts.load(_blare_root(repo), RunMode.ANALYZE)
+    assert artifacts.semantic_violations(loaded) == []

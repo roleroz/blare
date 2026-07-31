@@ -97,6 +97,7 @@ __all__ = [
     "AmendmentOrigin",
     "AmendmentPhaseSection",
     "AmendmentReply",
+    "AmendmentRoundCapExceededError",
     "AmendmentView",
     "Approve",
     "Chat",
@@ -281,7 +282,17 @@ class Presenter(Protocol):
     def is_interactive(self) -> bool: ...
 
 
-RunFn = Callable[[RunMode, Path, Presenter], int]
+class RunFn(Protocol):
+    """`cli.main`'s injected entry contract. A `Protocol` rather than a plain
+    `Callable` alias (as it was before R26) because `unattended` (T4.5) is
+    keyword-only with a default -- `Callable[[...], int]` cannot express a
+    keyword-only parameter, and `main` must pass `unattended=` explicitly (cli.md:
+    "passes parsed.unattended as run()'s keyword-only unattended argument")."""
+
+    def __call__(
+        self, mode: RunMode, repo_path: Path, presenter: Presenter, *, unattended: bool = False
+    ) -> int: ...
+
 
 # A run-log sink bound to this run's `_RunState`/`presenter` (orchestrator.md,
 # Failure visibility: the run log records "amendment units, gate results"
@@ -485,6 +496,16 @@ class WriteTimeRecheckError(BlareError):
     outside `.blare/` no longer matches the commit captured at run start, or the
     canonical YAML no longer matches what this run loaded -- the repository changed
     mid-run. Aborts before writing anything."""
+
+
+class AmendmentRoundCapExceededError(BlareError):
+    """R26 (T4.5): an `--unattended` run's amendment round counter (see
+    `_AmendmentRoundCounter`) exceeded `_UNATTENDED_AMENDMENT_ROUND_CAP` without
+    converging -- raised from `_resolve_unit_to_presentation`'s entry, the single
+    point every unit-opening path reaches immediately after a new unit opens, so
+    nothing is written (R20: this always fires before `_finalize_and_write`'s own
+    write path can run). A run failure per the exit-code taxonomy (exit 2): the
+    system is not converging, not the user aborting."""
 
 
 _R15_NEXT_ACTION = (
@@ -790,6 +811,52 @@ class _UnitHolder:
     current: _AmendmentUnit | None = None
 
 
+# R26 (T4.5): an order of magnitude above the 4 rounds a real run has been
+# observed needing -- generous headroom for a genuinely converging repair while
+# still bounding a non-converging one (orchestrator.md, "Unattended mode (R26)").
+_UNATTENDED_AMENDMENT_ROUND_CAP = 10
+
+
+@dataclass
+class _AmendmentRoundCounter:
+    """Counts amendment rounds since run start (R26, T4.5): incremented exactly
+    once each time `unit_holder.current` transitions from no-unit-open to a
+    *newly opened* unit -- origin- and call-site-agnostic by construction, since
+    every code path that constructs a fresh `_AmendmentUnit` (`_open_system_unit`,
+    shared by both `_finalize_and_write`'s gate-failure loop and
+    `_repair_residual_violations`'s load-seeded-violation path, and
+    `_handle_amend_proposal`'s agent-originated path) assigns through the single
+    `_open_new_unit` helper below rather than writing `unit_holder.current`
+    directly -- there is exactly one place in this module that performs a
+    None -> unit transition, so the counter can never advance at some opening
+    paths and not others. Tracked unconditionally, in every run regardless of
+    `unattended` (needed for the interactive-mode test asserting the cap is
+    never consulted there); only ever *checked* against
+    `_UNATTENDED_AMENDMENT_ROUND_CAP` when `unattended` is true (see
+    `_resolve_unit_to_presentation`)."""
+
+    count: int = 0
+
+
+def _open_new_unit(
+    unit_holder: _UnitHolder, unit: _AmendmentUnit, round_counter: _AmendmentRoundCounter
+) -> None:
+    """The single choke point where a *new* amendment unit becomes the run's open
+    unit (R26, T4.5; orchestrator.md, "Unattended mode (R26)"). Both places that
+    construct a fresh `_AmendmentUnit` -- `_open_system_unit` (itself called from
+    two sites: `_finalize_and_write`'s gate-failure loop, and
+    `_repair_residual_violations`'s T3.2 load-seeded-violation path) and
+    `_handle_amend_proposal`'s agent-originated path -- assign through here
+    instead of writing `unit_holder.current` directly, so the round counter is
+    provably uniform across all three real paths rather than incremented at each
+    site independently. A cascade join into an already-open unit (`_advance_unit`
+    adding a phase to `unit.opened_from` in place) never calls this, so it never
+    advances the counter -- only a genuine no-unit-open -> new-unit transition
+    does."""
+    unit_holder.current = unit
+    round_counter.count += 1
+
+
 @dataclass
 class _NoImpactHolder:
     """T3.1: the run's standing `no_impact` conclusion, if the control handler has
@@ -887,12 +954,15 @@ def _handle_amend_proposal(
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     holder: _CandidateHolder,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
 ) -> RunControlVerdict:
     """`amend_proposal`: opens every named phase not already open, starting a unit
     if none is open yet or joining the open one (architecture: "join-over-reject
     precedence" -- an already-open named phase is simply a no-op within it).
     Rejected as a verdict when *every* named phase is already open (orchestrator.md:
-    "those phases are open -- just edit them")."""
+    "those phases are open -- just edit them"). Starting a fresh unit goes through
+    `_open_new_unit` (R26, T4.5) so the amendment round counter advances uniformly
+    with the two system-originated call sites, never by a direct assignment here."""
     phases_raw = payload.get("phases")
     if not isinstance(phases_raw, list) or not phases_raw:
         return RunControlVerdict(
@@ -919,7 +989,7 @@ def _handle_amend_proposal(
     starting_unit = unit is None
     if unit is None:
         unit = _AmendmentUnit(origin=AmendmentOrigin.AGENT, baseline=holder.current)
-        unit_holder.current = unit
+        _open_new_unit(unit_holder, unit, round_counter)
     joined: list[Phase] = []
     for p in phases:
         if phase_status.get(p, _PhaseStatus.UNVISITED) is not _PhaseStatus.OPEN:
@@ -1064,17 +1134,21 @@ def _make_control_handler(
     log: _Log,
     no_impact_holder: _NoImpactHolder,
     load_seeded_violations: list[Violation],
+    round_counter: _AmendmentRoundCounter,
 ) -> agent.RunControlHandler:
     """The run-control handler (architecture: Run-control channel). `amend_proposal`
     and `amend_complete` are real (T2.4); `affected_verdict`/`no_impact` are real in
     update mode (T3.1) and stay rejected in analyze mode (diff-mode-only, R18) per
     the architecture's "Run-control handling is total" rule: never a raise, always
-    a verdict the model can act on."""
+    a verdict the model can act on. `round_counter` (R26, T4.5) passes straight
+    through to `_handle_amend_proposal`, the agent-originated half of the
+    amendment round counter."""
 
     def control(call: RunControlCall) -> RunControlVerdict:
         if call.action is RunControlAction.AMEND_PROPOSAL:
             return _handle_amend_proposal(
-                call.payload, phase_status, unit_holder, phase_baselines, holder, log
+                call.payload, phase_status, unit_holder, phase_baselines, holder, log,
+                round_counter,
             )
         if call.action is RunControlAction.AMEND_COMPLETE:
             return _handle_amend_complete(unit_holder)
@@ -1422,10 +1496,33 @@ def _resolve_unit_to_presentation(
     presenter: Presenter,
     progress_ctx: _ProgressContext,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
+    *,
+    unattended: bool,
 ) -> None:
     """Drive any open unit through the closure loop and its (possibly repeated)
     re-presentation until it closes (T2.4; orchestrator.md: "An open unit defers
-    everything downstream of it"). A no-op if no unit is open."""
+    everything downstream of it"). A no-op if no unit is open.
+
+    R26 (T4.5): every one of this module's three unit-opening paths
+    (`_open_system_unit`'s two call sites and `_handle_amend_proposal`'s) is
+    always followed by a call here -- this is the single point in the module
+    reached uniformly right after a new unit opens, regardless of origin or
+    call site, so the round cap is checked here rather than at each opening
+    site individually. Checked (and raised) *before* `_advance_unit` runs, so
+    an over-cap round never announces a repair to the model or does any other
+    work -- and always before `_finalize_and_write`'s write path, so R20's
+    nothing-written guarantee holds for free."""
+    if unattended and round_counter.count > _UNATTENDED_AMENDMENT_ROUND_CAP:
+        raise AmendmentRoundCapExceededError(
+            cause=(
+                f"--unattended: {round_counter.count} amendment rounds without "
+                f"converging, exceeding the cap of {_UNATTENDED_AMENDMENT_ROUND_CAP}"
+            ),
+            next_action=(
+                "Re-run without --unattended to steer the repair through chat instead."
+            ),
+        )
     while unit_holder.current is not None:
         _advance_unit(
             unit_holder, phase_status, phase_baselines, holder, session, presenter,
@@ -1443,6 +1540,7 @@ def _open_system_unit(
     phase_baselines: dict[Phase, artifacts.ArtifactSet],
     holder: _CandidateHolder,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
 ) -> None:
     """Open a system-originated unit naming every violation's repair phase
     (architecture: Amendment mechanism). Two call sites (T3.2): a failed
@@ -1463,14 +1561,23 @@ def _open_system_unit(
     harmless: approval leaves it open, exactly as it already was. The queue
     re-read at the top of `_drain_phase_queue`'s own loop is what gives every
     phase this unit opens (from unvisited or already-open alike) its own
-    ordinary checkpoint before the write, never only the amendment's."""
+    ordinary checkpoint before the write, never only the amendment's.
+
+    Both call sites hand-construct the unit here and assign it via
+    `_open_new_unit` (R26, T4.5) rather than writing `unit_holder.current`
+    directly -- one of this module's two source lines that can start a fresh
+    unit (the other is `_handle_amend_proposal`'s agent-originated path), which
+    is what keeps the amendment round counter uniform across both of this
+    function's own call sites (`_finalize_and_write`'s gate loop,
+    `_repair_residual_violations`'s proactive check) without either needing to
+    increment it itself."""
     assert unit_holder.current is None
     unit = _AmendmentUnit(origin=AmendmentOrigin.SYSTEM, baseline=holder.current)
     for p in sorted({v.phase for v in violations}, key=int):
         unit.opened_from[p] = phase_status[p]
         unit.pending_violations[p] = tuple(v for v in violations if v.phase is p)
         _mark_phase_open(p, phase_status, phase_baselines, holder)
-    unit_holder.current = unit
+    _open_new_unit(unit_holder, unit, round_counter)
     log(
         {
             "event": "amendment_unit_opened",
@@ -1490,6 +1597,9 @@ def _repair_residual_violations(
     presenter: Presenter,
     progress_ctx: _ProgressContext,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
+    *,
+    unattended: bool,
 ) -> None:
     """T3.2: update mode's own post-triage check for R18's load-seeded violation
     repairs (agent.md: "in update mode the orchestrator calls it [request_repair]
@@ -1517,10 +1627,12 @@ def _repair_residual_violations(
             "kinds": [v.kind.value for v in violations],
         }
     )
-    _open_system_unit(violations, phase_status, unit_holder, phase_baselines, holder, log)
+    _open_system_unit(
+        violations, phase_status, unit_holder, phase_baselines, holder, log, round_counter,
+    )
     _resolve_unit_to_presentation(
         unit_holder, phase_status, phase_baselines, holder, session, presenter,
-        progress_ctx, log,
+        progress_ctx, log, round_counter, unattended=unattended,
     )
 
 
@@ -1635,6 +1747,9 @@ def _run_checkpoint(
     holder: _CandidateHolder,
     progress_ctx: _ProgressContext,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
+    *,
+    unattended: bool,
 ) -> None:
     """Present one checkpoint and drive its chat loop to approval (architecture:
     "Checkpoint loop"); raises `_AbortRun` on abort. An `amend_proposal` arising
@@ -1659,7 +1774,7 @@ def _run_checkpoint(
                 presenter.show_chat_reply(chat_reply_text, None)
                 _resolve_unit_to_presentation(
                     unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                    progress_ctx, log,
+                    progress_ctx, log, round_counter, unattended=unattended,
                 )
                 view = build_view()
                 reply = presenter.present_checkpoint(view)
@@ -1687,6 +1802,9 @@ def _run_no_impact_checkpoint(
     holder: _CandidateHolder,
     progress_ctx: _ProgressContext,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
+    *,
+    unattended: bool,
 ) -> None:
     """Present the R18 no-impact conclusion as a checkpoint -- approve/abort/chat,
     the same reply convention `_run_checkpoint` drives (cli.md: "replies per the
@@ -1732,7 +1850,7 @@ def _run_no_impact_checkpoint(
                 if unit_holder.current is not None:
                     _resolve_unit_to_presentation(
                         unit_holder, phase_status, phase_baselines, holder, session,
-                        presenter, progress_ctx, log,
+                        presenter, progress_ctx, log, round_counter, unattended=unattended,
                     )
                 if any(status is _PhaseStatus.OPEN for status in phase_status.values()):
                     return
@@ -1762,6 +1880,9 @@ def _drain_phase_queue(
     unit_holder: _UnitHolder,
     progress_ctx: _ProgressContext,
     log: _Log,
+    round_counter: _AmendmentRoundCounter,
+    *,
+    unattended: bool,
 ) -> None:
     """Run exactly the queue's phases, in phase order (T3.1; architecture: update
     mode's phase engine over the R18-seeded queue) -- reusing the analyze phase
@@ -1799,7 +1920,7 @@ def _drain_phase_queue(
             # unit open resumes it immediately before anything else proceeds.
             _resolve_unit_to_presentation(
                 unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                progress_ctx, log,
+                progress_ctx, log, round_counter, unattended=unattended,
             )
 
         def _build_checkpoint_view(phase: Phase = phase) -> CheckpointView:
@@ -1814,7 +1935,7 @@ def _drain_phase_queue(
 
         _run_checkpoint(
             session, presenter, _build_checkpoint_view, unit_holder, phase_status,
-            phase_baselines, holder, progress_ctx, log,
+            phase_baselines, holder, progress_ctx, log, round_counter, unattended=unattended,
         )
         phase_status[phase] = _PhaseStatus.FROZEN
         log({"event": "phase_frozen", "phase": int(phase)})
@@ -1832,6 +1953,9 @@ def _finalize_and_write(
     repo: gitrepo.GitRepo,
     end_sha: str,
     blare_root: Path,
+    round_counter: _AmendmentRoundCounter,
+    *,
+    unattended: bool,
 ) -> None:
     """Final confirmation (architecture: "the checkpoint approval at which the
     phase queue is empty and the semantic check passes") and the write path
@@ -1851,7 +1975,7 @@ def _finalize_and_write(
     while True:
         _drain_phase_queue(
             session, presenter, holder, phase_status, phase_baselines, unit_holder,
-            progress_ctx, log,
+            progress_ctx, log, round_counter, unattended=unattended,
         )
         violations = artifacts.semantic_violations(holder.current)
         if not violations:
@@ -1863,10 +1987,12 @@ def _finalize_and_write(
                 "kinds": [v.kind.value for v in violations],
             }
         )
-        _open_system_unit(violations, phase_status, unit_holder, phase_baselines, holder, log)
+        _open_system_unit(
+            violations, phase_status, unit_holder, phase_baselines, holder, log, round_counter,
+        )
         _resolve_unit_to_presentation(
             unit_holder, phase_status, phase_baselines, holder, session, presenter,
-            progress_ctx, log,
+            progress_ctx, log, round_counter, unattended=unattended,
         )
     log({"event": "gate_passed"})
 
@@ -1997,6 +2123,8 @@ def _execute(
     presenter: Presenter,
     run_state: _RunState,
     clock: Callable[[], float],
+    *,
+    unattended: bool,
 ) -> int:
     # Step 1: repo discovery; no-commits check (R11). No repo-id exists yet, so a
     # failure here has no run log -- its diagnosis is the R13 message alone.
@@ -2148,6 +2276,11 @@ def _execute(
     # mechanism naming it ahead of the run's position -- see `_mark_phase_open`.
     phase_baselines: dict[Phase, artifacts.ArtifactSet] = {}
     unit_holder = _UnitHolder()
+    # R26 (T4.5): one counter for the whole run, threaded to every function that
+    # can open a new amendment unit or that must check the cap right after one
+    # opens -- see `_AmendmentRoundCounter`'s own docstring for why this is
+    # provably the run's only such counter.
+    round_counter = _AmendmentRoundCounter()
     sink = _make_sink(holder, phase_status, unit_holder)
     # T3.1: the standing no_impact conclusion (if any) the control handler
     # accepts, and step 7's semantic-violation seeds -- both feed the update
@@ -2162,7 +2295,7 @@ def _execute(
 
     control = _make_control_handler(
         mode, phase_status, unit_holder, phase_baselines, holder, _log_event,
-        no_impact_holder, violations,
+        no_impact_holder, violations, round_counter,
     )
 
     transcript = _RealTranscriptWriter(
@@ -2219,7 +2352,7 @@ def _execute(
                 # (orchestrator.md, Approval gate).
                 _resolve_unit_to_presentation(
                     unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                    progress_ctx, _log_event,
+                    progress_ctx, _log_event, round_counter, unattended=unattended,
                 )
 
             # T3.2: R18's load-seeded violation repairs -- request_repair is the
@@ -2231,7 +2364,7 @@ def _execute(
             # no_impact conclusion or draining the queue.
             _repair_residual_violations(
                 holder, phase_status, unit_holder, phase_baselines, session, presenter,
-                progress_ctx, _log_event,
+                progress_ctx, _log_event, round_counter, unattended=unattended,
             )
 
             # T3.2: a same-turn sequence within triage() itself -- an accepted
@@ -2262,19 +2395,20 @@ def _execute(
                 # rejected -- nothing further to do here once it returns.
                 _run_no_impact_checkpoint(
                     session, presenter, view, unit_holder, phase_status, phase_baselines,
-                    holder, progress_ctx, _log_event,
+                    holder, progress_ctx, _log_event, round_counter, unattended=unattended,
                 )
             # `_drain_phase_queue` is a no-op over an empty queue, so this
             # unconditional call covers both the no_impact-withdrawn path (a
             # phase is now open) and the ordinary affected_verdict path.
             _drain_phase_queue(
                 session, presenter, holder, phase_status, phase_baselines, unit_holder,
-                progress_ctx, _log_event,
+                progress_ctx, _log_event, round_counter, unattended=unattended,
             )
 
             _finalize_and_write(
                 holder, phase_status, unit_holder, phase_baselines, session, presenter,
-                progress_ctx, _log_event, repo, end_sha, blare_root,
+                progress_ctx, _log_event, repo, end_sha, blare_root, round_counter,
+                unattended=unattended,
             )
         except _AbortRun:
             counts = _overall_counts(artifact_set, holder.current)
@@ -2328,7 +2462,7 @@ def _execute(
                 # checkpoint."
                 _resolve_unit_to_presentation(
                     unit_holder, phase_status, phase_baselines, holder, session, presenter,
-                    progress_ctx, _log_event,
+                    progress_ctx, _log_event, round_counter, unattended=unattended,
                 )
 
             def _build_checkpoint_view(phase: Phase = phase) -> CheckpointView:
@@ -2348,7 +2482,8 @@ def _execute(
 
             _run_checkpoint(
                 session, presenter, _build_checkpoint_view, unit_holder, phase_status,
-                phase_baselines, holder, progress_ctx, _log_event,
+                phase_baselines, holder, progress_ctx, _log_event, round_counter,
+                unattended=unattended,
             )
             phase_status[phase] = _PhaseStatus.FROZEN
             _log(run_state, presenter, {"event": "phase_frozen", "phase": int(phase)})
@@ -2359,7 +2494,8 @@ def _execute(
         # (T3.1) rather than a duplicated implementation.
         _finalize_and_write(
             holder, phase_status, unit_holder, phase_baselines, session, presenter,
-            progress_ctx, _log_event, repo, end_sha, blare_root,
+            progress_ctx, _log_event, repo, end_sha, blare_root, round_counter,
+            unattended=unattended,
         )
     except _AbortRun:
         counts = _overall_counts(artifact_set, holder.current)
@@ -2430,16 +2566,23 @@ def run(
     presenter: Presenter,
     *,
     clock: Callable[[], float] = time.monotonic,
+    unattended: bool = False,
 ) -> int:
     """Blare's one entry contract: run a mode against a repo, render through presenter.
 
     `clock` (R25, T4.3) is the progress ticker's injected clock -- `time.monotonic`
     by default, the module's own test seam for the ticker's elapsed-time behavior
     (orchestrator.md's Test plan). A keyword-only parameter with a default so
-    `RunFn = Callable[[RunMode, Path, Presenter], int]` (cli's fixed entry
-    contract) stays satisfied: every ordinary caller (cli.main) calls `run` with
-    exactly the three positional arguments and gets the real clock; only tests
-    override it.
+    `RunFn`'s `__call__` protocol (cli's fixed entry contract) stays satisfied:
+    every ordinary caller (cli.main) calls `run` with the three positional
+    arguments and its own `unattended=` value; only tests override `clock`.
+
+    `unattended` (R26, T4.5) is threaded straight down to the amendment
+    machinery's round counter (see `_AmendmentRoundCounter`, `_open_new_unit`,
+    and the cap check in `_resolve_unit_to_presentation`) -- the *reply* half of
+    unattended mode (auto-approving every checkpoint/amendment/no-impact
+    presentation) is entirely the injected `Presenter`'s own concern (cli.md's
+    `TerminalPresenter`), needing no conditional logic here at all.
 
     Exit-code taxonomy (orchestrator.md), assigned by run stage, not by which module
     raised: `0` success (including R7 up-to-date); `1` refusal -- any `BlareError`
@@ -2471,7 +2614,7 @@ def run(
     """
     run_state = _RunState()
     try:
-        return _execute(mode, repo_path, presenter, run_state, clock)
+        return _execute(mode, repo_path, presenter, run_state, clock, unattended=unattended)
     except KeyboardInterrupt:
         if run_state.transcript_path is not None:
             fields = _discarded_summary_fields(run_state)
