@@ -185,3 +185,21 @@ run gave zero terminal output while a phase computed, including one phase that r
 two hours during an amendment repair loop, leaving the user unable to tell whether the process
 was working or hung. `_drain_turn` in `agent.py` confirmed the root cause directly — it fully
 blocks on the live SDK's event queue with no hook to report intermediate activity.
+
+## 2026-07-31 — Pause T4.1 until checkpoint-wait/gate-timing is addressed
+
+**Chosen**: no further T4.1 (release suite) dispatches until the excessive wait time a full
+live run exhibits is fixed. The user asked for a timing analysis of the finished
+`~/blare_test/oauth2-proxy` run and instructed directly: don't run T4.1 again until this is
+fixed.
+**Rejected**: continuing to capture T4.1's remaining scenarios in parallel with designing a
+timing fix — rejected because the user's instruction was explicit and unconditional, not a
+priority ordering.
+**Why**: analysis of the finished run's log and transcript found the total ~10-hour run was
+dominated by two waits where the model had finished in minutes and nothing signaled a
+checkpoint or amendment was ready for review — one nearly 2 hours (phase 4's checkpoint), one
+over 7 hours (the final amendment round) — while the four designed phases' actual model
+compute totaled only ~16 minutes. R25/T4.3 (already merged) fixes silence *during*
+computation but not a finished checkpoint sitting unnoticed; a further fix (see the
+architecture/module docs once designed) is needed before another long live run is worth the
+cost.

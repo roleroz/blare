@@ -227,23 +227,19 @@ also real.
   release-suite capture still supersedes it once that's resolved.
 - update with an affected subset of phases — T3.1 hand-authored provisional instances at
   `tests/fixtures/claude-sdk/update-happy-path/scenario.jsonl` and
-  `update-multi-commit/scenario.jsonl` (R8's multi-commit delta); still unverified — T4.1
-  found `orchestrator.py` hardcodes `patch_text=""` for update-mode triage (a documented,
-  never-actually-closed T2.2/T3.1 gap: `gitrepo.md`'s `effective_delta` exposes name-status
-  only, never diff text), confirmed live: given no real diff, the model correctly noticed it
-  had nothing to review and defaulted to no-impact for a substantive commit. Blocks a real
-  capture of this scenario and of update-dynamic-expansion and a genuine
-  update-no-impact/-redirect below, until this gap is closed — see the pending decision on
-  how to close it, flagged to the user.
+  `update-multi-commit/scenario.jsonl` (R8's multi-commit delta), now carrying real diff
+  content in `patch_text` (T4.4 fixed the gap that previously left it hardcoded `""`); still
+  unverified — a live capture is what would replace them, and per the user's 2026-07-31
+  instruction T4.1 doesn't run again until the checkpoint-wait/gate-timing concern from its
+  first run is addressed (decisions.md).
 - update no-impact conclusion (R18) — T3.1 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; T3.2 hand-authored its
-  chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`; still unverified —
-  a *genuine* no-impact conclusion needs the model to see real diff content to correctly
-  judge nothing matters, so this is blocked by the same `patch_text=""` gap noted above.
+  chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`, both now carrying
+  real `patch_text` (T4.4); still unverified, same reason as above.
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
   a behind-position phase — T3.2 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`; still unverified,
-  blocked by the same `patch_text=""` gap noted above.
+  `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`, now carrying real
+  `patch_text` (T4.4); still unverified, same reason as above.
 - checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/analyze-checkpoint-chat/scenario.jsonl`; a release-suite
   capture still supersedes it

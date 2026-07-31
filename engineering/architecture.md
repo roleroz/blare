@@ -305,11 +305,15 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   replace the provisional set, and emptying that list is this task's definition of done, per
   the global rule that it gates the first release. Driver and 3 real captures landed
   (analyze-happy-path, analyze-reanalysis-update, update-load-seeded-repair — see agent.md).
-  Remaining, blocked on a decision: 5 update-mode scenarios need the `patch_text=""` gap
-  closed first (agent.md's provisional list explains). Remaining, not diff-content-blocked:
-  analyze-reanalysis-noop (3 live attempts didn't converge — needs a different approach, not
-  necessarily a code fix), auth-required, amendment-system, amendment-agent (×2),
-  amendment-cascade (×2), analyze-checkpoint-chat (not yet attempted).
+  T4.4 closed the `patch_text=""` gap that blocked 5 update-mode scenarios
+  (update-happy-path, update-multi-commit, update-dynamic-expansion, update-no-impact,
+  update-no-impact-redirect) — unblocked, but **not re-attempted**: per the user's explicit
+  instruction (2026-07-31, following a live-run timing analysis), T4.1 does not run again
+  until the checkpoint-wait/gate-timing concern is addressed first (see decisions.md).
+  Remaining, not diff-content-blocked: analyze-reanalysis-noop (3 live attempts didn't
+  converge — needs a different approach, not necessarily a code fix), auth-required,
+  amendment-system, amendment-agent (×2), amendment-cascade (×2), analyze-checkpoint-chat
+  (not yet attempted).
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
 - [x] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for
@@ -322,7 +326,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   delay or fake clock advancing between them) asserts progress lines appear on the PTY
   before the checkpoint renders, naming the phase and updating `last_activity`. Traces:
   R25.
-- [ ] **T4.4 real patch text for triage**: `gitrepo.patch_text` (new — real diff content
+- [x] **T4.4 real patch text for triage**: `gitrepo.patch_text` (new — real diff content
   for the same range `effective_delta` already covers, no size cap per gitrepo.md's
   Decisions), wired into `RunContext.patch_text` at preflight step 9, replacing the `""`
   hardcoded since T2.2. Discovered via T4.1's live testing: the model, given no real diff,
