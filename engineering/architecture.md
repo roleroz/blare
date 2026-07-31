@@ -11,8 +11,11 @@ configuration, D8 agent session structure) are settled and logged in
 
 Changes since last approval: the Tasks section gained **T2.6 live SDK client**, inserted after
 T2.5 — building `create_client`'s real (`unset`) branch, discovered missing while scoping T4.1
-(no prior task's scope ever included it). Everything else in the Tasks section, and everything
-above it, is as previously approved.
+(no prior task's scope ever included it). It also gained **T4.3 progress feedback**, after
+T4.2 — R25's three-module handshake (agent tool-call callback, orchestrator ticker, cli
+rendering), added as a new cross-cutting decision and reflected in the agent/orchestrator/cli
+module bullets above. Everything else in the Tasks section, and everything above it, is as
+previously approved.
 
 ---
 
@@ -39,15 +42,17 @@ graph TD
 ## Modules
 
 - **cli** — entry point and terminal surface: command parsing, checkpoint presentation, the
-  free-form chat loop, result summaries and error rendering (per `brand/design-language.md`
-  §6), TTY detection. Contains no run logic: it renders what the orchestrator reports and
-  forwards what the user types.
+  free-form chat loop, periodic progress rendering during a driving call (R25), result
+  summaries and error rendering (per `brand/design-language.md` §6), TTY detection. Contains
+  no run logic: it renders what the orchestrator reports and forwards what the user types.
 - **orchestrator** — the run lifecycle: preflight sequence (environment, lock, validation),
   the phase state machine with checkpoints, amendments and their atomic cascades, final
   confirmation including the write-time re-check, atomic write ordering, run summary. Owns
   the lock, the exit-code taxonomy, the phase-state rule (which phases are open), and the
   run's pending edit set: it injects the edit sink and run-control handler that the agent's
-  tools call into. The only module that coordinates the others.
+  tools call into. Times every agent-driving call and periodically renders elapsed time plus
+  the agent's last tool-call activity through the presenter (R25). The only module that
+  coordinates the others.
 - **gitrepo** — all git access, via the `git` subprocess: repo discovery, SHA resolution and
   ancestry, dirty-tree check (excluding `.blare/` and git-ignored files), effective-delta
   computation, and the repo-id (a hash of the repository's top-level worktree path — two
@@ -60,9 +65,9 @@ graph TD
   ordering primitives the orchestrator drives. No other module touches `.blare/`.
 - **agent** — the Claude Agent SDK boundary: session lifecycle, subscription-login preflight,
   the phase prompts, checkpoint chat pass-through, exposing the edit and run-control tools
-  (backed by orchestrator-injected handlers), transcript persistence. The SDK client behind
-  it is the system's mock boundary in tests, substituted via the environment-variable seam
-  named in Test strategy.
+  (backed by orchestrator-injected handlers), a tool-call activity callback for R25's
+  progress reporting, transcript persistence. The SDK client behind it is the system's mock
+  boundary in tests, substituted via the environment-variable seam named in Test strategy.
 - **stack** — the metrics/alerting stack abstraction: what instrumentation to look for and
   how to express alert rules. One interface, one Prometheus implementation in the MVP.
   Consulted by **agent** (prompt context) and **artifacts** (alert-expression validation).
@@ -149,6 +154,15 @@ The spec assigns the exact `.blare/` layout to this document:
   violation there raises a system-originated amendment (see Amendment mechanism), never a
   silent repair, and the run continues. This defines final confirmation operationally: the
   checkpoint approval at which the phase queue is empty and the semantic check passes.
+- **Progress feedback (R25)**: a three-module handshake, presentation-only and never
+  altering turn-taking. **agent** invokes a callback with the tool's name each time it
+  dispatches a tool call during a driving call (`run_phase`, `triage`, `chat`,
+  `request_repair`, `notify_amendment_outcome`). **orchestrator** times every driving call
+  and periodically reports elapsed time plus the most recent tool-call name through the
+  presenter for as long as the call is in flight, stopping before the call's own
+  result/checkpoint rendering proceeds — progress lines and result rendering never
+  interleave. **cli** renders these as a distinct line kind, never a result (`→ `) or a
+  prompt.
 - **Errors**: one error type carrying cause and next action (R13); the orchestrator maps it to
   the exit-code taxonomy; **cli** renders it. No module prints directly except **cli**.
 - **Agent session**: one continuous SDK session per run — all four phases and all checkpoint
@@ -290,3 +304,13 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   global rule that it gates the first release.
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
+- [ ] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for
+  every tool call, including the SDK's own filesystem-read tools, not only `propose_edits`/
+  `run_control`), the orchestrator's per-driving-call ticker (injected clock, per
+  orchestrator.md's Test plan), and `cli`'s new `progress` rendering. Discovered via live
+  user testing (a real run gave no indication of which phase was active or whether it was
+  still alive across phases running minutes to nearly two hours). e2e: a fixture scripting
+  a slow phase (several scripted tool calls before `turn_end`, replayed with an injected
+  delay or fake clock advancing between them) asserts progress lines appear on the PTY
+  before the checkpoint renders, naming the phase and updating `last_activity`. Traces:
+  R25.

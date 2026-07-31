@@ -4,7 +4,11 @@
 
 This section contains only open items. **No open items** — D9 (checkpoint input convention:
 exact reserved words `approve` / `abort`, anything else is chat) is settled and logged in
-`engineering/decisions.md`. 
+`engineering/decisions.md`.
+
+**Changes since last approval**: `TerminalPresenter` gained `progress` (R25, added
+2026-07-31) — periodic status rendering during a driving call. See Interface and Rendering
+rules. 
 
 ## Responsibility
 
@@ -27,6 +31,7 @@ class TerminalPresenter:                            # orchestrator's presenter p
     def present_amendment(self, view: AmendmentView, rejectable: bool) -> AmendmentReply
     def present_no_impact(self, view: NoImpactView) -> CheckpointReply
     def show_chat_reply(self, text: str, prompt: PromptKind | None) -> AmendmentReply | None
+    def progress(self, label: str, elapsed_seconds: float, last_activity: str | None) -> None
     def notice(self, text: str) -> None
     def error(self, cause: str, next_action: str, detail: str | None = None) -> None
     def summary(self, s: RunSummary) -> None
@@ -42,6 +47,14 @@ reject-and-restore is a mechanical action, not chat); at a non-rejectable prompt
 is ordinary chat. `notice` renders one informational line outside any view (a reclaimed
 stale lock, a phase opening) — plain, no `→ ` prefix; that prefix marks results and next
 actions, which a notice is neither.
+`progress` (R25) renders one status line while an agent-driving call is in flight —
+`label` names the active phase or operation (e.g. `"phase 3 — metric coverage"`,
+`"triage"`), `elapsed_seconds` is time since the call began, and `last_activity` is the
+most recent tool call's name, rendered as `waiting` when `None` (no tool call has arrived
+yet). It takes no reply and never blocks: the orchestrator calls it from its own ticker,
+off the thread draining the turn, purely to inform — a broken stream here is swallowed
+like `notice`, never mapped to `Abort` the way a reply-pending view is, since no reply was
+ever expected.
 `show_chat_reply` is the chat loop's continuation: after a `Chat` reply, the orchestrator
 routes the text to the agent and passes the response here together with the kind of prompt
 in progress (`PromptKind`: checkpoint, no-impact, amendment, rejectable amendment). It
@@ -81,6 +94,11 @@ run failures, an overlap it tolerates because a usage error occurs before any ru
 - Errors render as the cause line, then `→ ` + next action.
 - Terse and factual; no apologies, no exclamation marks; vocabulary per the brand file
   (failure mode, coverage, gap, breach, recommendation).
+- Progress lines (R25) start `· ` — distinct from both `→ ` (results) and `$ ` (prompts),
+  since a progress line is neither: `· phase 3 — metric coverage (12s, propose_edits)`, or
+  `(12s, waiting)` before any tool call has arrived. No color, no motion beyond appearing —
+  brand's "nothing loops, nothing pulses idly" (§7) rules out a spinner or cursor tricks;
+  each tick is one plain appended line.
 
 Checkpoint screen: phase name as header, then this module's rendering of the structured
 `CheckpointView` (entries added/updated/removed with their content, gap summary — the
@@ -104,11 +122,12 @@ the next reply-pending call converts the dead stream to `Abort`): a reply-pendin
 (checkpoint, amendment, no-impact, a prompting `show_chat_reply`) hit by a broken pipe or
 closed stdout returns `Abort` — the run cannot continue without a user, and before final
 confirmation R20 guarantees nothing is written; a void method (`notice`, `error`,
-`summary`) swallows the write failure and continues — for `error` and `summary` because
-the run's outcome is already determined and a render crash would corrupt it, and for
-`notice` as a deliberate call: a mid-run notice lost to a dead stdout is tolerable
-because the next reply-pending call converts the dead stream to `Abort`, whereas raising
-from a fire-and-forget render would abort runs for a line nobody could read anyway — in particular a pipe break during `summary`,
+`summary`, `progress`) swallows the write failure and continues — for `error` and
+`summary` because the run's outcome is already determined and a render crash would
+corrupt it, and for `notice`/`progress` as a deliberate call: a mid-run notice or progress
+line lost to a dead stdout is tolerable because the next reply-pending call converts the
+dead stream to `Abort`, whereas raising from a fire-and-forget render would abort runs for
+a line nobody could read anyway — in particular a pipe break during `summary`,
 after the write, must not turn a completed run into a reported abort, and the exit code
 reflects the actual outcome. `main` catches nothing itself — exit codes are the
 orchestrator's; the argparse-decided exits are the exceptions (usage errors exit 2,
@@ -173,6 +192,9 @@ Contract tests, one per behaviour:
   orchestrator's pre-run-log traceback channel) the detail renders beneath, on stderr.
 - `is_interactive` false exactly when stdin is not a TTY (R22's criterion); a non-TTY
   stdout alone leaves it true and only disables color.
+- `progress` rendering: `· ` prefix, the label verbatim, elapsed seconds, and
+  `last_activity` when set; `last_activity=None` renders `waiting` in its place —
+  byte-exact assertions for a fixed set of arguments.
 
 Failure-mode tests, dependency = the terminal streams:
 
@@ -186,3 +208,5 @@ Failure-mode tests, dependency = the terminal streams:
   unchanged; stdout failing inside `notice` → swallowed; stdout failing inside a
   `show_chat_reply(prompt=None)` render → swallowed, returns `None`, no traceback (the
   void-class rule — this test lives here because its trigger is the stream failing).
+- stdout raising BrokenPipeError inside `progress` → swallowed, no traceback, no effect on
+  the run (same void-class rule as `notice`).

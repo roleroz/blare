@@ -3,7 +3,11 @@
 ## Decisions needed from you
 
 This section contains only open items. **No open items** — the seam variable name and fixture
-format below are implementation detail. 
+format below are implementation detail.
+
+**Changes since last approval**: `AgentSession.__init__` gained `on_activity` (R25, added
+2026-07-31) — a callback invoked with the dispatched tool's name each time a tool call
+arrives during a driving call, feeding the orchestrator's progress ticker. See Interface.
 
 ## Responsibility
 
@@ -19,7 +23,8 @@ def create_client() -> SDKClient        # env-var seam selection (see Client sea
 
 class AgentSession:
     def __init__(self, client: SDKClient, sink: EditSink, control: RunControlHandler,
-                 stack: ObservabilityStack, transcript: TranscriptWriter) -> None
+                 stack: ObservabilityStack, transcript: TranscriptWriter,
+                 on_activity: Callable[[str], None] | None = None) -> None
     def start(self, mode: RunMode, context: RunContext) -> None   # raises AuthRequiredError
     def triage(self) -> None            # update mode: produce the R18 verdict
     def run_phase(self, phase: Phase) -> None
@@ -80,6 +85,19 @@ it itself. `close` is idempotent and safe after any `AgentSessionError`.
   `request_repair` then check that their required event (a verdict; `amend_complete`)
   arrived during the turn, remind once via a follow-up message when it did not, and raise
   `AgentSessionError` after a second eventless turn.
+- `on_activity` (R25) is invoked with a tool's name immediately when the model calls it,
+  for *every* tool call in the turn — `propose_edits` and `run_control` alike, but also
+  every filesystem read tool (`Read`, `Grep`, `Glob`, ...) the SDK itself executes: those
+  dominate a phase's actual wall-clock time (a phase is mostly the model exploring the
+  codebase, not proposing edits), so `on_activity` must not be scoped to Blare's own two
+  tools or R25's progress line would sit stale through most of a long call. It fires from
+  whatever thread is draining the turn — today, the same thread that called the driving
+  method, since draining blocks synchronously — and fires independently of, not instead of,
+  the propose_edits/run_control round trip those two tools still go through. It is a pure
+  notification: its return value is ignored, and an exception it raises must not be allowed
+  to break the turn (caught and dropped at the call site, not propagated as an
+  `AgentSessionError` — R25 is presentation-only and must never affect a run's outcome).
+  `None` (the default) means no callback runs.
 - `notify_amendment_outcome` closes the loop on every amendment unit (R2): it sends the
   model a structured message stating approval, or rejection with the restored phases —
   without it the session's context would keep the rejected repair batches as accepted and
@@ -104,7 +122,8 @@ it itself. `close` is idempotent and safe after any `AgentSessionError`.
   `amend_complete`) — schemas mirroring artifacts' `EditBatch` and the orchestrator's
   run-control payloads. Filesystem read tools are the SDK's own; the session runs with
   write tools disallowed — the target repo is read-only to the model, edits flow only
-  through `propose_edits`.
+  through `propose_edits`. `on_activity` (R25, Interface) sees every one of these calls
+  too, not only the two above.
 - System prompt per mode (analyze / update), assembled by this module. Phase prompts carry
   the stack's fragment for their phase: `instrumentation_hints()` in phase 3,
   `alerting_hints()` in phase 4.
@@ -298,6 +317,12 @@ Contract tests, one per behaviour:
   version present — that the replaying client then replays to an identical event stream.
 - `close` ends the SDK session, is idempotent, does not close the TranscriptWriter, and is
   safe after a session error.
+- `on_activity` (R25): fires with the tool's name for `propose_edits` and `run_control`
+  calls, and for a scripted filesystem-read tool call (`Read`, or similar), in call order;
+  a session constructed with `on_activity=None` drives a turn with tool calls normally and
+  raises nothing; a callback that raises is caught and does not interrupt the turn or
+  surface as `AgentSessionError` (asserted via a raising fake callback: the turn still
+  completes and the driving call still returns normally).
 
 Failure-mode tests, per dependency:
 

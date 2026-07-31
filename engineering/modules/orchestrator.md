@@ -5,6 +5,9 @@
 This section contains only open items. **No open items** — the exit-code taxonomy below is a
 conventional mapping documented as fact; say so if you want it surfaced as a choice instead.
 
+**Changes since last approval**: a progress ticker wraps every agent-driving call (R25,
+added 2026-07-31). See Phase engine.
+
 
 ## Responsibility
 
@@ -127,6 +130,24 @@ session ran), and chat replies actually reach the terminal. `error` takes an opt
 `detail` string — the channel for the pre-run-log traceback, rendered beneath the cause
 on stderr. The agent
 runs a phase via `AgentSession.run_phase(phase)`.
+
+**Progress ticker (R25)**: every driving call — `run_phase`, `triage`, `chat`,
+`request_repair`, `notify_amendment_outcome` — is wrapped in a ticker: a background thread
+started immediately before the call (first tick at `elapsed=0`, `last_activity=None`) that
+calls `presenter.progress(label, elapsed_seconds, last_activity)` on a short interval for as
+long as the call is in flight, reading `last_activity` from a thread-safe cell that
+`AgentSession`'s `on_activity` callback (agent.md) updates each time a tool call is
+dispatched. `label` names the active phase (`"phase {n} — {title}"`) for `run_phase`, or the
+operation itself (`"triage"`, `"chat"`, `"repair"`, `"amendment outcome"`) for the other four.
+The ticker is stopped and joined before the driving call's own result is used for anything
+further — a checkpoint built from `run_phase`, the chat reply rendered by `show_chat_reply`,
+the repair loop's next step — so a progress line can never interleave with or follow the
+call's own result rendering. A callback exception or a presenter failure inside the ticker is
+swallowed (R25 is presentation-only, per agent.md and cli.md) and never affects the run's
+outcome or exit code. The ticker takes its clock as an injected `Callable[[], float]`
+(default `time.monotonic`), the module's own test seam for this behavior — real time is
+never faked by patching the standard library, and a test drives elapsed-time assertions and
+tick counts deterministically by supplying a fake clock instead.
 
 Approval gate: at every approval that would leave the queue empty **with no amendment
 unit open** — a phase checkpoint or a unit's re-presentation alike — run the semantic
@@ -336,6 +357,13 @@ R20's nothing-written on observable filesystem state):
   (R15), and after a run failure (agent death) each acquire cleanly with no stale notice.
 - write re-check: a mid-run commit aborts the write (exit 2); a mid-run hand edit to
   canonical YAML aborts; a derived-doc edit does not (restored per R10).
+- progress ticker (R25): given a fake clock and a driving call held open past several tick
+  intervals, the presenter receives a first tick at `elapsed=0`/`last_activity=None`, then
+  further ticks reflecting the fake clock's advance and the most recent name the fake
+  session's `on_activity` reported; the ticker is stopped (no further ticks) once the
+  driving call returns, before the caller's next presenter call (a checkpoint, a chat
+  reply) is made — asserted on call order in the fake presenter's recording; this holds for
+  each of `run_phase`, `triage`, `chat`, `request_repair`, and `notify_amendment_outcome`.
 
 Failure-mode tests, per dependency:
 
@@ -353,3 +381,7 @@ Failure-mode tests, per dependency:
 - presenter: an `Abort` reply produced by the cli's stream-death mapping → exit 3,
   nothing written (a reply, not an exception); a presenter raising → unexpected
   exception, exit 2.
+- progress ticker (R25): a `progress()` call raising inside the ticker is swallowed —
+  the driving call still completes and its own result still reaches the presenter
+  normally; a raising `on_activity` (agent-side) is likewise swallowed and does not
+  interrupt the ticker or the turn.
