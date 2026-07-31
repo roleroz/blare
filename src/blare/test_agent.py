@@ -2189,7 +2189,11 @@ class _RealisticFakeSink:
         self.calls.append(batch)
         for edit in batch.edits:
             if edit.entry_type not in self._VALID_ENTRY_TYPES:
-                return BatchVerdict(ok=False, message=f"unknown entry_type {edit.entry_type!r}")
+                valid_types = ", ".join(sorted(self._VALID_ENTRY_TYPES))
+                return BatchVerdict(
+                    ok=False,
+                    message=f"unknown entry_type {edit.entry_type!r}; valid types: {valid_types}",
+                )
         for edit in batch.edits:
             if edit.op is EditOp.ADD and isinstance(edit.payload_or_id, dict):
                 entry_id = edit.payload_or_id.get("id")
