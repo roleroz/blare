@@ -512,6 +512,14 @@ py_test(
     data = [
         "//src/blare:blare",
         "//tests/fixtures/claude-sdk/update-multi-commit:scenario.jsonl",
+        "testdata/update_multi_commit/common_after.css",
+        "testdata/update_multi_commit/common_before.css",
+        "testdata/update_multi_commit/content_rewrite_functions_after.go",
+        "testdata/update_multi_commit/content_rewrite_functions_before.go",
+        "testdata/update_multi_commit/content_rewrite_test_after.go",
+        "testdata/update_multi_commit/content_rewrite_test_before.go",
+        "testdata/update_multi_commit/entry_after.go",
+        "testdata/update_multi_commit/entry_before.go",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
@@ -564,6 +572,8 @@ py_test(
     data = [
         "//src/blare:blare",
         "//tests/fixtures/claude-sdk/update-no-impact:scenario.jsonl",
+        "testdata/update_no_impact/api_integration_test_after.go",
+        "testdata/update_no_impact/api_integration_test_before.go",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
