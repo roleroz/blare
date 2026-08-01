@@ -216,8 +216,20 @@ entries, clean, no amendments) against `~/external_git/miniflux_v2`. ~~analyze r
 one entry changed (R16 re-analysis)~~ — T4.1 replaced T2.5's hand-authored instance at
 `tests/fixtures/claude-sdk/analyze-reanalysis-update/scenario.jsonl` with a real capture: a
 genuinely messy re-analysis (duplicated work, self-diagnosis via `.blare/`, a 3-phase
-`amend_proposal` escalation, converged correctly). The load-seeded-repair capture below is
-also real.
+`amend_proposal` escalation, converged correctly). ~~auth-failure handshake shape (R12)~~ —
+T4.1 replaced T2.2's hand-authored instance at
+`tests/fixtures/claude-sdk/auth-required/scenario.jsonl` with a real capture (unchanged
+shape). ~~update-happy-path~~ — T4.1 replaced T3.1's hand-authored instance at
+`tests/fixtures/claude-sdk/update-happy-path/scenario.jsonl` with a real capture: a single
+real miniflux_v2 commit (a defensive `migrations.go` fix), correctly concluded `no_impact`.
+The load-seeded-repair capture below is also real.
+
+T4.1's live testing also found and fixed a real bug (2026-08-01): `_LiveSDKClient.send()`
+only forwarded an event's `text` field, silently dropping `delta_files`/`patch_text` on
+`triage` events — every diff-mode triage was showing the live model *zero* real diff
+content despite `_TRIAGE_MESSAGE` saying "review... (above)". Fixed via
+`_fold_triage_delta_into_query`, scoped to the live client only (the recorded/replayed wire
+event's own `text` field is untouched, so no existing fixture needed re-recording).
 
 - analyze re-run, unchanged conclusions (R16 re-analysis noop) — T2.5 hand-authored a
   provisional instance at `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl`;
@@ -225,13 +237,11 @@ also real.
   and none converged to a genuine zero-diff (a real re-analysis has no way to learn prior
   analysis exists except its own initiative; the phase prompts never mention it). A
   release-suite capture still supersedes it once that's resolved.
-- update with an affected subset of phases — T3.1 hand-authored provisional instances at
-  `tests/fixtures/claude-sdk/update-happy-path/scenario.jsonl` and
-  `update-multi-commit/scenario.jsonl` (R8's multi-commit delta), now carrying real diff
+- update with a multi-commit delta (R8) — T3.1 hand-authored a provisional instance at
+  `tests/fixtures/claude-sdk/update-multi-commit/scenario.jsonl`, now carrying real diff
   content in `patch_text` (T4.4 fixed the gap that previously left it hardcoded `""`); still
-  unverified — a live capture is what would replace them, and per the user's 2026-07-31
-  instruction T4.1 doesn't run again until the checkpoint-wait/gate-timing concern from its
-  first run is addressed (decisions.md).
+  unverified — a live capture (T4.1's continuation, scaffolding already in place at
+  `tests/release/test_capture_update_multi_commit.py`) is what would replace it.
 - update no-impact conclusion (R18) — T3.1 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; T3.2 hand-authored its
   chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`, both now carrying
@@ -262,11 +272,6 @@ also real.
   at `tests/fixtures/claude-sdk/update-load-seeded-repair/scenario.jsonl`. Unaffected by the
   `patch_text=""` gap above — its behavior is orchestrator-driven (a hand-seeded R18
   violation), not diff-content-driven.
-- auth-failure handshake shape (R12) — captured by a dedicated logged-out release
-  scenario: the suite runs `blare` once with a scratch `HOME` carrying no credentials.
-  T2.2 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/auth-required/scenario.jsonl` for its R12 refusal e2e test;
-  a release-suite capture still supersedes it
 - progress feedback (R25) — a slow phase 1 turn with scripted filesystem-read
   `"activity"` events (each carrying a real `delay_before`) ahead of the ordinary
   `propose_edits` round trip, giving the e2e test real wall-clock time to observe
