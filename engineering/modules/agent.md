@@ -227,8 +227,12 @@ real miniflux_v2 commit (a defensive `migrations.go` fix), correctly concluded `
 3-commit range across four files, named in one triage call as R8 requires, concluded
 `no_impact`. ~~update-no-impact~~ — T4.1 replaced T3.1's hand-authored instance at
 `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl` with a real capture: a
-single-commit, test-only delta correctly recognized as having no production impact. The
-load-seeded-repair capture below is also real.
+single-commit, test-only delta correctly recognized as having no production impact.
+~~update-no-impact-redirect~~ — T4.1 replaced T3.2's hand-authored instance at
+`tests/fixtures/claude-sdk/update-no-impact-redirect/scenario.jsonl` with a real capture: a
+docs-only delta's `no_impact` conclusion, withdrawn by a directive chat redirect into phase
+2, where the model added an excluded, non-alertable failure mode. The load-seeded-repair
+capture below is also real.
 
 T4.1's live testing also found and fixed a real bug (2026-08-01): `_LiveSDKClient.send()`
 only forwarded an event's `text` field, silently dropping `delta_files`/`patch_text` on
@@ -243,15 +247,21 @@ event's own `text` field is untouched, so no existing fixture needed re-recordin
   and none converged to a genuine zero-diff (a real re-analysis has no way to learn prior
   analysis exists except its own initiative; the phase prompts never mention it). A
   release-suite capture still supersedes it once that's resolved.
-- update no-impact conclusion (R18), chat-redirected variant — T3.2 hand-authored a
-  provisional instance at `update-no-impact-redirect/scenario.jsonl`, now carrying real
-  `patch_text` (T4.4); still unverified — a live capture (T4.1's continuation) is what would
-  replace it. (The plain, non-redirected `update-no-impact` scenario is captured for real —
-  see the top of this section.)
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
   a behind-position phase — T3.2 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`, now carrying real
-  `patch_text` (T4.4); still unverified, same reason as above.
+  `patch_text` (T4.4); still unverified. T4.1's continuation tried twice against real
+  miniflux_v2 ranges without producing this shape: a broad six-commit range spiralled into a
+  38-minute, 60-round repair loop that never reached a final confirmation (the model's own
+  edits kept re-tripping the invariant gate across an unusually rich delta — the catalog
+  itself had zero semantic violations once checked offline, so this wasn't a stuck or
+  corrupted run); a narrower five-commit range with a chat nudge converged cleanly in under
+  two minutes, but the model's triage had already concluded `no_impact` and it explicitly
+  stood by that after genuine re-examination — no phase ever opened.
+  `tests/release/test_capture_update_dynamic_expansion.py` now hard-fails rather than
+  finalizing unless a real run actually opens more than one distinct phase, so a future
+  attempt (a different, better-chosen delta) can't silently corrupt the fixture with the
+  wrong shape.
 - checkpoint chat that alters results (R2) — T2.3 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/analyze-checkpoint-chat/scenario.jsonl`; a release-suite
   capture still supersedes it
