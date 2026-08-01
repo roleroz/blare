@@ -381,3 +381,18 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   `_repair_residual_violations` — this specifically exercises that the counter advances on
   that path too) completes with no prompt ever offered and the bell character present in the
   output. Traces: R26.
+- [ ] **T4.6 consolidated progress rendering**: `cli`'s `progress` (R25) stops appending one
+  line per tick — a `(label, last_activity)` key change finalizes the previous line
+  permanently and starts a new one; on a TTY the current key's line updates in place
+  (`\r` + clear-to-end-of-line); non-TTY output writes one plain line per key, holding that
+  key's last-seen elapsed time, with no control characters. `elapsed_seconds == 0.0` (the
+  ticker's own fixed first-tick invariant) is *always* a key change, even when
+  `(label, last_activity)` repeats — otherwise two separate driving calls with no tool call
+  in either (e.g. consecutive repair rounds) would merge into one line with elapsed time
+  running backwards. Every other stream-writing method finalizes a pending progress line
+  before writing its own content. Discovered via live testing: a slow phase produced dozens
+  of near-identical per-second lines, noise rather than signal. No spec/architecture change —
+  confined to `cli.md`'s rendering detail. e2e: the existing `test_progress_feedback`
+  fixture's multi-tick, multi-activity scenario now asserts a small, fixed number of
+  permanent lines (one per state reached) rather than one per tick, each holding that
+  state's final elapsed time.

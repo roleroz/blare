@@ -10,7 +10,10 @@ exact reserved words `approve` / `abort`, anything else is chat) is settled and 
 2026-07-31) — periodic status rendering during a driving call. See Interface and Rendering
 rules. `parse_args` gained `--unattended` (R26, added 2026-07-31); `TerminalPresenter` gained
 an `unattended` constructor flag changing every reply-pending method's behavior, plus a
-completion bell. See Interface, Error handling, and Rendering rules.
+completion bell. See Interface, Error handling, and Rendering rules. `progress` now
+consolidates same-key ticks instead of appending one line per tick (T4.6, added
+2026-07-31) — discovered via live testing: a slow phase produced dozens of near-identical
+per-second lines. See Interface, Error handling, and Rendering rules.
 
 ## Responsibility
 
@@ -68,14 +71,48 @@ and needs no awareness that nobody actually typed it.
 `notice` renders one informational line outside any view (a reclaimed
 stale lock, a phase opening) — plain, no `→ ` prefix; that prefix marks results and next
 actions, which a notice is neither.
-`progress` (R25) renders one status line while an agent-driving call is in flight —
-`label` names the active phase or operation (e.g. `"phase 3 — metric coverage"`,
-`"triage"`), `elapsed_seconds` is time since the call began, and `last_activity` is the
-most recent tool call's name, rendered as `waiting` when `None` (no tool call has arrived
-yet). It takes no reply and never blocks: the orchestrator calls it from its own ticker,
-off the thread draining the turn, purely to inform — a broken stream here is swallowed
-like `notice`, never mapped to `Abort` the way a reply-pending view is, since no reply was
-ever expected.
+`progress` (R25) renders status while an agent-driving call is in flight — `label` names the
+active phase or operation (e.g. `"phase 3 — metric coverage"`, `"triage"`), `elapsed_seconds`
+is time since the call began, and `last_activity` is the most recent tool call's name,
+rendered as `waiting` when `None` (no tool call has arrived yet). `(label, last_activity)`
+is this call's *key*; consecutive calls sharing a key are the same ongoing state (elapsed
+time is the only thing changing), and a key change means the state itself changed (a new
+phase, or the model moved on to a different tool) — **except** `elapsed_seconds == 0.0` is
+*always* a key change regardless of whether `(label, last_activity)` repeats: the ticker's
+own invariant (orchestrator.md: "the first tick is always emitted at exactly `elapsed=0.0`")
+is what marks a fresh driving call starting, and two separate calls can share an identical
+key with nothing in between them — repeated repair rounds each driven by `_drive(...,
+"repair", ...)` with no tool call arriving before either ends both render `("repair", None)`
+— so without this rule a second round's first tick would be read as a continuation of the
+first round's *last* tick, silently merging two distinct rounds into one line whose elapsed
+time then runs backwards. Because the ticker (orchestrator.md) fires on a short interval
+regardless of how long a state lasts, most calls otherwise share a key with the one before —
+one line per second of "system map, waiting" during a slow turn (2026-07-31's timing
+analysis) reads as noise, not signal, in a way a single line updating in place, plus one
+permanent line per state actually reached, does not (added 2026-07-31, T4.6 — refining the
+"no motion beyond appearing" reading below):
+- **TTY**: a same-key call rewrites the current line in place (`\r` then clear-to-end-of-line,
+  then the new content, no trailing newline — the terminal shows one line, its elapsed time
+  ticking). A key change first finalizes the *previous* key's line — a bare `\n`, since its
+  last-rendered content is already exactly right — before the new key's content is written
+  the same way. The very last key of a call is finalized by whatever the next presenter call
+  is (any other method — `_finalize_progress_line`, Stream I/O), never by `progress` itself,
+  since it cannot know it was the last tick until something else happens next.
+- **Non-TTY** (unattended output redirected to a file, e.g.): a same-key call writes nothing
+  — control sequences in a plain file are noise, not a redraw anyone will see live — and only
+  updates an internal buffer holding that key's latest content. A key change, or the next
+  finalize, commits exactly one plain line (no control characters) for the key that just
+  ended, holding its *last* elapsed time, not its first. TTY and non-TTY therefore agree on
+  what ends up permanently visible — one line per state reached, each showing that state's
+  final elapsed time — differing only in whether a live in-place preview exists while a state
+  is still ongoing.
+
+It takes no reply and never blocks: the orchestrator calls it from its own ticker, off the
+thread draining the turn, purely to inform — a broken stream here is swallowed like `notice`,
+never mapped to `Abort` the way a reply-pending view is, since no reply was ever expected.
+Every other stream-writing method (Stream I/O) finalizes a pending progress line — if one is
+open — before writing its own content, so a checkpoint, notice, or summary can never land
+mid-line or get overwritten by a later progress tick.
 `show_chat_reply` is the chat loop's continuation: after a `Chat` reply, the orchestrator
 routes the text to the agent and passes the response here together with the kind of prompt
 in progress (`PromptKind`: checkpoint, no-impact, amendment, rejectable amendment). It
@@ -118,9 +155,13 @@ run failures, an overlap it tolerates because a usage error occurs before any ru
   (failure mode, coverage, gap, breach, recommendation).
 - Progress lines (R25) start `· ` — distinct from both `→ ` (results) and `$ ` (prompts),
   since a progress line is neither: `· phase 3 — metric coverage (12s, propose_edits)`, or
-  `(12s, waiting)` before any tool call has arrived. No color, no motion beyond appearing —
-  brand's "nothing loops, nothing pulses idly" (§7) rules out a spinner or cursor tricks;
-  each tick is one plain appended line.
+  `(12s, waiting)` before any tool call has arrived. No color. On a TTY, the *current* state's
+  line updates in place (T4.6, 2026-07-31: this refines the original "no motion beyond
+  appearing" reading below) — this is real, non-decorative information (elapsed time, the
+  model's actual activity), not the idle-pulsing brand's §7 rules out; every *previous* state
+  the run passed through stays as its own permanent line, so the log still reads as a
+  sequence of what happened, never overwritten. Non-TTY output never redraws — one plain line
+  per state, no control characters.
 - The unattended completion bell (R26) is the single ASCII BEL byte (`\a`, `0x07`) written
   to stdout by `main`, once, after `run()` returns — no text, no prefix, nothing else added
   to the summary/error rendering that already happens; terminals that honor BEL (most do)
@@ -160,7 +201,12 @@ line lost to a dead stdout is tolerable because the next reply-pending call conv
 dead stream to `Abort`, whereas raising from a fire-and-forget render would abort runs for
 a line nobody could read anyway — in particular a pipe break during `summary`,
 after the write, must not turn a completed run into a reported abort, and the exit code
-reflects the actual outcome. `main` catches nothing itself — exit codes are the
+reflects the actual outcome. `_finalize_progress_line` (T4.6) — called at the start of every
+other stream-writing method, reply-pending or void alike — is itself void: a write failure
+while finalizing a pending progress line is swallowed the same way, never surfacing as
+`Abort` even from a reply-pending caller (the caller's own subsequent write is what
+determines whether *it* returns `Abort`, unaffected by whether finalizing succeeded).
+`main` catches nothing itself — exit codes are the
 orchestrator's; the argparse-decided exits are the exceptions (usage errors exit 2,
 `--help` and `--version` exit 0). Any stream error on a reply-pending read — EOF,
 `BrokenPipeError`, or an `OSError` such as EIO when the controlling terminal dies —
@@ -223,9 +269,35 @@ Contract tests, one per behaviour:
   orchestrator's pre-run-log traceback channel) the detail renders beneath, on stderr.
 - `is_interactive` false exactly when stdin is not a TTY (R22's criterion); a non-TTY
   stdout alone leaves it true and only disables color.
-- `progress` rendering: `· ` prefix, the label verbatim, elapsed seconds, and
-  `last_activity` when set; `last_activity=None` renders `waiting` in its place —
-  byte-exact assertions for a fixed set of arguments.
+- `progress` rendering (single call, TTY stdout): `· ` prefix, the label verbatim, elapsed
+  seconds, and `last_activity` when set; `last_activity=None` renders `waiting` in its
+  place — byte-exact assertion on the in-place-update bytes (`\r` + clear-to-end-of-line +
+  content, no trailing newline) for a fixed set of arguments.
+- `progress` consolidation (T4.6), TTY stdout: two consecutive calls with the same
+  `(label, last_activity)` key and `elapsed_seconds > 0` — only elapsed time differs —
+  produce a single in-place update, asserted byte-exact on the stream; a third call with a
+  different `last_activity` first finalizes the prior line with a bare `\n` (its
+  already-rendered content unchanged), then writes the new key's content the same in-place
+  way; a call with a different `label` (a new phase) finalizes and starts fresh identically.
+  A call with `elapsed_seconds == 0.0` *always* finalizes and starts fresh, even when
+  `(label, last_activity)` is identical to the immediately preceding call — the regression
+  test for two consecutive `"repair"`/`None` rounds (no tool call in either) that must not
+  merge into one line with elapsed time running backwards. Each of
+  `present_checkpoint`/`present_amendment`/`present_no_impact`/`show_chat_reply` (both the
+  `prompt=None` and prompting branches)/`notice`/`error`/`summary`, called while a progress
+  line is open, finalizes it first — one test per method, asserted on the exact byte
+  sequence: the pending line's `\n`, then that method's own content, never interleaved or
+  missing the boundary.
+- `progress` consolidation, non-TTY stdout: consecutive same-key calls (`elapsed_seconds >
+  0`) write nothing at all; a key change — including the `elapsed_seconds == 0.0` case above
+  — or the next finalize, writes exactly one plain line (no `\r` or escape sequences) holding
+  the *superseded* key's last-seen elapsed time and activity, not its first. A run whose
+  every progress call shares one key end to end still produces exactly one committed line
+  once something finalizes it. Scope note (not a test, a documented boundary): this means a
+  same-key state produces zero output for its whole duration until superseded — acceptable
+  because non-TTY output (chiefly `--unattended`, T4.5) is specified as reviewed after the
+  run ends, never tailed live; live-tailing a redirected run is not a use case this design
+  covers.
 - `--unattended` parses on both `analyze` and `update`, defaulting false; `TerminalPresenter
   (unattended=True)`'s `present_checkpoint`/`present_amendment`/`present_no_impact` render
   the view content in full (byte-exact assertions matching the interactive case's view
@@ -251,3 +323,7 @@ Failure-mode tests, dependency = the terminal streams:
   void-class rule — this test lives here because its trigger is the stream failing).
 - stdout raising BrokenPipeError inside `progress` → swallowed, no traceback, no effect on
   the run (same void-class rule as `notice`).
+- stdout raising BrokenPipeError inside `_finalize_progress_line` (T4.6), triggered from
+  within a reply-pending method (`present_checkpoint`) → the finalize failure is swallowed;
+  the method's own subsequent write still runs and its own success/failure (not the
+  finalize's) is what determines the reply.
