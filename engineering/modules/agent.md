@@ -222,7 +222,13 @@ T4.1 replaced T2.2's hand-authored instance at
 shape). ~~update-happy-path~~ — T4.1 replaced T3.1's hand-authored instance at
 `tests/fixtures/claude-sdk/update-happy-path/scenario.jsonl` with a real capture: a single
 real miniflux_v2 commit (a defensive `migrations.go` fix), correctly concluded `no_impact`.
-The load-seeded-repair capture below is also real.
+~~update-multi-commit (R8)~~ — T4.1 replaced T3.1's hand-authored instance at
+`tests/fixtures/claude-sdk/update-multi-commit/scenario.jsonl` with a real capture: a
+3-commit range across four files, named in one triage call as R8 requires, concluded
+`no_impact`. ~~update-no-impact~~ — T4.1 replaced T3.1's hand-authored instance at
+`tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl` with a real capture: a
+single-commit, test-only delta correctly recognized as having no production impact. The
+load-seeded-repair capture below is also real.
 
 T4.1's live testing also found and fixed a real bug (2026-08-01): `_LiveSDKClient.send()`
 only forwarded an event's `text` field, silently dropping `delta_files`/`patch_text` on
@@ -237,15 +243,11 @@ event's own `text` field is untouched, so no existing fixture needed re-recordin
   and none converged to a genuine zero-diff (a real re-analysis has no way to learn prior
   analysis exists except its own initiative; the phase prompts never mention it). A
   release-suite capture still supersedes it once that's resolved.
-- update with a multi-commit delta (R8) — T3.1 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/update-multi-commit/scenario.jsonl`, now carrying real diff
-  content in `patch_text` (T4.4 fixed the gap that previously left it hardcoded `""`); still
-  unverified — a live capture (T4.1's continuation, scaffolding already in place at
-  `tests/release/test_capture_update_multi_commit.py`) is what would replace it.
-- update no-impact conclusion (R18) — T3.1 hand-authored a provisional instance at
-  `tests/fixtures/claude-sdk/update-no-impact/scenario.jsonl`; T3.2 hand-authored its
-  chat-redirected variant at `update-no-impact-redirect/scenario.jsonl`, both now carrying
-  real `patch_text` (T4.4); still unverified, same reason as above.
+- update no-impact conclusion (R18), chat-redirected variant — T3.2 hand-authored a
+  provisional instance at `update-no-impact-redirect/scenario.jsonl`, now carrying real
+  `patch_text` (T4.4); still unverified — a live capture (T4.1's continuation) is what would
+  replace it. (The plain, non-redirected `update-no-impact` scenario is captured for real —
+  see the top of this section.)
 - update dynamic expansion: a revised `affected_verdict` opening a phase mid-run, including
   a behind-position phase — T3.2 hand-authored a provisional instance at
   `tests/fixtures/claude-sdk/update-dynamic-expansion/scenario.jsonl`, now carrying real

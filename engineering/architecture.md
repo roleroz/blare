@@ -317,21 +317,21 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T4 — Release readiness
 
-- [ ] **T4.1 release suite** (in progress — 5 of 16 scenarios captured, driver built): the
+- [ ] **T4.1 release suite** (in progress — 7 of 16 scenarios captured, driver built): the
   scripted PTY scenarios against `~/external_git/miniflux_v2` in record mode — one per entry
   on agent.md's provisional list, which is the binding enumeration; captured fixtures
   replace the provisional set, and emptying that list is this task's definition of done, per
   the global rule that it gates the first release. Real captures landed: analyze-happy-path,
-  analyze-reanalysis-update, update-load-seeded-repair, auth-required, update-happy-path (see
-  agent.md). T4.4 closed the `patch_text=""` gap that blocked update-mode scenarios from
-  seeing real diff content; T4.1's own continuation then found and fixed a second, deeper
-  bug in the same area — `_LiveSDKClient.send()` never actually folded `patch_text`/
-  `delta_files` into the text sent to the live model at all (agent.md) — confirmed by the
-  first update-happy-path attempt visibly hallucinating an unrelated history before the fix.
-  T4.5/T4.6 addressed the checkpoint-wait/gate-timing concern that had paused this task
-  (decisions.md); the user has since re-authorized it to continue. Remaining: update-multi
-  -commit, update-dynamic-expansion, update-no-impact, update-no-impact-redirect (scaffolding
-  in place, not yet run live), analyze-reanalysis-noop (3 earlier attempts didn't converge —
+  analyze-reanalysis-update, update-load-seeded-repair, auth-required, update-happy-path,
+  update-multi-commit, update-no-impact (see agent.md). T4.4 closed the `patch_text=""` gap
+  that blocked update-mode scenarios from seeing real diff content; T4.1's own continuation
+  then found and fixed a second, deeper bug in the same area — `_LiveSDKClient.send()` never
+  actually folded `patch_text`/`delta_files` into the text sent to the live model at all
+  (agent.md) — confirmed by the first update-happy-path attempt visibly hallucinating an
+  unrelated history before the fix. T4.5/T4.6 addressed the checkpoint-wait/gate-timing
+  concern that had paused this task (decisions.md); the user has since re-authorized it to
+  continue. Remaining: update-dynamic-expansion, update-no-impact-redirect (scaffolding in
+  place, not yet run live), analyze-reanalysis-noop (3 earlier attempts didn't converge —
   needs a different approach, not necessarily a code fix), and amendment-system,
   amendment-agent (×2), amendment-cascade (×2), analyze-checkpoint-chat (scaffolding in
   place, not yet attempted).
