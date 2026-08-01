@@ -245,36 +245,40 @@ def capture_update_no_impact_redirect(
 _ORPHAN_ID = "fm-orphan-injected"
 
 
-def inject_unmapped_failure_mode(blare_root: Path) -> None:
+def inject_unmapped_failure_mode(
+    blare_root: Path, fm_id: str = _ORPHAN_ID, origin_note: str = "update-load-seeded-repair"
+) -> None:
     """Hand-append a failure mode with `coverage_status: alertable` but no alert
     coverage -- sanctioned by spec ("hand-editing the canonical YAML is
-    supported"), seeding R18's load-time `unmapped_failure_mode` violation for a
-    real capture of the proactive repair path. Idempotent per file (each of the
-    two appends below is independently guarded), so a re-run after a prior run
-    was interrupted between the two writes still completes the missing one
-    rather than silently leaving `coverage.yaml` without its matching entry."""
+    supported"), seeding a semantic violation for a real capture of a repair
+    path. `fm_id`/`origin_note` let distinct scenarios (the update-mode
+    preflight repair, and the analyze-mode approval-gate system amendment)
+    inject their own independently-idempotent entry into the same real
+    `.blare/` without colliding or re-triggering each other's already-resolved
+    injection. Idempotent per file (each of the two appends below is
+    independently guarded), so a re-run after a prior run was interrupted
+    between the two writes still completes the missing one rather than
+    silently leaving `coverage.yaml` without its matching entry."""
     fm_path = blare_root / "failure-modes.yaml"
-    if _ORPHAN_ID not in fm_path.read_text():
+    if fm_id not in fm_path.read_text():
         with fm_path.open("a", encoding="utf-8") as handle:
             handle.write(
-                f"- id: {_ORPHAN_ID}\n"
-                "  title: hand-injected unmapped failure mode (T4.1"
-                " update-load-seeded-repair capture)\n"
+                f"- id: {fm_id}\n"
+                f"  title: hand-injected unmapped failure mode (T4.1 {origin_note} capture)\n"
                 "  description: Deliberately hand-added with coverage_status alertable but"
                 " no alert\n"
-                "    coverage, to seed R18's load-time semantic violation for a real"
-                " release-suite\n"
-                "    capture of the proactive repair path.\n"
+                "    coverage, to seed a semantic violation for a real release-suite\n"
+                "    capture of a repair path.\n"
                 "  severity: warning\n"
                 "  user_visible: false\n"
                 "  caused_by: []\n"
                 "  coverage_status: alertable\n"
             )
     cov_path = blare_root / "coverage.yaml"
-    if _ORPHAN_ID not in cov_path.read_text():
+    if fm_id not in cov_path.read_text():
         with cov_path.open("a", encoding="utf-8") as handle:
             handle.write(
-                f"- failure_mode_id: {_ORPHAN_ID}\n"
+                f"- failure_mode_id: {fm_id}\n"
                 "  detecting_metric_ids: []\n"
                 "  metric_recommendation_ids: []\n"
                 "  alert_ids: []\n"

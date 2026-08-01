@@ -537,6 +537,8 @@ py_test(
     data = [
         "//src/blare:blare",
         "//tests/fixtures/claude-sdk/update-happy-path:scenario.jsonl",
+        "testdata/update_happy_path/migrations_after.go",
+        "testdata/update_happy_path/migrations_before.go",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",

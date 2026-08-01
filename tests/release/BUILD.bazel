@@ -6,21 +6,13 @@ load("@rules_python//python:py_test.bzl", "py_test")
 # live-tagged py_test targets that `bazel test --test_tag_filters=live //...`
 # discovers are declared below as each scenario's own capture is finalized.
 #
-# Not every entry on agent.md's provisional-fixtures list has a target here yet:
-# a real live analyze-mode re-analysis run (analyze-reanalysis-noop's intended
-# scenario) has no way to learn a prior analysis exists except by its own
-# initiative -- the phase prompts never mention it -- so it reliably produces
-# noisy duplicate-then-reconcile content rather than a clean no-op after three
-# separate attempts; and orchestrator.py's `patch_text=""` (a documented,
-# never-closed T2.2/T3.1 gap -- gitrepo.md's interface exposes name-status only,
-# never full diff text) means every update-mode scenario needing the model to
-# judge *real diff content* (update-happy-path, update-multi-commit,
-# update-dynamic-expansion, and a genuine update-no-impact/-redirect) currently
-# gets an empty patch body, which a real live run correctly notices and
-# complains about. Both are reported findings for the parent session, not
-# something this task routes around; update-load-seeded-repair below is
-# unaffected since its behaviour is orchestrator-driven (a hand-seeded R18
-# violation), not diff-content-driven.
+# analyze-reanalysis-noop still has no way to learn a prior analysis exists
+# except by its own initiative -- the phase prompts never mention it -- and a
+# first attempt (no hint) reliably produced noisy duplicate-then-reconcile
+# content instead of a clean no-op; its own py_test below uses a different
+# strategy (an explicit chat hint) and only finalizes the capture if the real
+# run actually converges to a genuine zero-diff, per the global rule against
+# forcing a scenario's shape.
 py_library(
     name = "release_lib",
     srcs = [
@@ -52,6 +44,12 @@ py_test(
     # live target shares mutable state (the same real checkout's .blare/) and
     # must not run concurrently with another one.
     data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
     tags = ["exclusive", "live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
@@ -71,6 +69,12 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
     tags = ["exclusive", "live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
@@ -90,6 +94,337 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_update_happy_path",
+    srcs = [
+        "test_capture_update_happy_path.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_update_happy_path.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_update_multi_commit",
+    srcs = [
+        "test_capture_update_multi_commit.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_update_multi_commit.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_update_no_impact",
+    srcs = [
+        "test_capture_update_no_impact.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_update_no_impact.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_update_no_impact_redirect",
+    srcs = [
+        "test_capture_update_no_impact_redirect.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_update_no_impact_redirect.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_update_dynamic_expansion",
+    srcs = [
+        "test_capture_update_dynamic_expansion.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_update_dynamic_expansion.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_analyze_reanalysis_noop",
+    srcs = [
+        "test_capture_analyze_reanalysis_noop.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_analyze_reanalysis_noop.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_analyze_checkpoint_chat",
+    srcs = [
+        "test_capture_analyze_checkpoint_chat.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_analyze_checkpoint_chat.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_amendment_agent_approved",
+    srcs = [
+        "test_capture_amendment_agent_approved.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_amendment_agent_approved.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_amendment_agent_rejected",
+    srcs = [
+        "test_capture_amendment_agent_rejected.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_amendment_agent_rejected.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_amendment_cascade_approved",
+    srcs = [
+        "test_capture_amendment_cascade_approved.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_amendment_cascade_approved.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_amendment_cascade_rejected",
+    srcs = [
+        "test_capture_amendment_cascade_rejected.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_amendment_cascade_rejected.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_amendment_system",
+    srcs = [
+        "test_capture_amendment_system.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_amendment_system.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
+    tags = ["exclusive", "live", "local", "no-sandbox"],
+    timeout = "eternal",
+    deps = [
+        ":release_lib",
+        "@pip//pytest_bazel",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_test(
+    name = "test_capture_auth_required",
+    srcs = [
+        "test_capture_auth_required.py",
+        "//:pytest_main.py",
+    ],
+    args = ["$(location :test_capture_auth_required.py)"],
+    legacy_create_init = False,
+    main = "//:pytest_main.py",
+    data = ["//src/blare:blare"],
+    # env_inherit: every scenario in this package resolves the real checkout
+    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
+    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
+    # ["local", "no-sandbox"], which would silently point every capture at an
+    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
+    env_inherit = ["HOME"],
     tags = ["exclusive", "live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [

@@ -810,6 +810,8 @@ class _LiveSDKClient:
         text = event.get("text")
         if not isinstance(text, str):
             raise RuntimeError(f"live SDK client cannot send event with no text field: {event!r}")
+        if event.get("type") == "triage":
+            text = _fold_triage_delta_into_query(text, event)
         self._run_coro(self._start_turn(text))
 
     async def _start_turn(self, text: str) -> None:
@@ -1062,6 +1064,29 @@ _TRIAGE_REMINDER = (
     "Please call run_control with affected_verdict or no_impact before ending "
     "your turn."
 )
+
+
+def _fold_triage_delta_into_query(text: str, event: dict[str, object]) -> str:
+    """`_TRIAGE_MESSAGE` says "review the effective delta's file list and patch
+    text (above)", but `delta_files`/`patch_text` travel as separate dict keys on
+    the `triage` event -- kept apart from `text` so the recorded/replayed wire
+    event can assert on them structurally (agent.md's test plan), the same way
+    every other `_send()` event already carries its own structured fields
+    alongside a self-contained `text`. Only the live client actually has to turn
+    those keys into words a model reads: `_ReplayingSDKClient` never inspects
+    what `_LiveSDKClient` does with them, so this folding is invisible to every
+    replayed fixture. Discovered missing during T4.1's live release run: the
+    delta content never reached the real model at all, which -- unable to see
+    any patch text -- read the live repository itself and reasoned about
+    whatever range it inferred from git history rather than the range Blare
+    actually computed.
+    """
+    delta_files = event.get("delta_files")
+    patch_text = event.get("patch_text")
+    if not isinstance(delta_files, list) or not isinstance(patch_text, str):
+        return text
+    files_list = "\n".join(f"- {f}" for f in delta_files) if delta_files else "(no files changed)"
+    return f"Changed files:\n{files_list}\n\nPatch:\n{patch_text}\n\n{text}"
 
 
 # ---- tool-payload parsing (malformed input -> soft error verdict, never a raise) --

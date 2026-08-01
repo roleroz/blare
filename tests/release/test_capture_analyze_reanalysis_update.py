@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from blare import artifacts
+import blare.artifacts as artifacts
 from blare.model import RunMode
 from tests.release import capture
 from tests.release import miniflux_repo as mr

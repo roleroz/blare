@@ -748,6 +748,71 @@ def test_failure_live_client_send_without_text_field_raises() -> None:
         client.close()
 
 
+class _FakeQueryCapturingClient:
+    """Stands in for `claude_agent_sdk.ClaudeSDKClient` to capture the exact text
+    `_LiveSDKClient.send()` actually hands to `query()` -- as opposed to what
+    `AgentSession._send()` records into the transcript/fixture event, which is a
+    separate dict `_LiveSDKClient` never inspects for this purpose."""
+
+    def __init__(self) -> None:
+        self.queried_text: str | None = None
+
+    async def query(self, text: str) -> None:
+        self.queried_text = text
+
+    async def receive_response(self) -> AsyncIterator[object]:
+        return
+        yield  # pragma: no cover -- makes this an async generator; never reached
+
+
+def test_contract_live_client_send_triage_folds_delta_content_into_the_query() -> None:
+    """A "triage" event's `delta_files`/`patch_text` -- carried as separate dict
+    keys alongside "text" so the recorded/replayed wire event can assert on them
+    structurally (agent.md's test plan) -- must still reach the live model
+    somehow: `_TRIAGE_MESSAGE` only says "review ... (above)", so `send()` must
+    fold the actual file list and patch text into the real query text itself.
+    Before this fix, `send()` forwarded only the static `text` field verbatim,
+    silently dropping the delta content the live model was supposed to see."""
+    client = _LiveSDKClient()
+    try:
+        fake = _FakeQueryCapturingClient()
+        client._client = fake  # type: ignore[assignment]  # noqa: SLF001
+
+        client.send(
+            {
+                "type": "triage",
+                "delta_files": ["internal/database/migrations.go"],
+                "patch_text": "diff --git a/x b/x\n+added line\n",
+                "text": "Diff-mode triage: review the effective delta's file list "
+                "and patch text (above) and decide which phase(s) need work.",
+            }
+        )
+
+        assert fake.queried_text is not None
+        assert "internal/database/migrations.go" in fake.queried_text
+        assert "diff --git a/x b/x" in fake.queried_text
+        assert "+added line" in fake.queried_text
+        assert "review the effective delta's file list" in fake.queried_text
+    finally:
+        client.close()
+
+
+def test_contract_live_client_send_non_triage_event_sends_text_unchanged() -> None:
+    """A non-"triage" event (e.g. an ordinary phase prompt) has no separate
+    delta_files/patch_text keys to fold in -- send() must forward its "text"
+    field byte-for-byte, exactly as before this fix."""
+    client = _LiveSDKClient()
+    try:
+        fake = _FakeQueryCapturingClient()
+        client._client = fake  # type: ignore[assignment]  # noqa: SLF001
+
+        client.send({"type": "phase_prompt", "phase": 1, "text": "phase 1 instructions"})
+
+        assert fake.queried_text == "phase 1 instructions"
+    finally:
+        client.close()
+
+
 def test_failure_live_client_receive_reraises_transport_error() -> None:
     """A background-task transport exception pushed as a `_transport_error`
     sentinel is re-raised verbatim by receive() -- caught by AgentSession's own

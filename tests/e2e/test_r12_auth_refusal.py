@@ -3,10 +3,9 @@ subscription login available, exits non-zero naming the login step.
 
 Needs a real TTY (R22 must pass before step 9's auth preflight can even be
 attempted), so this test drives `blare` through the PTY harness rather than a plain
-subprocess, replaying a hand-authored fixture whose handshake reports
-`auth_required` (`tests/fixtures/claude-sdk/auth-required/`, provisional --
-`engineering/modules/agent.md`'s provisional-fixtures list names the auth-failure
-handshake shape as one to capture for real in T4.1's release suite).
+subprocess, replaying `tests/fixtures/claude-sdk/auth-required/` -- a T4.1
+release-suite capture of the real SDK's handshake with a scratch, credential-less
+`HOME`, reporting `auth_required`.
 
 Traces `engineering/architecture.md`'s T2.2 scope: "Traces: R11, R12, R17, ...".
 """
