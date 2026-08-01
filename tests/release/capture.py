@@ -19,6 +19,7 @@ from pathlib import Path
 
 from tests.release import miniflux_repo as mr
 from tests.release.scenario_driver import (
+    PROMPT_PREFIX,
     Capture,
     approve_to_exit,
     approve_until,
@@ -222,6 +223,37 @@ def capture_update(scratch_root: Path, name: str, baseline_sha: str, target_sha:
         approve_to_exit(cap)
         exit_code, output = finish(cap)
     _report(name, exit_code, output)
+    return cap
+
+
+def capture_update_dynamic_expansion(
+    scratch_root: Path, baseline_sha: str, target_sha: str
+) -> Capture:
+    """`blare update` with a chat nudge at the very first checkpoint (whichever
+    phase triage actually names), asking the model to reconsider whether the
+    delta also touches other phases -- R18's dynamic expansion (a revised
+    `affected_verdict`, no amendment) is not otherwise scriptable from outside
+    a phase's own turn, the same reasoning `capture_amendment_agent`'s chat
+    nudge already relies on for organic, model-initiated mechanisms."""
+    repo = mr.MINIFLUX_ROOT
+    blare_root = mr.blare_root(repo)
+    set_analyzed_sha(blare_root, baseline_sha)
+    xdg, record = scratch_paths(scratch_root, "update-dynamic-expansion")
+    with mr.on_commit(repo, target_sha):
+        cap = start_recording(BLARE_BIN, ["update"], repo, record, xdg)
+        chat_at_marker(
+            cap,
+            PROMPT_PREFIX,
+            "before you approve -- given everything you've seen while working on "
+            "this delta, please double check whether it also requires revisiting "
+            "any other phase (system map, failure modes, metric coverage, or "
+            "alert recommendations) beyond what triage originally named; if so, "
+            "call run_control with a bare affected_verdict naming it now, before "
+            "finishing this phase",
+        )
+        approve_to_exit(cap)
+        exit_code, output = finish(cap)
+    _report("update-dynamic-expansion", exit_code, output)
     return cap
 
 

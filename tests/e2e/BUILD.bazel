@@ -649,6 +649,8 @@ py_test(
     data = [
         "//src/blare:blare",
         "//tests/fixtures/claude-sdk/update-no-impact-redirect:scenario.jsonl",
+        "testdata/update_no_impact_redirect/miniflux1_after.1",
+        "testdata/update_no_impact_redirect/miniflux1_before.1",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
