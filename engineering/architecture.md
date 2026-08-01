@@ -381,7 +381,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   `_repair_residual_violations` — this specifically exercises that the counter advances on
   that path too) completes with no prompt ever offered and the bell character present in the
   output. Traces: R26.
-- [ ] **T4.6 consolidated progress rendering**: `cli`'s `progress` (R25) stops appending one
+- [x] **T4.6 consolidated progress rendering**: `cli`'s `progress` (R25) stops appending one
   line per tick — a `(label, last_activity)` key change finalizes the previous line
   permanently and starts a new one; on a TTY the current key's line updates in place
   (`\r` + clear-to-end-of-line); non-TTY output writes one plain line per key, holding that
