@@ -13,7 +13,11 @@ agent's conclusion text, then the ordinary checkpoint prompt). T4.3 builds
 while a driving call is in flight. T4.5 builds `--unattended` (R26): `parse_args`'
 new flag, `TerminalPresenter`'s `unattended` constructor flag (every
 reply-pending method renders its view then returns `Approve()` immediately,
-never reading stdin), and `main`'s completion bell.
+never reading stdin), and `main`'s completion bell. T4.6 consolidates `progress`:
+same-key ticks update one line in place (TTY) or one buffered line (non-TTY)
+instead of appending a line per tick; every other stream-writing method
+finalizes a pending progress line first, via `_finalize_progress_line` folded
+into the three low-level write helpers.
 """
 
 from __future__ import annotations
@@ -170,6 +174,15 @@ class TerminalPresenter:
         self._stdout = stdout
         self._stderr = stderr
         self._unattended = unattended
+        # T4.6: the currently open progress "key" -- (label, activity), activity
+        # being last_activity or the literal "waiting" -- and the latest rendered
+        # content for it. `None` means no progress line is currently pending.
+        # `_progress_content` is read by `_finalize_progress_line`'s non-TTY
+        # branch (its last-seen content is what gets committed), and is always
+        # kept in sync with `_progress_key`: whenever the key is not None, the
+        # content is too.
+        self._progress_key: tuple[str, str] | None = None
+        self._progress_content: str | None = None
 
     # --- Checkpoint (T2.3) ----------------------------------------------------------
 
@@ -247,12 +260,66 @@ class TerminalPresenter:
         before any tool call has arrived. Void like `notice`: swallows a stream
         failure and never raises -- the orchestrator's ticker calls this off the
         thread draining the turn, purely to inform, and no reply was ever
-        expected here (cli.md's Error handling: "progress" is in the void class)."""
+        expected here (cli.md's Error handling: "progress" is in the void class).
+
+        T4.6 consolidation: `(label, activity)` is this call's *key*.
+        `elapsed_seconds == 0.0` is *always* a key change regardless of whether
+        the key repeats -- the ticker's own fixed-first-tick invariant marks a
+        fresh driving call starting, which is what stops two separate calls that
+        happen to share a key (e.g. two consecutive system-originated repair
+        rounds, both `("repair", None)`) from colliding into one line whose
+        elapsed time then runs backwards. A key change finalizes the previous
+        key's line first. Then: on a TTY, the current key's content is written
+        in place (`\\r` + clear-to-end-of-line, no trailing newline) whether or
+        not this call changed the key -- a same-key tick and a fresh key render
+        identically, differing only in whether finalization happened first. On
+        non-TTY, only the buffered content is updated here; nothing is written
+        by this method itself -- all non-TTY writes happen in
+        `_finalize_progress_line`, once a key is superseded."""
         activity = last_activity if last_activity is not None else _WAITING_ACTIVITY
-        self._write(
-            self._stdout,
-            f"{_PROGRESS_PREFIX}{label} ({int(elapsed_seconds)}s, {activity})",
-        )
+        key = (label, activity)
+        content = f"{_PROGRESS_PREFIX}{label} ({int(elapsed_seconds)}s, {activity})"
+        if elapsed_seconds == 0.0 or key != self._progress_key:
+            self._finalize_progress_line()
+            self._progress_key = key
+        self._progress_content = content
+        if self._isatty(self._stdout):
+            try:
+                self._stdout.write(f"\r\x1b[K{content}")
+                self._stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass
+
+    def _finalize_progress_line(self) -> None:
+        """T4.6: closes any currently open progress line before another
+        stream-writing method renders its own content, so a checkpoint, notice,
+        or summary can never land mid-line or get overwritten by a later
+        progress tick. On a TTY this is a bare `\\n` -- the line's content is
+        already correctly displayed from `progress`'s last in-place write. On
+        non-TTY, `progress` itself never wrote anything for the open key, so
+        this writes the buffered content in full, plus `\\n`. A no-op when no
+        progress line is open.
+
+        Void, like every other fire-and-forget render in this class: a write
+        failure here is swallowed and never raises, and -- critically -- never
+        surfaces as `Abort` even when called from a reply-pending method (via
+        the low-level write helpers below). That caller's own subsequent write
+        is what determines whether *it* returns `Abort`, unaffected by whether
+        finalizing succeeded (cli.md's Error handling)."""
+        if self._progress_key is None:
+            return
+        content = self._progress_content
+        self._progress_key = None
+        self._progress_content = None
+        try:
+            if self._isatty(self._stdout):
+                self._stdout.write("\n")
+            else:
+                assert content is not None, "a tracked progress key always has content"
+                self._stdout.write(content + "\n")
+            self._stdout.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     # --- Non-view methods -------------------------------------------------------------
 
@@ -284,10 +351,7 @@ class TerminalPresenter:
             self._write(self._stdout, f"{_RESULT_PREFIX}transcript: {s.transcript_path}")
 
     def is_interactive(self) -> bool:
-        try:
-            return self._stdin.isatty()
-        except (ValueError, OSError):
-            return False
+        return self._isatty(self._stdin)
 
     # --- Rendering helpers -------------------------------------------------------------
 
@@ -357,8 +421,15 @@ class TerminalPresenter:
     def _use_color(self) -> bool:
         if os.environ.get("NO_COLOR"):
             return False
+        return self._isatty(self._stdout)
+
+    def _isatty(self, stream: TextIO) -> bool:
+        """The `isatty()`-with-try/except pattern shared by `is_interactive`,
+        `_use_color`, and T4.6's `progress`/`_finalize_progress_line` TTY check
+        -- some stream implementations raise rather than returning False on a
+        closed or non-standard stream."""
         try:
-            return self._stdout.isatty()
+            return stream.isatty()
         except (ValueError, OSError):
             return False
 
@@ -368,6 +439,7 @@ class TerminalPresenter:
         # Void methods swallow stream failures rather than raise (cli.md's
         # error-handling rule): the run's outcome is already decided, and a
         # render crash on a dead stream must not corrupt it.
+        self._finalize_progress_line()
         try:
             stream.write(text + "\n")
             stream.flush()
@@ -377,6 +449,7 @@ class TerminalPresenter:
     def _write_lines(self, stream: TextIO, lines: list[str]) -> bool:
         """Like `_write`, but for a reply-pending render: reports success/failure
         instead of swallowing it, so the caller can map a broken stream to `Abort`."""
+        self._finalize_progress_line()
         try:
             for line in lines:
                 stream.write(line + "\n")
@@ -386,6 +459,7 @@ class TerminalPresenter:
             return False
 
     def _write_text(self, stream: TextIO, text: str) -> bool:
+        self._finalize_progress_line()
         try:
             stream.write(text + "\n")
             stream.flush()

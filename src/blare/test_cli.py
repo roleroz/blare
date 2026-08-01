@@ -227,25 +227,28 @@ def test_contract_notice_renders_plain_line_without_prefix() -> None:
 
 
 def test_contract_progress_renders_dot_prefix_label_elapsed_and_activity() -> None:
-    """progress() (R25) renders "· label (Ns, activity)", byte-exact for a fixed
-    set of arguments -- distinct from both "→ " (results) and "$ " (prompts)."""
-    stdout = io.StringIO()
+    """progress() (R25) renders "· label (Ns, activity)" on a TTY stream, byte-exact
+    for a fixed set of arguments (single call): `\\r` + clear-to-end-of-line +
+    content, no trailing newline (T4.6's in-place-update contract) -- distinct from
+    both "→ " (results) and "$ " (prompts)."""
+    stdout = _TTYStream()
     presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
 
     presenter.progress("phase 3 — metric coverage", 12.0, "propose_edits")
 
-    assert stdout.getvalue() == "· phase 3 — metric coverage (12s, propose_edits)\n"
+    assert stdout.getvalue() == "\r\x1b[K· phase 3 — metric coverage (12s, propose_edits)"
 
 
 def test_contract_progress_renders_waiting_when_last_activity_is_none() -> None:
     """progress() renders "waiting" in place of last_activity when it is None --
-    no tool call has arrived yet (cli.md's Rendering rules)."""
-    stdout = io.StringIO()
+    no tool call has arrived yet (cli.md's Rendering rules) -- same TTY in-place
+    byte-exact contract as above."""
+    stdout = _TTYStream()
     presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
 
     presenter.progress("triage", 3.0, None)
 
-    assert stdout.getvalue() == "· triage (3s, waiting)\n"
+    assert stdout.getvalue() == "\r\x1b[K· triage (3s, waiting)"
 
 
 def test_contract_is_interactive_reflects_stdin_isatty() -> None:
@@ -265,6 +268,48 @@ class _BrokenPipeStream(io.StringIO):
 
     def write(self, s: str) -> int:
         raise BrokenPipeError
+
+
+class _TTYStream(io.StringIO):
+    """An in-memory stream that reports itself as a TTY -- T4.6's in-place
+    progress redraw and severity coloring both branch on `isatty()`."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class _BrokenPipeTTYStream(io.StringIO):
+    """A TTY stream whose write always raises BrokenPipeError -- isolates a
+    write failure on the path that actually attempts a write (T4.6: `progress`
+    only writes immediately on a TTY; a non-TTY stream never attempts a write
+    from a single call, so it can never observe this failure)."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        raise BrokenPipeError
+
+
+class _NthWriteFailsStream(io.StringIO):
+    """A TTY stream whose Nth `write()` call (1-indexed) raises BrokenPipeError;
+    every other call behaves normally. Isolates a single write in a sequence --
+    e.g. `_finalize_progress_line`'s own write -- so a test can assert its
+    failure is swallowed without the surrounding writes also failing."""
+
+    def __init__(self, fail_at: int) -> None:
+        super().__init__()
+        self._count = 0
+        self._fail_at = fail_at
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        self._count += 1
+        if self._count == self._fail_at:
+            raise BrokenPipeError
+        return super().write(s)
 
 
 def test_failure_stdout_broken_pipe_in_summary_is_swallowed() -> None:
@@ -291,8 +336,10 @@ def test_failure_stdout_broken_pipe_in_notice_is_swallowed() -> None:
 def test_failure_stdout_broken_pipe_in_progress_is_swallowed() -> None:
     """A BrokenPipeError inside progress() (R25, a void method like notice) is
     swallowed, no traceback, no effect on the run (cli.md's Error handling: the
-    same void-class rule as notice)."""
-    presenter = TerminalPresenter(io.StringIO(), _BrokenPipeStream(), io.StringIO())
+    same void-class rule as notice). Uses a TTY stream because T4.6's progress()
+    only attempts a write immediately on a TTY -- a non-TTY stream never writes
+    from a single call, so it could never exercise this failure."""
+    presenter = TerminalPresenter(io.StringIO(), _BrokenPipeTTYStream(), io.StringIO())
 
     presenter.progress("phase 1 — system map", 5.0, "Read")  # must not raise
 
@@ -696,11 +743,7 @@ def test_contract_severity_colored_on_tty_bare_with_no_color_and_on_non_tty(
     the severity word")."""
     monkeypatch.delenv("NO_COLOR", raising=False)
 
-    class _TTYStdout(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
-    stdout = _TTYStdout()
+    stdout = _TTYStream()
     presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
     presenter.present_checkpoint(_fixed_view())
     rendered = stdout.getvalue()
@@ -708,7 +751,7 @@ def test_contract_severity_colored_on_tty_bare_with_no_color_and_on_non_tty(
     assert "    severity: critical\n" not in rendered  # the bare form is not present
 
     monkeypatch.setenv("NO_COLOR", "1")
-    stdout_no_color = _TTYStdout()
+    stdout_no_color = _TTYStream()
     presenter = TerminalPresenter(io.StringIO("approve\n"), stdout_no_color, io.StringIO())
     presenter.present_checkpoint(_fixed_view())
     assert "    severity: critical\n" in stdout_no_color.getvalue()
@@ -875,3 +918,289 @@ def test_failure_present_no_impact_stdin_eof_is_abort() -> None:
     """stdin EOF at the no-impact confirmation's prompt returns `Abort`."""
     presenter = TerminalPresenter(_RaisingStream(EOFError()), io.StringIO(), io.StringIO())
     assert presenter.present_no_impact(_fixed_no_impact_view()) == Abort()
+
+
+# ==== progress consolidation (T4.6) =================================================
+
+
+def _progress_content(label: str, elapsed_seconds: float, activity: str) -> str:
+    """The bare rendered content of a progress line (no `\\r`/clear-to-end-of-line
+    prefix, no trailing newline) -- shared by the consolidation tests below."""
+    return f"· {label} ({int(elapsed_seconds)}s, {activity})"
+
+
+def _in_place(content: str) -> str:
+    """T4.6's in-place-update bytes for one progress write: `\\r` + clear-to-
+    end-of-line + content, no trailing newline."""
+    return f"\r\x1b[K{content}"
+
+
+def test_contract_progress_consolidation_tty_same_key_updates_in_place() -> None:
+    """T4.6, TTY stdout: two consecutive calls sharing the same `(label,
+    last_activity)` key, `elapsed_seconds > 0` on both -- only elapsed time
+    differs -- produce a single in-place update: two raw in-place writes back to
+    back, with no finalizing `\\n` between them, asserted byte-exact."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("phase 1 — system map", 1.0, None)
+    presenter.progress("phase 1 — system map", 2.0, None)
+
+    expected = _in_place(_progress_content("phase 1 — system map", 1.0, "waiting")) + _in_place(
+        _progress_content("phase 1 — system map", 2.0, "waiting")
+    )
+    assert stdout.getvalue() == expected
+
+
+def test_contract_progress_consolidation_tty_activity_change_finalizes_then_starts_fresh() -> (
+    None
+):
+    """T4.6, TTY stdout: a third call with a different `last_activity` first
+    finalizes the prior line with a bare `\\n` (its already-rendered content
+    unchanged), then writes the new key's content the same in-place way."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("phase 1 — system map", 1.0, None)
+    presenter.progress("phase 1 — system map", 2.0, None)
+    presenter.progress("phase 1 — system map", 3.0, "Read")
+
+    expected = (
+        _in_place(_progress_content("phase 1 — system map", 1.0, "waiting"))
+        + _in_place(_progress_content("phase 1 — system map", 2.0, "waiting"))
+        + "\n"
+        + _in_place(_progress_content("phase 1 — system map", 3.0, "Read"))
+    )
+    assert stdout.getvalue() == expected
+
+
+def test_contract_progress_consolidation_tty_label_change_finalizes_then_starts_fresh() -> None:
+    """T4.6, TTY stdout: a call with a different `label` (a new phase) finalizes
+    the prior line and starts fresh identically to an activity change."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("phase 1 — system map", 5.0, "Read")
+    presenter.progress("phase 2 — failure modes", 0.0, None)
+
+    expected = (
+        _in_place(_progress_content("phase 1 — system map", 5.0, "Read"))
+        + "\n"
+        + _in_place(_progress_content("phase 2 — failure modes", 0.0, "waiting"))
+    )
+    assert stdout.getvalue() == expected
+
+
+def test_contract_progress_consolidation_elapsed_zero_is_always_a_key_change() -> None:
+    """T4.6: `elapsed_seconds == 0.0` is *always* a key change, even when
+    `(label, last_activity)` is identical to the immediately preceding call --
+    the regression test for two consecutive "repair"/None rounds (no tool call
+    in either) that must not merge into one line with elapsed time running
+    backwards."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("repair", 4.0, None)  # first round's last tick
+    presenter.progress("repair", 0.0, None)  # second round's first tick
+
+    expected = (
+        _in_place(_progress_content("repair", 4.0, "waiting"))
+        + "\n"
+        + _in_place(_progress_content("repair", 0.0, "waiting"))
+    )
+    assert stdout.getvalue() == expected
+
+
+def test_contract_progress_consolidation_non_tty_same_key_writes_nothing() -> None:
+    """T4.6, non-TTY stdout: consecutive same-key calls (`elapsed_seconds > 0`)
+    write nothing at all -- control sequences (and a live redraw) in a plain
+    file are noise, not signal."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("phase 1 — system map", 1.0, None)
+    presenter.progress("phase 1 — system map", 2.0, None)
+    presenter.progress("phase 1 — system map", 3.0, None)
+
+    assert stdout.getvalue() == ""
+
+
+def test_contract_progress_consolidation_non_tty_key_change_commits_one_line_with_last_elapsed() -> (  # noqa: E501
+    None
+):
+    """T4.6, non-TTY stdout: a key change (here, the `elapsed_seconds == 0.0`
+    case) commits exactly one plain line (no `\\r` or escape sequences) holding
+    the superseded key's *last-seen* elapsed time and activity, not its first."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("repair", 1.0, None)
+    presenter.progress("repair", 2.0, None)  # last tick of the first "repair" round
+    presenter.progress("repair", 0.0, None)  # second round's first tick -- a key change
+
+    assert stdout.getvalue() == _progress_content("repair", 2.0, "waiting") + "\n"
+    assert "\r" not in stdout.getvalue()
+    assert "\x1b" not in stdout.getvalue()
+
+
+def test_contract_progress_consolidation_non_tty_one_key_end_to_end_yields_one_line() -> None:
+    """T4.6, non-TTY stdout: a run whose every progress call shares one key end
+    to end still produces exactly one committed line, once something finalizes
+    it -- here, the next stream-writing method (`notice`)."""
+    stdout = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+
+    presenter.progress("triage", 1.0, "Read")
+    presenter.progress("triage", 2.0, "Read")
+    presenter.progress("triage", 3.0, "Read")
+    presenter.notice("done")
+
+    assert stdout.getvalue() == _progress_content("triage", 3.0, "Read") + "\ndone\n"
+
+
+# --- Each of the seven stream-writing methods finalizes a pending line first --------
+
+
+def test_contract_present_checkpoint_finalizes_pending_progress_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.6: `present_checkpoint` finalizes any pending progress line (TTY: a
+    bare `\\n`, since its content is already correctly displayed) before its own
+    checkpoint content, never interleaved or missing the boundary."""
+    monkeypatch.setenv("NO_COLOR", "1")  # isolates the finalize boundary from
+    # severity coloring, which a TTY stdout would otherwise also trigger
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.present_checkpoint(_fixed_view())
+
+    expected_checkpoint = "".join(line + "\n" for line in _FIXED_VIEW_LINES)
+    assert stdout.getvalue() == progress_bytes + "\n" + expected_checkpoint
+
+
+def test_contract_present_amendment_finalizes_pending_progress_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.6: `present_amendment` finalizes a pending progress line before its
+    own amendment content."""
+    monkeypatch.setenv("NO_COLOR", "1")  # isolates the finalize boundary from
+    # severity coloring, which a TTY stdout would otherwise also trigger
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.present_amendment(_fixed_amendment_view(), rejectable=True)
+
+    expected_amendment = "".join(line + "\n" for line in _FIXED_AMENDMENT_LINES)
+    assert stdout.getvalue() == progress_bytes + "\n" + expected_amendment
+
+
+def test_contract_present_no_impact_finalizes_pending_progress_line() -> None:
+    """T4.6: `present_no_impact` finalizes a pending progress line before its
+    own no-impact content."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.present_no_impact(_fixed_no_impact_view())
+
+    expected_no_impact = "".join(line + "\n" for line in _FIXED_NO_IMPACT_LINES)
+    assert stdout.getvalue() == progress_bytes + "\n" + expected_no_impact
+
+
+def test_contract_show_chat_reply_prompt_none_finalizes_pending_progress_line() -> None:
+    """T4.6: `show_chat_reply(prompt=None)` finalizes a pending progress line
+    before rendering its own reply text."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.show_chat_reply("the no-impact conclusion was withdrawn", None)
+
+    assert stdout.getvalue() == (
+        progress_bytes + "\nthe no-impact conclusion was withdrawn\n"
+    )
+
+
+def test_contract_show_chat_reply_prompting_finalizes_pending_progress_line() -> None:
+    """T4.6: a prompting `show_chat_reply` call finalizes a pending progress
+    line before rendering its own reply text and re-offered prompt."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.show_chat_reply("noted, proceeding", PromptKind.CHECKPOINT)
+
+    assert stdout.getvalue() == (
+        progress_bytes + "\nnoted, proceeding\n$ approve · abort · anything else is chat\n"
+    )
+
+
+def test_contract_notice_finalizes_pending_progress_line() -> None:
+    """T4.6: `notice` finalizes a pending progress line before its own line."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.notice("a stale lock was reclaimed")
+
+    assert stdout.getvalue() == progress_bytes + "\na stale lock was reclaimed\n"
+
+
+def test_contract_error_finalizes_pending_progress_line_on_stdout() -> None:
+    """T4.6: `error` finalizes a pending progress line -- on stdout, where the
+    progress line lives -- before its own content, which renders on stderr as
+    usual; folding the finalize step into the shared low-level write helpers is
+    what makes this reach `error` even though `error`'s own writes target a
+    different stream."""
+    stdout = _TTYStream()
+    stderr = io.StringIO()
+    presenter = TerminalPresenter(io.StringIO(), stdout, stderr)
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.error(cause="it broke", next_action="fix it")
+
+    assert stdout.getvalue() == progress_bytes + "\n"
+    assert stderr.getvalue() == "it broke\n→ fix it\n"
+
+
+def test_contract_summary_finalizes_pending_progress_line() -> None:
+    """T4.6: `summary` finalizes a pending progress line before its own
+    content."""
+    stdout = _TTYStream()
+    presenter = TerminalPresenter(io.StringIO(), stdout, io.StringIO())
+    presenter.progress("triage", 3.0, None)
+    progress_bytes = stdout.getvalue()
+
+    presenter.summary(RunSummary(outcome="no changes"))
+
+    assert stdout.getvalue() == progress_bytes + "\n→ no changes\n"
+
+
+def test_failure_finalize_progress_line_broken_pipe_is_swallowed_and_does_not_affect_reply() -> (
+    None
+):
+    """T4.6: a `BrokenPipeError` raised only by `_finalize_progress_line`'s own
+    write, triggered from within a reply-pending method (`present_checkpoint`),
+    is swallowed -- the method's own subsequent write still runs (proven by its
+    content landing on the stream) and its own success (not the finalize's
+    failure) is what determines the reply."""
+    # Write #1 is progress()'s own in-place update (succeeds); write #2 is
+    # present_checkpoint's finalize call (fails, swallowed); writes #3+ are
+    # present_checkpoint's own content (succeed).
+    stdout = _NthWriteFailsStream(fail_at=2)
+    presenter = TerminalPresenter(io.StringIO("approve\n"), stdout, io.StringIO())
+    presenter.progress("triage", 1.0, None)
+
+    reply = presenter.present_checkpoint(_fixed_view())
+
+    assert reply == Approve()
+    assert "sm-web" in stdout.getvalue()  # the checkpoint's own content still wrote
