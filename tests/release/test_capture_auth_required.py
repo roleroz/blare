@@ -2,9 +2,9 @@
 SDK, run with a scratch `HOME` carrying no Claude Code login (T4.1's
 continuation).
 
-Runs against a throwaway scratch repo, never miniflux_v2 -- this scenario
-needs no real codebase, only the real auth-handshake failure shape. Tagged
-`live`, `exclusive`, but touches no shared mutable state.
+Runs against a throwaway scratch repo, never kvstore -- this scenario needs
+no real codebase, only the real auth-handshake failure shape. Tagged `live`
+only -- touches no shared mutable state, so no `exclusive` tag is needed.
 """
 
 from __future__ import annotations

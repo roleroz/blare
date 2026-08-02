@@ -1,11 +1,14 @@
-"""live: capture the update-multi-commit fixture (R8) against the real
-`~/external_git/miniflux_v2` checkout with the live Claude Agent SDK (T4.1's
-continuation).
+"""live: capture the update-multi-commit fixture (R8) against a fresh
+`testdata/kvstore` repo with the live Claude Agent SDK (T4.1's continuation).
 
-Requires a real prior analysis to already exist in `.blare/` (run
-`test_capture_analyze_happy_path` first in the same release-suite session).
-Tagged `live`, `exclusive` -- see `test_capture_analyze_happy_path`'s docstring
-for the shared re-run/scrub notes.
+Builds its own fresh kvstore repo, bootstraps its own real `blare analyze` at
+`genesis`, then checks out `multi_commit_range_end` (a real three-commit range
+spanning three distinct concerns: the storage JSON-lines fix, the admin
+stale-cache fix, and the README metrics doc update -- `kvstore_repo.py`'s
+commit graph) before running `blare update` -- R8's "one delta, not per-commit"
+needs a multi-commit range to exercise at all. See
+`test_capture_analyze_happy_path`'s docstring for the shared re-run/scrub
+notes.
 """
 
 from __future__ import annotations
@@ -16,33 +19,24 @@ from ruamel.yaml import YAML
 
 import blare.artifacts as artifacts
 from blare.model import RunMode
-from tests.release import capture
-from tests.release import miniflux_repo as mr
+from tests.release import capture, kvstore_repo
 from tests.release.scenario_driver import finalize_capture
 
 _YAML = YAML(typ="safe")
 
-# A real three-commit range spanning three distinct concerns (ui perf, storage
-# fix, rewrite-function fix) -- R8's "one delta, not per-commit" needs a
-# multi-commit range to exercise at all.
-_BASELINE_SHA = "8528e5e650b71537439c2f74fb35c3276d8978fd"
-_TARGET_SHA = "cf5ae57d9a65b24394104fa12428a48ca5236a8d"
+_TARGET_NAME = "multi_commit_range_end"
 
 
 def test_live_capture_update_multi_commit(tmp_path: Path) -> None:
     """`blare update` over a real three-commit range completes as one delta
     (R8), the recorded SHA lands on the range's real end commit, and the
     resulting artifact set is internally consistent."""
-    assert mr.blare_root(mr.MINIFLUX_ROOT).is_dir(), (
-        "no existing .blare/ state -- run test_capture_analyze_happy_path "
-        "(or any real blare analyze) first in this release-suite session"
-    )
-    cap = capture.capture_update(tmp_path, "update-multi-commit", _BASELINE_SHA, _TARGET_SHA)
+    cap = capture.capture_update(tmp_path, "update-multi-commit", _TARGET_NAME)
     finalize_capture(cap.record_dir, capture.FIXTURES_ROOT / "update-multi-commit")
 
-    blare_root = mr.blare_root(mr.MINIFLUX_ROOT)
+    blare_root = kvstore_repo.blare_root(cap.repo)
     artifact_set = artifacts.load(blare_root, RunMode.UPDATE)
     assert artifacts.semantic_violations(artifact_set) == []
 
     state = _YAML.load((blare_root / "state.yaml").read_bytes())
-    assert state["analyzed_sha"] == _TARGET_SHA
+    assert state["analyzed_sha"] == cap.target_sha

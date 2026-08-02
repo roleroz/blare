@@ -1,10 +1,9 @@
-"""live: capture the amendment-agent-rejected fixture against the real
-`~/external_git/miniflux_v2` checkout with the live Claude Agent SDK (T4.1's
-continuation).
+"""live: capture the amendment-agent-rejected fixture against a fresh
+`testdata/kvstore` repo with the live Claude Agent SDK (T4.1's continuation).
 
-Runs `blare analyze` (a real re-analysis, R16); chat at phase 4's checkpoint
-prompts an agent-proposed amendment, rejected at its re-presentation (the
-proposed repairs are restored). Tagged `live`, `exclusive` -- see
+Builds its own fresh kvstore repo and runs a fresh `blare analyze` at
+`genesis`; chat at phase 4's checkpoint prompts an agent-proposed amendment,
+rejected at its re-presentation (the proposed repairs are restored). See
 `test_capture_analyze_happy_path`'s docstring for the shared re-run/scrub
 notes.
 """
@@ -15,8 +14,7 @@ from pathlib import Path
 
 import blare.artifacts as artifacts
 from blare.model import RunMode
-from tests.release import capture
-from tests.release import miniflux_repo as mr
+from tests.release import capture, kvstore_repo
 from tests.release.scenario_driver import finalize_capture
 
 
@@ -24,13 +22,9 @@ def test_live_capture_amendment_agent_rejected(tmp_path: Path) -> None:
     """A chat-prompted agent-proposed amendment, rejected at its
     re-presentation: the run completes and the resulting artifact set is
     internally consistent."""
-    assert mr.blare_root(mr.MINIFLUX_ROOT).is_dir(), (
-        "no existing .blare/ state -- run test_capture_analyze_happy_path "
-        "(or any real blare analyze) first in this release-suite session"
-    )
     cap = capture.capture_amendment_agent(tmp_path, "amendment-agent-rejected", approve=False)
     finalize_capture(cap.record_dir, capture.FIXTURES_ROOT / "amendment-agent-rejected")
 
-    blare_root = mr.blare_root(mr.MINIFLUX_ROOT)
+    blare_root = kvstore_repo.blare_root(cap.repo)
     artifact_set = artifacts.load(blare_root, RunMode.ANALYZE)
     assert artifacts.semantic_violations(artifact_set) == []

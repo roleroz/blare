@@ -47,11 +47,25 @@ class Capture:
     process's own PTY master fd cannot safely be shared with another process (a
     `/dev/ptmx`-derived fd re-opened via `/proc/<pid>/fd/<n>` allocates a *new*,
     unrelated pty pair rather than attaching to the existing one -- learned the hard
-    way capturing this task's own fixtures)."""
+    way capturing this task's own fixtures). `repo` is the directory `blare` was
+    driven against -- every `tests/release` capture now builds its own fresh repo
+    per call (kvstore_repo.py), so the caller's wrapper needs this to locate
+    `.blare/` afterward rather than assuming a single fixed, shared checkout.
+    `target_sha`, when a scenario checked out a specific commit as its delta's
+    target (an update-mode capture), is that commit's real SHA -- since the
+    repo is restored to its original ref by the time the capture function
+    returns (`kvstore_repo.on_commit`'s own contract), this is the only way a
+    wrapper can assert the recorded state actually advanced to the right
+    commit without re-deriving it (rebuilding the repo isn't an option: commits
+    carry real timestamps, so a second `kvstore_repo.build()` call produces
+    different SHAs). `None` for scenarios with no single target commit
+    (analyze-mode captures)."""
 
     process: PtyProcess
     record_dir: Path
     live_transcript: Path
+    repo: Path
+    target_sha: str | None = None
 
 
 def start_recording(
@@ -74,7 +88,9 @@ def start_recording(
     process = PtyProcess([str(blare_bin), *args], cwd=repo_dir, env=env)
     live_transcript = record_dir / "live_terminal_output.txt"
     live_transcript.write_text("")
-    return Capture(process=process, record_dir=record_dir, live_transcript=live_transcript)
+    return Capture(
+        process=process, record_dir=record_dir, live_transcript=live_transcript, repo=repo_dir
+    )
 
 
 def _append_live(cap: Capture, output: str) -> None:

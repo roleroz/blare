@@ -1,23 +1,36 @@
 """The release suite's scripted scenarios (T4.1): one function per entry on
 `engineering/modules/agent.md`'s provisional-fixtures list, each driving a real
-`blare` invocation against `~/external_git/miniflux_v2` with
-`BLARE_SDK_FIXTURES=record:<dir>` and finalizing the capture into
-`tests/fixtures/claude-sdk/<scenario>/scenario.jsonl`.
+`blare` invocation against a fresh `testdata/kvstore` repo (`tests/release/
+kvstore_repo.py`) with `BLARE_SDK_FIXTURES=record:<dir>` and finalizing the
+capture into `tests/fixtures/claude-sdk/<scenario>/scenario.jsonl`.
 
-Every scenario's real code delta comes from checking out among miniflux's own
-pre-existing commits (`miniflux_repo.checkout_commit`) -- this module never creates a
-commit itself. Run directly (e.g. from a `python3 -c` snippet) during a release-suite
-capture session; each captured scenario also gets a thin pytest wrapper under this
+Every capture function builds its own fresh kvstore repo at the start of the
+call (`kvstore_repo.build`), inside its caller's own `scratch_root` (always a
+test's own `tmp_path`, isolated per Bazel test action -- confirmed empirically,
+decisions.md 2026-08-01). Every scenario that needs a prior analyzed state
+before doing whatever it actually demonstrates now bootstraps its own real
+`blare analyze` at the repo's `genesis` commit first (`_bootstrap_analyze`),
+discarding that bootstrap run's own recording -- it exists only to produce a
+genuine `.blare/`, not as the fixture being captured. This replaces the old
+model of navigating a single, shared, external checkout (`miniflux_repo.py`)
+where every non-fresh scenario depended on `test_capture_analyze_happy_path`
+having already run, in order, in the same release-suite session; that implicit
+run-order requirement, and the `exclusive` bazel tag it required, are both
+gone now that every capture is fully self-contained (architecture.md, Test
+strategy).
+
+Run directly (e.g. from a `python3 -c` snippet) during a release-suite capture
+session; each captured scenario also gets a thin pytest wrapper under this
 package that `bazel test --test_tag_filters=live //...` runs.
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
-from tests.release import miniflux_repo as mr
+from tests.release import kvstore_repo
 from tests.release.scenario_driver import (
     PROMPT_PREFIX,
     Capture,
@@ -69,48 +82,54 @@ def _report(name: str, exit_code: int, output: str) -> None:
         raise RuntimeError(f"{name} capture: expected exit 0, got {exit_code}")
 
 
-def set_analyzed_sha(blare_root: Path, sha: str) -> None:
-    """Hand-edit `state.yaml`'s `analyzed_sha` -- sanctioned by spec ("hand-editing
-    the canonical YAML is supported... Blare validates the YAML on load and treats it
-    as the current state"). Used to present a real, already-analyzed artifact set as
-    if it had been recorded at a different real ancestor commit, so an update
-    scenario's delta is whatever real range this module's caller wants to demonstrate
-    -- without inventing any commit of its own."""
-    state_path = blare_root / "state.yaml"
-    text = state_path.read_text()
-    if not re.search(r"analyzed_sha:\s*\"?[0-9a-f]+\"?", text):
-        raise RuntimeError(f"analyzed_sha pattern not found in {state_path}: {text!r}")
-    new_text = re.sub(r'analyzed_sha:\s*"?[0-9a-f]+"?', f"analyzed_sha: {sha}", text)
-    state_path.write_text(new_text)
+def _bootstrap_analyze(scratch_root: Path, repo: Path) -> None:
+    """Run a real `blare analyze` at `repo`'s current commit (always `genesis`,
+    since callers run this immediately after `kvstore_repo.build`) to produce a
+    genuine `.blare/` for a scenario to build on. This bootstrap run's own
+    recording is discarded -- written under `scratch_root / "bootstrap"`, never
+    finalized into a fixture -- it is not the scenario being demonstrated, just
+    the real prior analysis every non-fresh scenario now needs (architecture.md,
+    Test strategy)."""
+    xdg, record = scratch_paths(scratch_root, "bootstrap")
+    cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
+    approve_to_exit(cap)
+    exit_code, output = finish(cap)
+    _report("bootstrap-analyze", exit_code, output)
 
 
 # ---- analyze-mode scenarios -------------------------------------------------------
 
 
-def capture_analyze_happy_path(scratch_root: Path, base_sha: str) -> Capture:
-    """Fresh `blare analyze` at `base_sha`: approve every real prompt to completion."""
-    repo = mr.MINIFLUX_ROOT
+def capture_analyze_happy_path(scratch_root: Path) -> Capture:
+    """Fresh `blare analyze` over a newly built kvstore repo at its `genesis`
+    commit: approve every real prompt to completion. No bootstrap needed --
+    this run itself establishes the first-ever `.blare/`."""
+    repo = scratch_root / "repo"
+    kvstore_repo.build(repo)
     xdg, record = scratch_paths(scratch_root, "analyze-happy-path")
-    with mr.on_commit(repo, base_sha):
-        cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
-        approve_to_exit(cap)
-        exit_code, output = finish(cap)
+    cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
+    approve_to_exit(cap)
+    exit_code, output = finish(cap)
     _report("analyze-happy-path", exit_code, output)
     return cap
 
 
 def capture_analyze_reanalysis_noop(scratch_root: Path) -> Capture:
-    """`blare analyze` again with no code change since the last real analysis --
-    R16 re-analysis expected to conclude no changes needed.
+    """Bootstrap a real analysis at `genesis`, then run `blare analyze` again
+    with no code change since -- R16 re-analysis expected to conclude no
+    changes needed.
 
-    A first attempt at this scenario (no hint) found the model has no way to know
-    a prior analysis exists unless it checks `.blare/` on its own initiative --
-    the phase prompts never mention it -- and it produced a real but noisy
-    duplicate-then-reconcile run instead of a clean no-op (kept as the real
-    analyze-reanalysis-update capture). The hint below is exactly what that run's
-    own model concluded it should have done, not a scripted outcome.
+    A first attempt at this scenario (no hint) found the model has no way to
+    know a prior analysis exists unless it checks `.blare/` on its own
+    initiative -- the phase prompts never mention it -- and it produced a real
+    but noisy duplicate-then-reconcile run instead of a clean no-op (kept as
+    the real analyze-reanalysis-update capture). The hint below is exactly
+    what that run's own model concluded it should have done, not a scripted
+    outcome.
     """
-    repo = mr.MINIFLUX_ROOT
+    repo = scratch_root / "repo"
+    kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
     xdg, record = scratch_paths(scratch_root, "analyze-reanalysis-noop")
     cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
     chat_at_marker(
@@ -126,12 +145,15 @@ def capture_analyze_reanalysis_noop(scratch_root: Path) -> Capture:
     return cap
 
 
-def capture_analyze_reanalysis_update(scratch_root: Path, new_sha: str) -> Capture:
-    """`blare analyze` again after checking out `new_sha` (real commits ahead) --
-    R16 re-analysis expected to change at least one entry."""
-    repo = mr.MINIFLUX_ROOT
+def capture_analyze_reanalysis_update(scratch_root: Path, new_sha_name: str) -> Capture:
+    """Bootstrap a real analysis at `genesis`, check out `shas[new_sha_name]`
+    (real commits ahead, e.g. `"fix_evictor"`), then run `blare analyze` again
+    -- R16 re-analysis expected to change at least one entry."""
+    repo = scratch_root / "repo"
+    shas = kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
     xdg, record = scratch_paths(scratch_root, "analyze-reanalysis-update")
-    with mr.on_commit(repo, new_sha):
+    with kvstore_repo.on_commit(repo, shas[new_sha_name]):
         cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
         approve_to_exit(cap)
         exit_code, output = finish(cap)
@@ -140,12 +162,19 @@ def capture_analyze_reanalysis_update(scratch_root: Path, new_sha: str) -> Captu
 
 
 def capture_analyze_checkpoint_chat(scratch_root: Path) -> Capture:
-    """R2: chat right at phase 1's own checkpoint (the first prompt of the run, so
-    no organic amendment can have preceded it), then approve through the rest."""
-    repo = mr.MINIFLUX_ROOT
+    """R2: fresh `blare analyze` over a newly built kvstore repo at `genesis`;
+    chat right at phase 1's own checkpoint (the first prompt of the run, so no
+    organic amendment can have preceded it), then approve through the rest."""
+    repo = scratch_root / "repo"
+    kvstore_repo.build(repo)
     xdg, record = scratch_paths(scratch_root, "analyze-checkpoint-chat")
     cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
-    chat_at_marker(cap, PHASE_HEADER[1], "what about the auth service?")
+    chat_at_marker(
+        cap,
+        PHASE_HEADER[1],
+        "what about the admin write path in admin.py -- it's not reachable from "
+        "api.py's public surface at all, does that matter here?",
+    )
     approve_to_exit(cap)
     exit_code, output = finish(cap)
     _report("analyze-checkpoint-chat", exit_code, output)
@@ -153,10 +182,12 @@ def capture_analyze_checkpoint_chat(scratch_root: Path) -> Capture:
 
 
 def capture_amendment_agent(scratch_root: Path, name: str, *, approve: bool) -> Capture:
-    """Approve along until phase 4's own checkpoint, then chat there to propose an
-    amendment to an earlier phase; `approve` picks the approved/rejected variant at
-    the amendment's re-presentation."""
-    repo = mr.MINIFLUX_ROOT
+    """Fresh `blare analyze` over a newly built kvstore repo at `genesis`;
+    approve along until phase 4's own checkpoint, then chat there to propose an
+    amendment to an earlier phase; `approve` picks the approved/rejected
+    variant at the amendment's re-presentation."""
+    repo = scratch_root / "repo"
+    kvstore_repo.build(repo)
     xdg, record = scratch_paths(scratch_root, name)
     cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
     chat_at_marker(
@@ -176,9 +207,11 @@ def capture_amendment_agent(scratch_root: Path, name: str, *, approve: bool) -> 
 
 
 def capture_amendment_cascade(scratch_root: Path, name: str, *, approve: bool) -> Capture:
-    """Chat at phase 4's checkpoint proposes renaming a failure mode, cascading
-    (via `referencing_phases`) into phase 3's metric coverage."""
-    repo = mr.MINIFLUX_ROOT
+    """Fresh `blare analyze` over a newly built kvstore repo at `genesis`; chat
+    at phase 4's checkpoint proposes renaming a failure mode, cascading (via
+    `referencing_phases`) into phase 3's metric coverage."""
+    repo = scratch_root / "repo"
+    kvstore_repo.build(repo)
     xdg, record = scratch_paths(scratch_root, name)
     cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
     chat_at_marker(
@@ -195,10 +228,21 @@ def capture_amendment_cascade(scratch_root: Path, name: str, *, approve: bool) -
 
 
 def capture_amendment_system(scratch_root: Path) -> Capture:
-    """A re-analysis run over a `.blare/` whose loaded set already violates R4
-    (hand-edited beforehand, per the caller) -- expects the *approval gate* (not
-    preflight) to open a system-originated unit once all four phases freeze."""
-    repo = mr.MINIFLUX_ROOT
+    """Build a fresh kvstore repo and bootstrap a real analysis at `genesis` to
+    get a genuine `.blare/`, hand-inject an unmapped failure mode into it (R4
+    violation), then run `blare analyze` again (a real re-analysis) -- expects
+    the *approval gate* (not preflight) to open a system-originated unit once
+    all four phases freeze.
+
+    Each capture now gets its own private repo/`.blare/`, so unlike the
+    miniflux-era version there is no longer a need for a distinctly-named
+    injected ID to avoid colliding with another scenario's own injection into
+    a shared checkout -- the default `fm_id` is fine here."""
+    repo = scratch_root / "repo"
+    kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
+    blare_root = kvstore_repo.blare_root(repo)
+    inject_unmapped_failure_mode(blare_root)
     xdg, record = scratch_paths(scratch_root, "amendment-system")
     cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
     approve_until(cap, "amendment · invariant repair")
@@ -211,35 +255,40 @@ def capture_amendment_system(scratch_root: Path) -> Capture:
 # ---- update-mode scenarios ---------------------------------------------------------
 
 
-def capture_update(scratch_root: Path, name: str, baseline_sha: str, target_sha: str) -> Capture:
-    """Generic `blare update` capture: hand-set the loaded state's `analyzed_sha` to
-    `baseline_sha`, check out `target_sha` as the new HEAD, then approve everything."""
-    repo = mr.MINIFLUX_ROOT
-    blare_root = mr.blare_root(repo)
-    set_analyzed_sha(blare_root, baseline_sha)
+def capture_update(scratch_root: Path, name: str, target_name: str) -> Capture:
+    """Generic `blare update` capture: build a fresh kvstore repo, bootstrap a
+    real analysis at `genesis`, check out `shas[target_name]` as the new HEAD,
+    then approve everything. Baseline is always implicitly `genesis` -- the
+    bootstrap analysis establishes it for real, so there is no separate
+    baseline parameter or hand-edited `analyzed_sha` left to pass."""
+    repo = scratch_root / "repo"
+    shas = kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
     xdg, record = scratch_paths(scratch_root, name)
-    with mr.on_commit(repo, target_sha):
+    with kvstore_repo.on_commit(repo, shas[target_name]):
         cap = start_recording(BLARE_BIN, ["update"], repo, record, xdg)
         approve_to_exit(cap)
         exit_code, output = finish(cap)
     _report(name, exit_code, output)
-    return cap
+    return replace(cap, target_sha=shas[target_name])
 
 
-def capture_update_dynamic_expansion(
-    scratch_root: Path, baseline_sha: str, target_sha: str
-) -> Capture:
+def capture_update_dynamic_expansion(scratch_root: Path, target_name: str) -> Capture:
     """`blare update` with a chat nudge at the very first checkpoint (whichever
     phase triage actually names), asking the model to reconsider whether the
     delta also touches other phases -- R18's dynamic expansion (a revised
     `affected_verdict`, no amendment) is not otherwise scriptable from outside
     a phase's own turn, the same reasoning `capture_amendment_agent`'s chat
-    nudge already relies on for organic, model-initiated mechanisms."""
-    repo = mr.MINIFLUX_ROOT
-    blare_root = mr.blare_root(repo)
-    set_analyzed_sha(blare_root, baseline_sha)
+    nudge already relies on for organic, model-initiated mechanisms. Bootstraps
+    a real analysis at `genesis` first, then checks out `shas[target_name]`
+    (the caller passes `"dynamic_expansion_delta"`, kvstore's candidate for
+    this scenario: a storage-collision fix and a stale-cache fix bundled into
+    one commit, spanning two distinct failure domains)."""
+    repo = scratch_root / "repo"
+    shas = kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
     xdg, record = scratch_paths(scratch_root, "update-dynamic-expansion")
-    with mr.on_commit(repo, target_sha):
+    with kvstore_repo.on_commit(repo, shas[target_name]):
         cap = start_recording(BLARE_BIN, ["update"], repo, record, xdg)
         chat_at_marker(
             cap,
@@ -254,24 +303,26 @@ def capture_update_dynamic_expansion(
         approve_to_exit(cap)
         exit_code, output = finish(cap)
     _report("update-dynamic-expansion", exit_code, output)
-    return cap
+    return replace(cap, target_sha=shas[target_name])
 
 
 def capture_update_no_impact_redirect(
-    scratch_root: Path, baseline_sha: str, target_sha: str, redirect_text: str
+    scratch_root: Path, target_name: str, redirect_text: str
 ) -> Capture:
-    """The no-impact confirmation, redirected via chat into an affected phase."""
-    repo = mr.MINIFLUX_ROOT
-    blare_root = mr.blare_root(repo)
-    set_analyzed_sha(blare_root, baseline_sha)
+    """The no-impact confirmation, redirected via chat into an affected phase.
+    Bootstraps a real analysis at `genesis` first, then checks out
+    `shas[target_name]` (the caller passes `"docs_update"`)."""
+    repo = scratch_root / "repo"
+    shas = kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
     xdg, record = scratch_paths(scratch_root, "update-no-impact-redirect")
-    with mr.on_commit(repo, target_sha):
+    with kvstore_repo.on_commit(repo, shas[target_name]):
         cap = start_recording(BLARE_BIN, ["update"], repo, record, xdg)
         chat_at_marker(cap, "no changes needed", redirect_text)
         approve_to_exit(cap)
         exit_code, output = finish(cap)
     _report("update-no-impact-redirect", exit_code, output)
-    return cap
+    return replace(cap, target_sha=shas[target_name])
 
 
 _ORPHAN_ID = "fm-orphan-injected"
@@ -283,11 +334,13 @@ def inject_unmapped_failure_mode(
     """Hand-append a failure mode with `coverage_status: alertable` but no alert
     coverage -- sanctioned by spec ("hand-editing the canonical YAML is
     supported"), seeding a semantic violation for a real capture of a repair
-    path. `fm_id`/`origin_note` let distinct scenarios (the update-mode
-    preflight repair, and the analyze-mode approval-gate system amendment)
-    inject their own independently-idempotent entry into the same real
-    `.blare/` without colliding or re-triggering each other's already-resolved
-    injection. Idempotent per file (each of the two appends below is
+    path. `fm_id`/`origin_note` let distinct scenarios inject their own
+    independently-idempotent entry into a `.blare/` without colliding or
+    re-triggering each other's already-resolved injection (kept for scenarios
+    that might inject more than once into the same `.blare/`, though each
+    capture now builds its own private repo, so cross-scenario collision is no
+    longer the reason this matters -- idempotency within a single scenario
+    still is). Idempotent per file (each of the two appends below is
     independently guarded), so a re-run after a prior run was interrupted
     between the two writes still completes the missing one rather than
     silently leaving `coverage.yaml` without its matching entry."""
@@ -317,25 +370,28 @@ def inject_unmapped_failure_mode(
             )
 
 
-def capture_update_load_seeded_repair(
-    scratch_root: Path, baseline_sha: str, target_sha: str
-) -> Capture:
-    """The loaded state already violates R4 (hand-injected before this runs); the
-    proactive post-triage repair should present before any ordinary checkpoint."""
-    repo = mr.MINIFLUX_ROOT
-    blare_root = mr.blare_root(repo)
+def capture_update_load_seeded_repair(scratch_root: Path, target_name: str) -> Capture:
+    """The loaded state already violates R4 (hand-injected right after the
+    bootstrap analysis, before the delta is checked out); the proactive
+    post-triage repair should present before any ordinary checkpoint. The
+    delta's own content doesn't matter -- the violation is hand-seeded and the
+    repair fires regardless of what triage concludes, R18 -- caller passes
+    `"docs_update"`."""
+    repo = scratch_root / "repo"
+    shas = kvstore_repo.build(repo)
+    _bootstrap_analyze(scratch_root, repo)
+    blare_root = kvstore_repo.blare_root(repo)
     inject_unmapped_failure_mode(blare_root)
-    set_analyzed_sha(blare_root, baseline_sha)
     xdg, record = scratch_paths(scratch_root, "update-load-seeded-repair")
-    with mr.on_commit(repo, target_sha):
+    with kvstore_repo.on_commit(repo, shas[target_name]):
         cap = start_recording(BLARE_BIN, ["update"], repo, record, xdg)
         approve_to_exit(cap)
         exit_code, output = finish(cap)
     _report("update-load-seeded-repair", exit_code, output)
-    return cap
+    return replace(cap, target_sha=shas[target_name])
 
 
-# ---- auth-required (no miniflux involved) -----------------------------------------
+# ---- auth-required (no target codebase involved) ----------------------------------
 
 
 def _init_scratch_repo(repo: Path) -> None:
@@ -350,8 +406,9 @@ def _init_scratch_repo(repo: Path) -> None:
 
 def capture_auth_required(scratch_root: Path) -> Capture:
     """R12: a scripted scratch-`HOME` run with no Claude Code login -- the real
-    handshake reports `auth_required`, exit 1. Runs against a throwaway scratch repo,
-    never miniflux (this scenario needs no real codebase, only the handshake shape)."""
+    handshake reports `auth_required`, exit 1. Runs against a throwaway scratch
+    repo, never kvstore (this scenario needs no real codebase, only the
+    handshake shape)."""
     scratch_repo = scratch_root / "auth-required" / "repo"
     _init_scratch_repo(scratch_repo)
     home = scratch_root / "auth-required" / "home"

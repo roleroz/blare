@@ -2,9 +2,13 @@ load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_python//python:py_test.bzl", "py_test")
 
 # The release suite's driving library (T4.1): shared PTY-driving primitives,
-# read-only miniflux_v2 navigation, and the per-scenario capture functions. The
-# live-tagged py_test targets that `bazel test --test_tag_filters=live //...`
-# discovers are declared below as each scenario's own capture is finalized.
+# fresh-kvstore-repo construction (kvstore_repo.py), and the per-scenario
+# capture functions. The live-tagged py_test targets that `bazel test
+# --test_tag_filters=live //...` discovers are declared below as each
+# scenario's own capture is finalized. Every capture now builds its own fresh
+# kvstore repo inside its own test's tmp_path, so no live target shares
+# mutable state with another and none needs to run exclusively of the rest
+# (decisions.md 2026-08-01).
 #
 # analyze-reanalysis-noop still has no way to learn a prior analysis exists
 # except by its own initiative -- the phase prompts never mention it -- and a
@@ -18,7 +22,7 @@ py_library(
     srcs = [
         "__init__.py",
         "capture.py",
-        "miniflux_repo.py",
+        "kvstore_repo.py",
         "scenario_driver.py",
     ],
     imports = [".."],
@@ -38,19 +42,13 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     # no-sandbox/local: this test's own side effect (finalize_capture) writes
-    # back into the source tree's tests/fixtures/claude-sdk/ -- and it drives
-    # a subprocess against ~/external_git/miniflux_v2, an absolute path outside
-    # the workspace a sandboxed action couldn't reach at all. exclusive: every
-    # live target shares mutable state (the same real checkout's .blare/) and
-    # must not run concurrently with another one.
+    # back into the source tree's tests/fixtures/claude-sdk/ -- a sandboxed
+    # action couldn't reach the source tree at all. No exclusive tag needed:
+    # each capture builds its own fresh, private kvstore repo (kvstore_repo.py)
+    # inside its own test's tmp_path, so concurrent live targets never share
+    # mutable state (decisions.md 2026-08-01).
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -69,13 +67,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -94,13 +86,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -119,13 +105,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -144,13 +124,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -169,13 +143,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -194,13 +162,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -219,13 +181,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -244,13 +200,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -269,13 +219,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -294,13 +238,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -319,13 +257,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -344,13 +276,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -369,13 +295,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -394,13 +314,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
@@ -419,13 +333,7 @@ py_test(
     legacy_create_init = False,
     main = "//:pytest_main.py",
     data = ["//src/blare:blare"],
-    # env_inherit: every scenario in this package resolves the real checkout
-    # via `Path.home()` (miniflux_repo.MINIFLUX_ROOT) -- Bazel's test wrapper
-    # otherwise substitutes a synthetic, sandboxed HOME even for tags =
-    # ["local", "no-sandbox"], which would silently point every capture at an
-    # empty throwaway directory instead of the real ~/external_git/miniflux_v2.
-    env_inherit = ["HOME"],
-    tags = ["exclusive", "live", "local", "no-sandbox"],
+    tags = ["live", "local", "no-sandbox"],
     timeout = "eternal",
     deps = [
         ":release_lib",
