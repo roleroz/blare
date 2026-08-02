@@ -4,11 +4,6 @@ recommendations (R4, R5), and the R13/R14 summary/transcript content.
 
 T2.3's e2e scope (architecture.md): "fresh analyze (R1), ... chains (R3), coverage
 and alerts (R4, R5), ... summaries (R13, R14)".
-
-T4.1: this fixture is a release-suite capture of the live Claude Agent SDK
-analyzing the real `~/external_git/miniflux_v2` checkout (a Go RSS/Atom reader
-service) at commit `8528e5e6`; the assertions below name real entries from that
-capture, not the earlier hand-authored placeholder content.
 """
 
 from __future__ import annotations
@@ -69,8 +64,8 @@ def test_e2e_analyze_happy_path(tmp_path: Path) -> None:
     assert result.exit_code == 0
     # R13: the summary states counts and the current gap count.
     assert "analysis complete" in result.output
-    assert "123 added · 0 updated · 0 removed" in result.output
-    assert "8 alertable · 12 metric-gap · 7 excluded" in result.output
+    assert "11 added · 0 updated · 0 removed" in result.output
+    assert "1 alertable · 1 metric-gap · 1 excluded" in result.output
     # R14: the transcript path is stated, and it exists.
     transcript_dir = xdg_state / "blare"
     [repo_id_dir] = list(transcript_dir.iterdir())
@@ -90,61 +85,43 @@ def test_e2e_analyze_happy_path(tmp_path: Path) -> None:
     failure_modes = {
         fm["id"]: fm for fm in _load_yaml(blare_root / "failure-modes.yaml")
     }
-    assert len(failure_modes) == 27
+    assert set(failure_modes) == {"fm-timeout", "fm-503", "fm-slow"}
 
-    # R3: fm-daemon-process-down is user-visible and caused_by three upstream
-    # entries, each a documented entry with its own severity and visibility.
-    assert failure_modes["fm-daemon-process-down"]["user_visible"] is True
-    assert failure_modes["fm-daemon-process-down"]["caused_by"] == [
-        "fm-unhandled-goroutine-panic",
-        "fm-oom-condition",
-        "fm-startup-precondition-failure",
-    ]
-    assert failure_modes["fm-unhandled-goroutine-panic"]["user_visible"] is False
-    assert failure_modes["fm-unhandled-goroutine-panic"]["severity"] == "critical"
+    # R3: fm-503 is user-visible and caused_by fm-timeout, itself a documented entry
+    # with its own severity and visibility.
+    assert failure_modes["fm-503"]["user_visible"] is True
+    assert failure_modes["fm-503"]["caused_by"] == ["fm-timeout"]
+    assert failure_modes["fm-timeout"]["user_visible"] is False
+    assert failure_modes["fm-timeout"]["severity"] == "warning"
 
     # R4/R5: coverage status split, alert recommendations linked via coverage.
-    assert failure_modes["fm-unhandled-goroutine-panic"]["coverage_status"] == "excluded"
-    assert failure_modes["fm-unhandled-goroutine-panic"]["exclusion_reason"]
-    assert failure_modes["fm-daemon-process-down"]["coverage_status"] == "alertable"
-    assert failure_modes["fm-http-error-rate-spike"]["coverage_status"] == "metric-gap"
+    assert failure_modes["fm-timeout"]["coverage_status"] == "excluded"
+    assert failure_modes["fm-timeout"]["exclusion_reason"]
+    assert failure_modes["fm-503"]["coverage_status"] == "alertable"
+    assert failure_modes["fm-slow"]["coverage_status"] == "metric-gap"
 
     metric_recommendations = {
         mr["id"]: mr
         for mr in _load_yaml(blare_root / "metric-recommendations.yaml")
     }
-    assert metric_recommendations["mr-http-request-duration-histogram"]["kind"] == "new"
-    assert metric_recommendations["mr-http-request-duration-histogram"]["failure_mode_ids"] == [
-        "fm-http-error-rate-spike",
-        "fm-request-latency-degradation",
-        "fm-http-handler-panic-recovered",
-    ]
+    assert metric_recommendations["mr-latency"]["kind"] == "new"
+    assert metric_recommendations["mr-latency"]["failure_mode_ids"] == ["fm-slow"]
 
     alerts = {
         ar["id"]: ar
         for ar in _load_yaml(blare_root / "alert-recommendations.yaml")
     }
-    # ar-scrape-target-down serves two failure modes and carries the higher
-    # (critical) severity between them.
-    assert alerts["ar-scrape-target-down"]["failure_mode_ids"] == [
-        "fm-daemon-process-down",
-        "fm-metrics-scrape-failure",
-    ]
-    assert alerts["ar-scrape-target-down"]["severity"] == "critical"
-    assert alerts["ar-http-5xx-error-rate"]["failure_mode_ids"] == [
-        "fm-http-error-rate-spike",
-        "fm-http-handler-panic-recovered",
-    ]
+    assert alerts["ar-503"]["failure_mode_ids"] == ["fm-503"]
+    assert alerts["ar-503"]["severity"] == "critical"
+    assert alerts["ar-slow"]["failure_mode_ids"] == ["fm-slow"]
 
     coverage = {
         c["failure_mode_id"]: c for c in _load_yaml(blare_root / "coverage.yaml")
     }
-    assert coverage["fm-daemon-process-down"]["detecting_metric_ids"] == []
-    assert coverage["fm-daemon-process-down"]["alert_ids"] == ["ar-scrape-target-down"]
-    assert coverage["fm-http-error-rate-spike"]["metric_recommendation_ids"] == [
-        "mr-http-request-duration-histogram"
-    ]
-    assert coverage["fm-http-error-rate-spike"]["alert_ids"] == ["ar-http-5xx-error-rate"]
+    assert coverage["fm-503"]["detecting_metric_ids"] == ["mx-errors"]
+    assert coverage["fm-503"]["alert_ids"] == ["ar-503"]
+    assert coverage["fm-timeout"]["detecting_metric_ids"] == []
+    assert coverage["fm-timeout"]["alert_ids"] == []
 
     # R10: every derived doc carries the generated-file header.
     for doc_name in (

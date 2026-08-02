@@ -2224,88 +2224,26 @@ def _analyze_happy_path_fixture_dir() -> Path:
     )
 
 
-@dataclass
-class _RealisticFakeSink:
-    """A release-suite capture (T4.1) replaces the hand-authored analyze-happy-path
-    fixture with a real one, which -- unlike the idealized original -- includes the
-    real session's own trial-and-error: several rejected `propose_edits` calls
-    (an unknown `entry_type`, a duplicate `id`) before each phase's batch that
-    actually lands. Replaying it byte-exact (agent.md's replay comparison) needs a
-    sink that reproduces those same two verdicts, not the unconditional accept
-    every other test in this module uses -- so this fake checks exactly the two
-    things this fixture's real capture exercised, nothing more.
-    """
-
-    _VALID_ENTRY_TYPES = frozenset(
-        {
-            "system_components",
-            "failure_modes",
-            "metrics",
-            "metric_recommendations",
-            "alert_recommendations",
-            "coverage",
-        }
-    )
-
-    calls: list[EditBatch] = field(default_factory=list)
-    _seen_ids: set[tuple[str, str]] = field(default_factory=set)
-
-    def __call__(self, batch: EditBatch) -> BatchVerdict:
-        self.calls.append(batch)
-        for edit in batch.edits:
-            if edit.entry_type not in self._VALID_ENTRY_TYPES:
-                valid_types = ", ".join(sorted(self._VALID_ENTRY_TYPES))
-                return BatchVerdict(
-                    ok=False,
-                    message=f"unknown entry_type {edit.entry_type!r}; valid types: {valid_types}",
-                )
-        for edit in batch.edits:
-            if edit.op is EditOp.ADD and isinstance(edit.payload_or_id, dict):
-                entry_id = edit.payload_or_id.get("id")
-                if entry_id is not None:
-                    key = (edit.entry_type, str(entry_id))
-                    if key in self._seen_ids:
-                        return BatchVerdict(ok=False, message=f"duplicate id {entry_id!r}")
-                    self._seen_ids.add(key)
-        return BatchVerdict(ok=True, message=None)
-
-
 def test_contract_analyze_happy_path_fixture_replays_all_four_phases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The release-suite-captured analyze-happy-path fixture (four phases, real
-    trial-and-error included) replays end to end: each phase's propose_edits
-    reaches the sink, which reproduces the same reject/accept verdicts the real
-    run got, and the session closes cleanly."""
+    """The hand-authored, provisional analyze-happy-path fixture (four phases,
+    approvals only) replays end to end: each phase's propose_edits reaches the sink,
+    which approves, and the session closes cleanly."""
     fixture_dir = _analyze_happy_path_fixture_dir()
     assert fixture_dir.exists(), f"analyze-happy-path fixture not found at {fixture_dir}"
     monkeypatch.setenv("BLARE_SDK_FIXTURES", f"replay:{fixture_dir}")
     client = create_client()
     root = _repo_root_fixture(tmp_path)
-    # Built directly (not via `_session`, whose `sink` param is typed for the
-    # unconditional-accept `RecordingSink` every other test in this module uses)
-    # so this test can inject the realistic sink above instead.
-    sink = _RealisticFakeSink()
-    session = AgentSession(
-        client,
-        sink,
-        RecordingControl(),
-        PrometheusStack(),
-        FakeTranscriptWriter(tmp_path / "t.jsonl"),
-    )
+    session, sink, _, _ = _session(client, tmp_path)
 
     session.start(RunMode.ANALYZE, RunContext(worktree_root=root))
     for phase in Phase:
         session.run_phase(phase)
     session.close()
 
-    assert [batch.phase for batch in sink.calls] == (
-        [Phase.SYSTEM_MAP] * 18
-        + [Phase.FAILURE_MODES] * 2
-        + [Phase.METRIC_COVERAGE] * 4
-        + [Phase.ALERT_RECOMMENDATIONS] * 3
-    )
-    assert len(sink.calls) == 27
+    assert [batch.phase for batch in sink.calls] == list(Phase)
+    assert len(sink.calls) == 4
 
 
 # ==== update mode: triage (T3.1) ===================================================

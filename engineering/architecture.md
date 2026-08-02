@@ -317,25 +317,42 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T4 — Release readiness
 
-- [ ] **T4.1 release suite** (in progress — 8 of 16 scenarios captured, driver built): the
-  scripted PTY scenarios against `~/external_git/miniflux_v2` in record mode — one per entry
-  on agent.md's provisional list, which is the binding enumeration; captured fixtures
-  replace the provisional set, and emptying that list is this task's definition of done, per
-  the global rule that it gates the first release. Real captures landed: analyze-happy-path,
-  analyze-reanalysis-update, update-load-seeded-repair, auth-required, update-happy-path,
-  update-multi-commit, update-no-impact, update-no-impact-redirect (see agent.md). T4.4
-  closed the `patch_text=""` gap that blocked update-mode scenarios from seeing real diff
-  content; T4.1's own continuation then found and fixed a second, deeper bug in the same
-  area — `_LiveSDKClient.send()` never actually folded `patch_text`/`delta_files` into the
-  text sent to the live model at all (agent.md) — confirmed by the first update-happy-path
-  attempt visibly hallucinating an unrelated history before the fix. T4.5/T4.6 addressed the
-  checkpoint-wait/gate-timing concern that had paused this task (decisions.md); the user has
-  since re-authorized it to continue. `update-dynamic-expansion` remains unresolved after two
-  good-faith real attempts (agent.md has the detail); its capture wrapper now hard-fails
-  rather than risk finalizing the wrong shape. Remaining: update-dynamic-expansion (needs a
-  better-chosen delta), analyze-reanalysis-noop (3 earlier attempts didn't converge — needs a
-  different approach, not necessarily a code fix), and amendment-system, amendment-agent
-  (×2), amendment-cascade (×2), analyze-checkpoint-chat (scaffolding in place, not yet
+- [ ] **T4.1 release suite** (in progress — 1 of 16 scenarios captured, driver built;
+  reset 2026-08-01, see below): the scripted PTY scenarios against a live SDK in record
+  mode — one per entry on agent.md's provisional list, which is the binding enumeration;
+  captured fixtures replace the provisional set, and emptying that list is this task's
+  definition of done, per the global rule that it gates the first release. T4.1 originally
+  ran these captures against `~/external_git/miniflux_v2` and landed seven real captures:
+  analyze-happy-path, analyze-reanalysis-update, update-load-seeded-repair,
+  update-happy-path, update-multi-commit, update-no-impact, update-no-impact-redirect. On
+  2026-08-01 the user had all seven reverted back to provisional (agent.md has the detail):
+  some had embedded byte-exact copies of miniflux_v2's real source and literal diff output
+  in committed fixtures/testdata with no attribution anywhere in the repo, and miniflux_v2
+  is also large and expensive as a release-suite target, and separately the user's own
+  manual-testing checkout — conflating the two isn't wanted. `tests/e2e/testdata/*` (the
+  copied-source directories) was deleted outright. A smaller, dedicated test codebase will
+  be chosen in a separate design task before this task resumes capturing against it; this
+  entry does not guess what that codebase will be. Only auth-required's real capture
+  survived the revert — it runs against a throwaway scratch repo, never miniflux_v2, so
+  neither reason for reverting applied to it. T4.4 closed the `patch_text=""` gap that
+  blocked update-mode scenarios from seeing real diff content (that fix and its
+  synthetic-placeholder fixture updates are unaffected by the revert); T4.1's own
+  continuation then found and fixed a second, deeper bug in the same area —
+  `_LiveSDKClient.send()` never actually folded `patch_text`/`delta_files` into the text
+  sent to the live model at all (agent.md, also unaffected by the revert) — confirmed by
+  the first update-happy-path attempt visibly hallucinating an unrelated history before the
+  fix. T4.5/T4.6 addressed the checkpoint-wait/gate-timing concern that had paused this
+  task (decisions.md); the user has since re-authorized it to continue.
+  `update-dynamic-expansion` remains unresolved after two good-faith real attempts against
+  miniflux_v2 (agent.md has the detail) — it was never finalized, so there was nothing to
+  revert, and it stays exactly as T4.1 left it; its capture wrapper now hard-fails rather
+  than risk finalizing the wrong shape. Remaining once the new test codebase is chosen:
+  analyze-happy-path, analyze-reanalysis-update, update-load-seeded-repair,
+  update-happy-path, update-multi-commit, update-no-impact, update-no-impact-redirect (all
+  reset by the revert), update-dynamic-expansion (needs a better-chosen delta),
+  analyze-reanalysis-noop (3 earlier attempts didn't converge — needs a different approach,
+  not necessarily a code fix), and amendment-system, amendment-agent (×2),
+  amendment-cascade (×2), analyze-checkpoint-chat (scaffolding in place, not yet
   attempted).
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.

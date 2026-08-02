@@ -78,32 +78,16 @@ def _fixture_dir(name: str) -> Path:
     return path
 
 
-_PROMPT_PREFIX = "$ approve"
-
-
 def _run_analyze(blare_bin: Path, fixture_dir: Path, repo_dir: Path, xdg: Path) -> str:
-    """Drive one `blare analyze` run to completion, approving every reply-pending
-    prompt (ordinary checkpoint or amendment re-presentation alike -- both share
-    the `"$ approve"` prefix). The analyze-reanalysis-update fixture is a real
-    capture whose session organically folded a self-correcting `amend_proposal`
-    into its own run (T4.1), so a plain four-checkpoint loop can't replay it;
-    approving along the shared prefix until the process exits handles both this
-    fixture and the plain four-checkpoint ones the same way."""
+    """Drive one `blare analyze` run to completion through all four checkpoints,
+    approving every one; returns the process's full output."""
     process = PtyProcess(
         [str(blare_bin), "analyze"],
         cwd=repo_dir,
         env={"BLARE_SDK_FIXTURES": f"replay:{fixture_dir}", "XDG_STATE_HOME": str(xdg)},
     )
-    output = ""
-    for _ in range(20):
-        try:
-            output = process.read_until(
-                _PROMPT_PREFIX, occurrence=output.count(_PROMPT_PREFIX) + 1, timeout=10.0
-            )
-        except TimeoutError as exc:
-            if "process exited: True" in str(exc):
-                break
-            raise
+    for occurrence in (1, 2, 3, 4):
+        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
         process.send_line("approve")
     result = process.read_all_until_exit()
     assert result.exit_code == 0, result.output
@@ -143,23 +127,21 @@ def _hand_annotate_metrics(blare_root: Path) -> None:
     touches phase 3's metrics, so the whole file is untouched by either run's edit
     batch (the file-level skip in `write_entries_and_config`)."""
     _hand_annotate(
-        blare_root / "metrics.yaml",
-        "  name: miniflux_archive_entries_duration\n",
-        "  # hand-verified against the codebase\n",
+        blare_root / "metrics.yaml", "  type: counter\n", "  # hand-verified against the codebase\n"
     )
 
 
-def _hand_annotate_fm_oom(blare_root: Path) -> None:
-    """Hand-edit `failure-modes.yaml`'s fm-oom-condition entry -- a *sibling*,
-    within the same file as the entries the reanalysis-update fixture adds. Unlike
+def _hand_annotate_fm_slow(blare_root: Path) -> None:
+    """Hand-edit `failure-modes.yaml`'s fm-slow entry -- a *sibling*, within the
+    same file as fm-503, which the reanalysis-update fixture does touch. Unlike
     `_hand_annotate_metrics` (whose file is skipped wholesale), this specifically
-    exercises `_merge_entry_file`'s per-entry preserve-vs-replace branch: new
-    entries land in the same file while this one must be individually preserved
-    from the deep-copied loaded sequence, not merely because its containing file
-    was skipped."""
+    exercises `_merge_entry_file`'s per-entry preserve-vs-replace branch: fm-503 in
+    this same file gets replaced while fm-slow must be individually preserved from
+    the deep-copied loaded sequence, not merely because its containing file was
+    skipped."""
     _hand_annotate(
         blare_root / "failure-modes.yaml",
-        "  title: Out-of-memory condition\n",
+        "  coverage_status: metric-gap\n",
         "  # hand note: still tracking this one\n",
     )
 
@@ -221,12 +203,12 @@ def test_e2e_reanalysis_unchanged_conclusions_preserve_ids_and_bytes(tmp_path: P
     assert b"# hand-verified against the codebase" in after["metrics.yaml"]
 
 
-def test_e2e_reanalysis_changed_conclusion_adds_new_entries_only(tmp_path: Path) -> None:
-    """R16/R9: a second `blare analyze` run whose replayed session finds four new
-    failure modes (plus their metric recommendations, alerts, and coverage
-    entries) adds exactly those -- every entry from the first run keeps its exact
-    ID and bytes, siblings included -- while the recorded SHA still advances to
-    the delta's new HEAD."""
+def test_e2e_reanalysis_changed_conclusion_rewrites_only_that_entry(tmp_path: Path) -> None:
+    """R16/R9: a second `blare analyze` run whose replayed session updates one
+    existing failure mode's severity rewrites exactly that entry -- its ID
+    unchanged, its bytes changed -- while every sibling entry (same file and every
+    other canonical file/derived doc) keeps its exact bytes; the recorded SHA
+    still advances to the delta's new HEAD."""
     blare_bin = _blare_bin()
     repo_dir = tmp_path / "repo"
     init_repo(repo_dir)
@@ -236,11 +218,12 @@ def test_e2e_reanalysis_changed_conclusion_adds_new_entries_only(tmp_path: Path)
     _run_analyze(blare_bin, _fixture_dir("analyze-happy-path"), repo_dir, xdg_state)
     first_sha = head_sha(repo_dir)
     _hand_annotate_metrics(blare_root)
-    _hand_annotate_fm_oom(blare_root)
+    _hand_annotate_fm_slow(blare_root)
     before = _snapshot(blare_root)
     before_config = (blare_root / "config.yaml").read_bytes()
     before_fm_entries = _entries_by_id(before["failure-modes.yaml"])
-    assert "# hand note: still tracking this one" in before_fm_entries["fm-oom-condition"]
+    assert "severity: critical" in before_fm_entries["fm-503"]
+    assert "# hand note: still tracking this one" in before_fm_entries["fm-slow"]
 
     second_sha = commit_file(
         repo_dir, "src/extra.py", "# a later, unrelated change\n", "a later commit"
@@ -250,7 +233,7 @@ def test_e2e_reanalysis_changed_conclusion_adds_new_entries_only(tmp_path: Path)
     output = _run_analyze(
         blare_bin, _fixture_dir("analyze-reanalysis-update"), repo_dir, xdg_state
     )
-    assert "12 added · 0 updated · 0 removed" in output
+    assert "0 added · 1 updated · 0 removed" in output
 
     state = _load_yaml(blare_root / "state.yaml")
     assert state["analyzed_sha"] == second_sha
@@ -258,63 +241,31 @@ def test_e2e_reanalysis_changed_conclusion_adds_new_entries_only(tmp_path: Path)
 
     after = _snapshot(blare_root)
 
-    # system-map.yaml and metrics.yaml are untouched by this delta (the file-level
-    # skip); every other canonical file gains new entries but keeps every prior
-    # entry byte-stable.
-    assert after["system-map.yaml"] == before["system-map.yaml"]
-    assert after["metrics.yaml"] == before["metrics.yaml"]
+    # failure-modes.yaml is the only canonical file whose bytes changed.
+    for filename in _CANONICAL_ENTRY_FILES:
+        if filename == "failure-modes.yaml":
+            assert after[filename] != before[filename]
+        else:
+            assert after[filename] == before[filename], f"{filename} changed unexpectedly"
+    assert (blare_root / "config.yaml").read_bytes() == before_config
     assert b"# hand-verified against the codebase" in after["metrics.yaml"]
 
+    # Within failure-modes.yaml: fm-timeout and fm-slow (siblings, untouched) keep
+    # their exact bytes; fm-503's ID is stable even though its content (severity)
+    # changed, and its new bytes reflect the new severity.
     after_fm_entries = _entries_by_id(after["failure-modes.yaml"])
-    new_failure_modes = {
-        "fm-oauth2-provider-init-failure",
-        "fm-maintenance-mode-stuck-enabled",
-        "fm-auth-proxy-trust-misconfiguration",
-        "fm-premature-session-expiry",
-    }
-    assert set(after_fm_entries) == set(before_fm_entries) | new_failure_modes
-    for entry_id, entry_bytes in before_fm_entries.items():
-        assert after_fm_entries[entry_id] == entry_bytes, f"{entry_id} changed unexpectedly"
-    assert "# hand note: still tracking this one" in after_fm_entries["fm-oom-condition"]
+    assert set(after_fm_entries) == set(before_fm_entries)
+    assert after_fm_entries["fm-timeout"] == before_fm_entries["fm-timeout"]
+    assert after_fm_entries["fm-slow"] == before_fm_entries["fm-slow"]
+    assert after_fm_entries["fm-503"] != before_fm_entries["fm-503"]
+    assert "severity: warning" in after_fm_entries["fm-503"]
+    assert "severity: critical" not in after_fm_entries["fm-503"]
 
-    after_mr = _entries_by_id(after["metric-recommendations.yaml"])
-    before_mr = _entries_by_id(before["metric-recommendations.yaml"])
-    assert set(after_mr) == set(before_mr) | {
-        "mr-oauth2-provider-init-status-gauge",
-        "mr-maintenance-mode-gauge",
-    }
-    for entry_id, entry_bytes in before_mr.items():
-        assert after_mr[entry_id] == entry_bytes, f"{entry_id} changed unexpectedly"
-
-    after_ar = _entries_by_id(after["alert-recommendations.yaml"])
-    before_ar = _entries_by_id(before["alert-recommendations.yaml"])
-    assert set(after_ar) == set(before_ar) | {
-        "ar-oauth2-provider-not-ready",
-        "ar-maintenance-mode-stuck",
-    }
-    for entry_id, entry_bytes in before_ar.items():
-        assert after_ar[entry_id] == entry_bytes, f"{entry_id} changed unexpectedly"
-
-    after_cov = _entries_by_id(after["coverage.yaml"])
-    before_cov = _entries_by_id(before["coverage.yaml"])
-    assert set(after_cov) == set(before_cov) | new_failure_modes
-    for entry_id, entry_bytes in before_cov.items():
-        assert after_cov[entry_id] == entry_bytes, f"{entry_id} changed unexpectedly"
-
-    assert (blare_root / "config.yaml").read_bytes() == before_config
-
-    # failure-modes.md, metric-recommendations.md, alert-recommendations.md, and
-    # coverage.md are the only derived docs whose bytes changed (R9/R10: unchanged
-    # YAML renders byte-identically even though every doc is rewritten).
-    changed_docs = {
-        "failure-modes.md",
-        "metric-recommendations.md",
-        "alert-recommendations.md",
-        "coverage.md",
-    }
+    # failure-modes.md is the only derived doc whose bytes changed (R9/R10:
+    # unchanged YAML renders byte-identically even though every doc is rewritten).
     for doc_filename in _DOC_FILES:
         key = f"docs/{doc_filename}"
-        if doc_filename in changed_docs:
+        if doc_filename == "failure-modes.md":
             assert after[key] != before[key]
         else:
             assert after[key] == before[key], f"{key} changed unexpectedly"
