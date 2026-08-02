@@ -2,8 +2,10 @@
 renders inline, and the run then proceeds through the remaining phases to a
 completed run.
 
-Uses the analyze-checkpoint-chat replay fixture: identical to analyze-happy-path,
-with one chat exchange scripted right after phase 1's turn ends.
+Uses the real, live-captured analyze-checkpoint-chat fixture (T4.1): the same
+kvstore codebase as analyze-happy-path, with one real chat exchange at phase 1's
+own checkpoint (the very first prompt of the run, so no organic amendment can
+have preceded it -- capture.py's own design for this scenario).
 """
 
 from __future__ import annotations
@@ -12,16 +14,22 @@ from pathlib import Path
 
 from python.runfiles import Runfiles
 
-from tests.e2e.pty_harness import PtyProcess
+from tests.e2e.pty_harness import PtyProcess, approve_all, approve_until
 from tests.e2e.repo_fixtures import init_repo
 
-_CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
+_CHAT_TEXT = (
+    "what about the admin write path in admin.py -- it's not reachable from "
+    "api.py's public surface at all, does that matter here?"
+)
+_REPLY_MARKER = "It matters, but it cuts the opposite way from exclusion"
 
 
 def test_e2e_checkpoint_chat_routes_and_represents(tmp_path: Path) -> None:
-    """Typing free text at phase 1's checkpoint routes to the agent, the reply
-    renders inline (the view is not redrawn), the checkpoint prompt re-offers, and
-    approving from there proceeds through phases 2-4 to a completed run."""
+    """Typing the real chat text at phase 1's checkpoint routes to the agent, the
+    real reply renders inline (the view is not redrawn), the checkpoint prompt
+    re-offers, and approving from there proceeds through every remaining real
+    checkpoint (`approve_all`, since an organic mid-run amendment means the
+    checkpoint count is no longer a fixed few) to a completed run."""
     runfiles = Runfiles.Create()
     assert runfiles is not None
     blare_bin = Path(runfiles.Rlocation("blare/src/blare/blare"))
@@ -44,21 +52,15 @@ def test_e2e_checkpoint_chat_routes_and_represents(tmp_path: Path) -> None:
             "XDG_STATE_HOME": str(tmp_path / "xdg"),
         },
     )
-    # Phase 1's checkpoint (prompt occurrence 1): chat instead of approving.
-    process.read_until(_CHECKPOINT_PROMPT, occurrence=1)
-    process.send_line("what about the auth service?")
-    # The chat reply renders inline and re-offers the same prompt -- occurrence 2
-    # is that re-offer, still phase 1's checkpoint, not phase 2's.
-    output = process.read_until(_CHECKPOINT_PROMPT, occurrence=2)
-    assert "Noted -- this codebase has no separate auth service" in output
+    # Phase 1's checkpoint is the very first prompt: chat instead of approving.
+    approve_until(process, "phase 1 —")
+    process.send_line(_CHAT_TEXT)
+    # The chat reply renders inline and re-offers the same prompt.
+    output = approve_until(process, _REPLY_MARKER)
+    assert _REPLY_MARKER in output
     process.send_line("approve")
 
-    # Phases 2-4's checkpoints are prompt occurrences 3, 4, 5 (the chat re-offer
-    # above already consumed occurrence 2).
-    for occurrence in (3, 4, 5):
-        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
-        process.send_line("approve")
-    result = process.read_all_until_exit()
+    result = approve_all(process)
 
     assert result.exit_code == 0
     assert "analysis complete" in result.output

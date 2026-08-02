@@ -20,6 +20,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import claude_agent_sdk
 import pytest
@@ -185,6 +186,38 @@ class RecordingControl:
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.verdict
+
+
+@dataclass
+class ScriptedSink(RecordingSink):
+    """Like `RecordingSink`, but returns one pre-scripted verdict per call, in order,
+    instead of always returning the same fixed one -- for replaying a real,
+    live-captured fixture whose recorded tool_results include genuine validation
+    rejections (bad entry_type, missing fields, dangling references, ...) that a
+    fixed always-ok verdict can't reproduce. The script is exhausted exactly once
+    the same real session's tool_use sequence is exhausted, so an unexpected extra
+    or missing call surfaces as an IndexError rather than silently mismatching."""
+
+    script: list[BatchVerdict] = field(default_factory=list)
+
+    def __call__(self, batch: EditBatch) -> BatchVerdict:
+        self.calls.append(batch)
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.script.pop(0)
+
+
+@dataclass
+class ScriptedControl(RecordingControl):
+    """`ScriptedSink`'s counterpart for `run_control` -- see its docstring."""
+
+    script: list[RunControlVerdict] = field(default_factory=list)
+
+    def __call__(self, call: RunControlCall) -> RunControlVerdict:
+        self.calls.append(call)
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.script.pop(0)
 
 
 def _session(
@@ -2188,7 +2221,7 @@ def test_contract_replay_delay_before_sleeps_real_wall_clock_time(tmp_path: Path
     assert elapsed >= 0.05
 
 
-# ==== the hand-authored analyze-happy-path fixture (provisional) ===================
+# ==== the real, live-captured analyze-happy-path fixture (T4.1) ====================
 
 
 def _repo_root_fixture(base: Path) -> Path:
@@ -2224,26 +2257,123 @@ def _analyze_happy_path_fixture_dir() -> Path:
     )
 
 
+def _scripted_verdicts_from_fixture(
+    fixture_dir: Path,
+) -> tuple[list[BatchVerdict], list[RunControlVerdict]]:
+    """Extract, in call order, the exact `BatchVerdict`/`RunControlVerdict` the real
+    session recorded for each `propose_edits`/`run_control` call -- pairing each
+    inbound `tool_use` with its outbound `tool_result` by `tool_use_id`. A real
+    capture's tool_results are the *real* production validation's own verdicts
+    (including genuine rejections), so this is what lets a replay reproduce them
+    without reimplementing `artifacts.batch_check` here -- that validation is
+    already covered exhaustively by `test_artifacts.py`; this module's own contract
+    is the phase-driving wiring, not the validation rules themselves."""
+    lines = (fixture_dir / "scenario.jsonl").read_text().splitlines()[1:]
+    entries: list[dict[str, Any]] = [json.loads(line) for line in lines]
+    call_names: dict[str, str] = {}
+    call_order: list[str] = []
+    results_by_id: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        event = entry["event"]
+        if event.get("type") == "tool_use" and event["name"] in ("propose_edits", "run_control"):
+            call_names[event["id"]] = event["name"]
+            call_order.append(event["id"])
+        elif event.get("type") == "tool_result":
+            results_by_id[event["tool_use_id"]] = event["result"]
+    batch_verdicts: list[BatchVerdict] = []
+    control_verdicts: list[RunControlVerdict] = []
+    for call_id in call_order:
+        result = results_by_id[call_id]
+        ok = bool(result["ok"])
+        message = result.get("message")
+        if call_names[call_id] == "propose_edits":
+            batch_verdicts.append(BatchVerdict(ok=ok, message=message))
+        else:
+            control_verdicts.append(RunControlVerdict(ok=ok, message=message))
+    return batch_verdicts, control_verdicts
+
+
+def _amendment_outcomes_from_fixture(fixture_dir: Path) -> list[tuple[bool, list[Phase]]]:
+    """Extract, in order, each real `amendment_outcome` event's (approved,
+    restored_phases) -- `notify_amendment_outcome`'s own parameters (agent.md),
+    which the real capture's driver sent verbatim (`scenario_driver.py`'s
+    approve-everything loop). `run_phase`/`request_repair` only send one phase's
+    turn and drain it (agent.py); nothing there auto-sends `amendment_outcome` --
+    that message is the caller's (orchestrator's, here the test's) own reaction to
+    an `amend_complete` it observed, so replaying a fixture with an organic
+    mid-run amendment requires calling `notify_amendment_outcome` at the same
+    points a real orchestrator would have, using its real recorded decision."""
+    lines = (fixture_dir / "scenario.jsonl").read_text().splitlines()[1:]
+    entries: list[dict[str, Any]] = [json.loads(line) for line in lines]
+    outcomes: list[tuple[bool, list[Phase]]] = []
+    for entry in entries:
+        event = entry["event"]
+        if event.get("type") == "amendment_outcome":
+            outcomes.append(
+                (bool(event["approved"]), [Phase(p) for p in event["restored_phases"]])
+            )
+    return outcomes
+
+
 def test_contract_analyze_happy_path_fixture_replays_all_four_phases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The hand-authored, provisional analyze-happy-path fixture (four phases,
-    approvals only) replays end to end: each phase's propose_edits reaches the sink,
-    which approves, and the session closes cleanly."""
+    """The real, live-captured analyze-happy-path fixture (agent.md's provisional
+    list, captured for real by T4.1) drives cleanly through all four ordinary
+    phases: driven through a sink/control scripted from the fixture's own recorded
+    verdicts (see `_scripted_verdicts_from_fixture`), every propose_edits/run_control
+    call this test's simple phase loop triggers reaches the injected handler in
+    order and gets back exactly the verdict the real session received -- the
+    replaying client raises `FixtureMismatchError` on any divergence, so reaching
+    `close()` at all is itself the fidelity assertion. The capture also contains
+    five organic, model-initiated amendments mid-run (real live behaviour, not
+    scripted by the driver); each one this simple loop's own phase/amendment-flush
+    structure reaches is acknowledged via `notify_amendment_outcome` with the real
+    recorded decision, exercising that call against real fixture data. This test's
+    plain "one turn per phase" loop does not attempt to also replicate the
+    orchestrator's own repair-driving state machine (`request_repair`, which the
+    real run needed too, per its 8 recorded `request_repair` events) -- that full
+    gate-loop replay is `test_orchestrator.py`'s contract, run through the real
+    orchestrator rather than hand-rolled here; `AgentSession.close()` tolerates
+    the fixture's remaining unconsumed events (agent.md's own test plan: "closing
+    with recorded events unconsumed is legal and raises nothing"), so this test
+    ends once its own narrower phase-loop contract has been exercised without
+    divergence."""
     fixture_dir = _analyze_happy_path_fixture_dir()
     assert fixture_dir.exists(), f"analyze-happy-path fixture not found at {fixture_dir}"
+    batch_verdicts, control_verdicts = _scripted_verdicts_from_fixture(fixture_dir)
+    amendment_outcomes = _amendment_outcomes_from_fixture(fixture_dir)
     monkeypatch.setenv("BLARE_SDK_FIXTURES", f"replay:{fixture_dir}")
     client = create_client()
     root = _repo_root_fixture(tmp_path)
-    session, sink, _, _ = _session(client, tmp_path)
+    scripted_sink = ScriptedSink(script=list(batch_verdicts))
+    scripted_control = ScriptedControl(script=list(control_verdicts))
+    session, sink, control, _ = _session(
+        client, tmp_path, sink=scripted_sink, control=scripted_control
+    )
+    outcomes_acknowledged = 0
+
+    def _acknowledge_pending_amendments() -> None:
+        nonlocal outcomes_acknowledged
+        while (
+            sum(1 for c in control.calls if c.action == RunControlAction.AMEND_COMPLETE)
+            > outcomes_acknowledged
+            and outcomes_acknowledged < len(amendment_outcomes)
+        ):
+            approved, restored_phases = amendment_outcomes[outcomes_acknowledged]
+            session.notify_amendment_outcome(approved, restored_phases)
+            outcomes_acknowledged += 1
 
     session.start(RunMode.ANALYZE, RunContext(worktree_root=root))
     for phase in Phase:
         session.run_phase(phase)
+        _acknowledge_pending_amendments()
     session.close()
 
-    assert [batch.phase for batch in sink.calls] == list(Phase)
-    assert len(sink.calls) == 4
+    assert {batch.phase for batch in sink.calls} == set(Phase)
+    assert len(sink.calls) > 0
+    assert len(control.calls) > 0
+    assert outcomes_acknowledged > 0
 
 
 # ==== update mode: triage (T3.1) ===================================================

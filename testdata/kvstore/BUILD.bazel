@@ -1,0 +1,12 @@
+# kvstore's raw files as a public data dependency: `tests/release/kvstore_repo.py`
+# reaches them via a plain filesystem path (its capture py_test targets run
+# untagged "no-sandbox", against the real source checkout -- see tests/release/
+# BUILD.bazel), but the e2e suite's targets run sandboxed and need them declared
+# as an explicit, hermetic data dependency instead (tests/e2e/kvstore_fixtures.py:
+# reproducing one of T4.1's real kvstore-derived deltas locally, so a replayed real
+# fixture's triage patch_text matches byte for byte).
+filegroup(
+    name = "kvstore_files",
+    srcs = glob(["**"], exclude = ["BUILD.bazel"]),
+    visibility = ["//visibility:public"],
+)

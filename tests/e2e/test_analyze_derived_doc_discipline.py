@@ -12,7 +12,7 @@ from pathlib import Path
 from python.runfiles import Runfiles
 
 from blare.artifacts import GENERATED_DOC_HEADER
-from tests.e2e.pty_harness import PtyProcess
+from tests.e2e.pty_harness import PtyProcess, approve_all
 from tests.e2e.repo_fixtures import init_repo
 
 _CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
@@ -50,16 +50,13 @@ def test_e2e_derived_doc_restored_at_final_confirmation(tmp_path: Path) -> None:
     # exactly the construction R10's e2e criterion calls for.
     doc_path.parent.mkdir(parents=True, exist_ok=True)
     doc_path.write_text(_HAND_EDIT)
-    for occurrence in (1, 2, 3, 4):
-        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
-        process.send_line("approve")
-    result = process.read_all_until_exit()
+    result = approve_all(process)
 
     assert result.exit_code == 0
     restored = doc_path.read_bytes()
     assert restored.startswith(GENERATED_DOC_HEADER.encode())
     assert b"hand-edited during the checkpoint pause" not in restored
-    assert b"sm-web" in restored
+    assert b"sm-api-get-value" in restored
 
 
 def test_e2e_derived_doc_not_restored_on_abort(tmp_path: Path) -> None:

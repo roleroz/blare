@@ -15,16 +15,16 @@ from pathlib import Path
 
 from python.runfiles import Runfiles
 
-from tests.e2e.pty_harness import PtyProcess
+from tests.e2e.pty_harness import PtyProcess, approve_all
 from tests.e2e.repo_fixtures import init_repo
-
-_CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
 
 
 def test_e2e_seam_through_reaches_a_completed_run(tmp_path: Path) -> None:
     """A run over a minimal git repo, seamed through to the replay client via the
-    analyze-happy-path fixture, drives all four checkpoints (approving each) and
-    exits 0 with a real completed-run summary."""
+    real, live-captured analyze-happy-path fixture (T4.1), driving every real
+    checkpoint the session presents (`approve_all`, since an organic mid-run
+    amendment means the checkpoint count is no longer a fixed four) to a real
+    completed run, exiting 0 with a real completed-run summary."""
     runfiles = Runfiles.Create()
     assert runfiles is not None
     blare_bin = Path(runfiles.Rlocation("blare/src/blare/blare"))
@@ -45,10 +45,7 @@ def test_e2e_seam_through_reaches_a_completed_run(tmp_path: Path) -> None:
             "XDG_STATE_HOME": str(tmp_path / "xdg"),
         },
     )
-    for occurrence in (1, 2, 3, 4):
-        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
-        process.send_line("approve")
-    result = process.read_all_until_exit()
+    result = approve_all(process)
 
     assert result.exit_code == 0
     assert "analysis complete" in result.output

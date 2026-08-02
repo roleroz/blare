@@ -19,6 +19,7 @@ counting occurrences of one exact prompt string.
 
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,6 +119,23 @@ _STALL_HINT = (
     "alert_recommendations entry's own linkage field"
 )
 
+# cli.md's progress spinner redraws a `\x1b[K· <label> (Ns, <activity>)` line once
+# per elapsed second while the model is thinking/calling tools, so the number of
+# these lines between two otherwise-identical checkpoints varies with real response
+# latency, and their own timer digits never repeat either. A real stall -- the model
+# resubmitting the same repair, the same violation re-surfacing -- was observed (see
+# _STALL_HINT's docstring) to never trip the repeat counter below because of this:
+# consecutive deltas were never byte-identical even when the substantive content
+# (the actual prompt/state being repeated) was. Strip every spinner tick line
+# entirely before comparing, regardless of its timer value or how many redraws
+# occurred, so the repeat count reflects genuine content recurrence rather than the
+# absence of it.
+_SPINNER_LINE = re.compile(r"\x1b\[K·[^\n]*\(\d+s(?:, [^)]*)?\)\n?")
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    return _SPINNER_LINE.sub("", text)
+
 
 def _drive(
     cap: Capture,
@@ -156,8 +174,9 @@ def _drive(
         output = new_output
         if stop_marker is not None and stop_marker in output:
             return output
-        repeat = repeat + 1 if delta == last_delta else 0
-        last_delta = delta
+        normalized_delta = _normalize_for_repeat_check(delta)
+        repeat = repeat + 1 if normalized_delta == last_delta else 0
+        last_delta = normalized_delta
         if repeat >= stall_after and not hinted:
             cap.process.send_line(stall_hint)
             hinted = True

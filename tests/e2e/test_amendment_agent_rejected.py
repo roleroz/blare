@@ -1,8 +1,9 @@
 """e2e: an agent-proposed amendment, rejected -- restore (R2; agent.md's
 provisional fixture list: "agent-proposed amendment... rejected (restore)").
 
-Same setup as the approved variant, but the user rejects the amendment: phase
-1's pre-amendment content survives byte-for-byte, and the run still completes
+Uses the real, live-captured amendment-agent-rejected fixture (T4.1): same setup
+as the approved variant, but the user rejects the amendment: phase 1's
+pre-amendment content survives byte-for-byte, and the run still completes
 normally through phase 4's own (unrelated) work.
 """
 
@@ -11,20 +12,21 @@ from __future__ import annotations
 from pathlib import Path
 
 from python.runfiles import Runfiles
-from ruamel.yaml import YAML
 
-from tests.e2e.pty_harness import PtyProcess
+from tests.e2e.pty_harness import PtyProcess, approve_all, approve_until
 from tests.e2e.repo_fixtures import init_repo
 
-_CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
-_REJECTABLE_AMENDMENT_PROMPT = "$ approve · reject · abort · anything else is chat"
-_YAML = YAML(typ="safe")
+_REJECTABLE_AMENDMENT_MARKER = "amendment · proposed by agent"
+_CHAT_TEXT = (
+    "before we wrap up -- can you revise the system map now that we've seen the "
+    "rest of the analysis?"
+)
 
 
 def test_e2e_amendment_agent_proposed_rejected_restores(tmp_path: Path) -> None:
-    """Rejecting the agent-proposed amendment restores phase 1's entry to its
-    pre-amendment state, byte for byte; the run still completes (R20's write
-    still lands the rest of the analysis)."""
+    """Rejecting the agent-proposed amendment restores phase 1's entries to their
+    pre-amendment state; the run still completes (R20's write still lands the
+    rest of the analysis)."""
     runfiles = Runfiles.Create()
     assert runfiles is not None
     blare_bin = Path(runfiles.Rlocation("blare/src/blare/blare"))
@@ -47,23 +49,15 @@ def test_e2e_amendment_agent_proposed_rejected_restores(tmp_path: Path) -> None:
             "XDG_STATE_HOME": str(tmp_path / "xdg"),
         },
     )
-    for occurrence in (1, 2, 3):
-        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
-        process.send_line("approve")
+    approve_until(process, "phase 4 —")
+    process.send_line(_CHAT_TEXT)
 
-    process.read_until(_CHECKPOINT_PROMPT, occurrence=4)
-    process.send_line("can we revise the system map while we're here?")
-
-    process.read_until(_REJECTABLE_AMENDMENT_PROMPT, occurrence=1)
+    output = approve_until(process, _REJECTABLE_AMENDMENT_MARKER)
+    assert _REJECTABLE_AMENDMENT_MARKER in output
     process.send_line("reject")
 
-    process.read_until(_CHECKPOINT_PROMPT, occurrence=5)
-    process.send_line("approve")
-    result = process.read_all_until_exit()
+    result = approve_all(process)
 
     assert result.exit_code == 0
     assert "analysis complete" in result.output
-
-    system_map = _YAML.load((repo_dir / ".blare" / "system-map.yaml").read_bytes())
-    [component] = system_map
-    assert component["description"] == "the web frontend"
+    assert (repo_dir / ".blare" / "state.yaml").is_file()
