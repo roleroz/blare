@@ -357,8 +357,14 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   `capture.py`'s bootstrap `blare analyze` (run to get a genuine prior `.blare/` for
   scenarios that need one) has its own recording discarded, so the real capture's delta
   edits reference failure-mode/metric IDs nothing preserves, and no hand-authored e2e seed
-  can reproduce them. Closing that gap (what the bootstrap's recording should become, and
-  how these 5 e2e tests replay it) is design work still to be done, not yet started.
+  can reproduce them. Closed (2026-08-02, decisions.md): the bootstrap now replays the
+  already-captured `analyze-happy-path` fixture instead of making a fresh live call, so its
+  IDs are fixed and reusable by both future captures and e2e replay. 8 scenarios used the
+  old live bootstrap and need recapturing against the new fixed state — update-happy-path,
+  update-multi-commit, update-no-impact, update-no-impact-redirect,
+  update-dynamic-expansion, update-load-seeded-repair, analyze-reanalysis-update, and
+  amendment-system — plus analyze-reanalysis-noop, still provisional regardless. Cheaper
+  than their first capture, since none of them pays for a live bootstrap analyze anymore.
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
 - [x] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for

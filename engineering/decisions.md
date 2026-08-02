@@ -302,3 +302,44 @@ own design (decisions.md, 2026-08-01 entry), not something fixable by editing th
 the seed by hand; closing it needs a design decision of its own about what the bootstrap
 capture's recording should become, tracked as follow-up work rather than solved under
 this merge.
+
+## 2026-08-02 — Bootstrap via replaying `analyze-happy-path`, not a fresh live call
+
+**Chosen**: `capture.py`'s `_bootstrap_analyze` stops making a fresh *live* `blare analyze`
+call at `genesis` and instead replays the already-captured `analyze-happy-path` fixture
+(`BLARE_SDK_FIXTURES=replay:...`) to reconstruct the same prior `.blare/` state
+deterministically. The 5 quarantined e2e tests that need a prior state
+(`test_analyze_reanalysis`, `test_update_happy_path`, `test_update_r8_multi_commit_delta`,
+`test_update_dynamic_expansion`, `test_update_load_seeded_repair`) do the same two-step
+replay: `analyze-happy-path`'s fixture first to build `.blare/`, then the scenario's own
+delta fixture on top. The 8 scenarios that used the old live bootstrap
+(`update-happy-path`, `update-multi-commit`, `update-no-impact`, `update-no-impact-redirect`,
+`update-dynamic-expansion`, `update-load-seeded-repair`, `analyze-reanalysis-update`,
+`amendment-system`) need to be recaptured for real against the new, fixed bootstrap state;
+`analyze-reanalysis-noop` needs another attempt regardless, being still provisional.
+`analyze-happy-path` itself, `analyze-checkpoint-chat`, the four amendment-agent/cascade
+scenarios, and `auth-required` are unaffected (none bootstrap) and don't need recapturing.
+**Rejected**: capturing a new, dedicated "bootstrap" fixture instead of reusing
+`analyze-happy-path` — rejected as redundant: `analyze-happy-path` already is a real,
+verified, fresh analyze at `genesis`, exactly what every bootstrap needs, so a second,
+separate fixture would duplicate content for no benefit. Also rejected: seeding a
+hand-authored, synthetic `.blare/` before the real delta capture (matching the original
+pre-T4.1 e2e-test convention) — rejected because it would make the "prior state" a fiction
+again, undoing the entire reason bootstrap-via-real-analyze was chosen in the first place
+(2026-08-01 entry, self-contained parallel captures). Also rejected: deriving a synthetic
+seed programmatically by scanning each delta fixture for the IDs it references and
+generating matching entries — rejected as strictly harder than reuse (a prior attempt at
+this by hand was abandoned as "too deep to complete responsibly"), and it would need
+re-deriving per scenario rather than reusing one already-verified fixture.
+**Why**: the actual bug is that every live bootstrap call is an independent,
+non-deterministic model session, so its failure-mode/metric IDs differ every run —
+confirmed directly: `analyze-happy-path`'s real evictor-related ID is
+`fm-evictor-no-op-unit-bug`, while `update-happy-path`'s own bootstrap step separately
+generated `fm-evictor-unit-mismatch-never-expires` for the identical underlying bug, and
+`update-multi-commit`'s bootstrap produced yet another, entirely non-overlapping
+vocabulary. Replaying one fixed, already-captured fixture as the bootstrap removes that
+non-determinism at the root, for both future live captures and e2e replay, and as a direct
+side benefit removes an entire live 4-phase `blare analyze` call from every
+bootstrap-dependent capture's cost — the recapture this
+decision requires is therefore cheaper than the original captures, not merely a redo, since
+none of the 8 needs to pay for a live bootstrap analyze anymore.
