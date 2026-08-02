@@ -8,16 +8,19 @@ Every capture function builds its own fresh kvstore repo at the start of the
 call (`kvstore_repo.build`), inside its caller's own `scratch_root` (always a
 test's own `tmp_path`, isolated per Bazel test action -- confirmed empirically,
 decisions.md 2026-08-01). Every scenario that needs a prior analyzed state
-before doing whatever it actually demonstrates now bootstraps its own real
-`blare analyze` at the repo's `genesis` commit first (`_bootstrap_analyze`),
-discarding that bootstrap run's own recording -- it exists only to produce a
-genuine `.blare/`, not as the fixture being captured. This replaces the old
-model of navigating a single, shared, external checkout (`miniflux_repo.py`)
-where every non-fresh scenario depended on `test_capture_analyze_happy_path`
-having already run, in order, in the same release-suite session; that implicit
-run-order requirement, and the `exclusive` bazel tag it required, are both
-gone now that every capture is fully self-contained (architecture.md, Test
-strategy).
+before doing whatever it actually demonstrates now bootstraps that state by
+*replaying* the already-captured `analyze-happy-path` fixture at the repo's
+`genesis` commit (`_bootstrap_analyze`) rather than making a fresh live `blare
+analyze` call -- deterministic, free of live-API cost, and the resulting
+`.blare/` always carries `analyze-happy-path`'s own fixed, already-verified
+IDs instead of whatever a fresh live session happened to invent this time
+(decisions.md, 2026-08-02: "Bootstrap via replaying analyze-happy-path, not a
+fresh live call"). This replaces the old model of navigating a single,
+shared, external checkout (`miniflux_repo.py`) where every non-fresh scenario
+depended on `test_capture_analyze_happy_path` having already run, in order, in
+the same release-suite session; that implicit run-order requirement, and the
+`exclusive` bazel tag it required, are both gone now that every capture is
+fully self-contained (architecture.md, Test strategy).
 
 Run directly (e.g. from a `python3 -c` snippet) during a release-suite capture
 session; each captured scenario also gets a thin pytest wrapper under this
@@ -40,6 +43,7 @@ from tests.release.scenario_driver import (
     finish,
     reply_at_marker,
     start_recording,
+    start_replaying,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -83,15 +87,20 @@ def _report(name: str, exit_code: int, output: str) -> None:
 
 
 def _bootstrap_analyze(scratch_root: Path, repo: Path) -> None:
-    """Run a real `blare analyze` at `repo`'s current commit (always `genesis`,
-    since callers run this immediately after `kvstore_repo.build`) to produce a
-    genuine `.blare/` for a scenario to build on. This bootstrap run's own
-    recording is discarded -- written under `scratch_root / "bootstrap"`, never
-    finalized into a fixture -- it is not the scenario being demonstrated, just
-    the real prior analysis every non-fresh scenario now needs (architecture.md,
-    Test strategy)."""
-    xdg, record = scratch_paths(scratch_root, "bootstrap")
-    cap = start_recording(BLARE_BIN, ["analyze"], repo, record, xdg)
+    """Reconstruct a genuine prior `.blare/` for a scenario to build on, by
+    replaying the already-captured, real `analyze-happy-path` fixture at
+    `repo`'s current commit (always `genesis`, since callers run this
+    immediately after `kvstore_repo.build`) -- instead of making a fresh live
+    `blare analyze` call. No recording is produced or discarded here (unlike
+    the old live-bootstrap model): replay mode writes nothing, and the
+    resulting `.blare/` always carries `analyze-happy-path`'s own fixed,
+    already-verified IDs rather than whatever a fresh live session happened to
+    invent this time (decisions.md, 2026-08-02: "Bootstrap via replaying
+    analyze-happy-path, not a fresh live call")."""
+    xdg, scratch = scratch_paths(scratch_root, "bootstrap")
+    cap = start_replaying(
+        BLARE_BIN, ["analyze"], repo, FIXTURES_ROOT / "analyze-happy-path", scratch, xdg
+    )
     approve_to_exit(cap)
     exit_code, output = finish(cap)
     _report("bootstrap-analyze", exit_code, output)

@@ -158,6 +158,7 @@ py_test(
     name = "test_analyze_reanalysis",
     srcs = [
         "__init__.py",
+        "kvstore_fixtures.py",
         "pty_harness.py",
         "repo_fixtures.py",
         "test_analyze_reanalysis.py",
@@ -173,13 +174,14 @@ py_test(
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
-    # quarantined (2026-08-02, decisions.md): the real analyze-reanalysis-update
-    # capture's edits reference failure-mode/metric IDs the bootstrap `blare
-    # analyze` run generated for real -- that bootstrap's own recording is
-    # discarded by design (tests/release/capture.py), so this test's
-    # hand-authored `.blare/` seed can't be given matching IDs. Needs
-    # capture.py to finalize the bootstrap as a replayable fixture before this
-    # can be fixed for real.
+    # quarantined (2026-08-02, decisions.md): mechanism fixed -- the bootstrap
+    # now replays the already-captured, real analyze-happy-path fixture
+    # (kvstore_fixtures.bootstrap_analyze_happy_path) instead of relying on a
+    # discarded live-bootstrap recording. Still failing: the real
+    # analyze-reanalysis-update capture's own edits reference IDs from the
+    # *old*, discarded bootstrap session, which don't exist in the new,
+    # correctly-bootstrapped .blare/ -- recapture against the fixed bootstrap
+    # is separate follow-up work, not yet done.
     tags = ["e2e", "quarantined"],
     deps = [
         "//src/blare:blare_lib",
@@ -516,7 +518,6 @@ py_test(
         "__init__.py",
         "kvstore_fixtures.py",
         "pty_harness.py",
-        "repo_fixtures.py",
         "test_update_r8_multi_commit_delta.py",
         "//:pytest_main.py",
         "//tests:__init__.py",
@@ -525,13 +526,20 @@ py_test(
     data = [
         "//src/blare:blare",
         "//testdata/kvstore:kvstore_files",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
         "//tests/fixtures/claude-sdk/update-multi-commit:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
-    # quarantined (2026-08-02, decisions.md): same bootstrap-recording gap as
-    # test_analyze_reanalysis above -- the real update-multi-commit capture's
-    # edits reference IDs from a discarded bootstrap analyze.
+    # quarantined (2026-08-02, decisions.md): mechanism fixed -- the bootstrap
+    # now replays the already-captured, real analyze-happy-path fixture
+    # (kvstore_fixtures.bootstrap_analyze_happy_path) and the delta is
+    # kvstore's real multi-commit-range commits
+    # (kvstore_fixtures.commit_multi_commit_range), instead of a discarded
+    # live-bootstrap recording and ad hoc repo content. Still failing: the
+    # real update-multi-commit capture's own edits reference IDs from the
+    # *old*, discarded bootstrap session -- recapture against the fixed
+    # bootstrap is separate follow-up work, not yet done.
     tags = ["e2e", "quarantined"],
     deps = [
         "@pip//pytest_bazel",
@@ -555,13 +563,18 @@ py_test(
     data = [
         "//src/blare:blare",
         "//testdata/kvstore:kvstore_files",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
         "//tests/fixtures/claude-sdk/update-happy-path:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
-    # quarantined (2026-08-02, decisions.md): same bootstrap-recording gap as
-    # test_analyze_reanalysis above -- the real update-happy-path capture's
-    # edits reference IDs from a discarded bootstrap analyze.
+    # quarantined (2026-08-02, decisions.md): mechanism fixed -- the bootstrap
+    # now replays the already-captured, real analyze-happy-path fixture
+    # (kvstore_fixtures.bootstrap_analyze_happy_path) instead of a discarded
+    # live-bootstrap recording. Still failing: the real update-happy-path
+    # capture's own edits reference IDs from the *old*, discarded bootstrap
+    # session -- recapture against the fixed bootstrap is separate follow-up
+    # work, not yet done.
     tags = ["e2e", "quarantined"],
     deps = [
         "@pip//pytest_bazel",
@@ -603,7 +616,6 @@ py_test(
         "__init__.py",
         "kvstore_fixtures.py",
         "pty_harness.py",
-        "repo_fixtures.py",
         "test_update_dynamic_expansion.py",
         "//:pytest_main.py",
         "//tests:__init__.py",
@@ -612,13 +624,20 @@ py_test(
     data = [
         "//src/blare:blare",
         "//testdata/kvstore:kvstore_files",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
         "//tests/fixtures/claude-sdk/update-dynamic-expansion:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
-    # quarantined (2026-08-02, decisions.md): same bootstrap-recording gap as
-    # test_analyze_reanalysis above -- the real update-dynamic-expansion
-    # capture's edits reference IDs from a discarded bootstrap analyze.
+    # quarantined (2026-08-02, decisions.md): mechanism fixed -- the bootstrap
+    # now replays the already-captured, real analyze-happy-path fixture
+    # (kvstore_fixtures.bootstrap_analyze_happy_path) and the delta is
+    # kvstore's real dynamic_expansion_delta commit
+    # (kvstore_fixtures.commit_dynamic_expansion_delta), instead of a
+    # discarded live-bootstrap recording and ad hoc repo content. Still
+    # failing: the real update-dynamic-expansion capture's own edits reference
+    # IDs from the *old*, discarded bootstrap session -- recapture against the
+    # fixed bootstrap is separate follow-up work, not yet done.
     tags = ["e2e", "quarantined"],
     deps = [
         "@pip//pytest_bazel",
@@ -633,7 +652,6 @@ py_test(
         "__init__.py",
         "kvstore_fixtures.py",
         "pty_harness.py",
-        "repo_fixtures.py",
         "test_update_load_seeded_repair.py",
         "//:pytest_main.py",
         "//tests:__init__.py",
@@ -642,13 +660,26 @@ py_test(
     data = [
         "//src/blare:blare",
         "//testdata/kvstore:kvstore_files",
+        "//tests/fixtures/claude-sdk/analyze-happy-path:scenario.jsonl",
         "//tests/fixtures/claude-sdk/update-load-seeded-repair:scenario.jsonl",
     ],
     legacy_create_init = False,
     main = "//:pytest_main.py",
-    # quarantined (2026-08-02, decisions.md): same bootstrap-recording gap as
-    # test_analyze_reanalysis above -- the real update-load-seeded-repair
-    # capture's edits reference IDs from a discarded bootstrap analyze.
+    # quarantined (2026-08-02, decisions.md): mechanism fixed -- the bootstrap
+    # now replays the already-captured, real analyze-happy-path fixture
+    # (kvstore_fixtures.bootstrap_analyze_happy_path), then hand-injects the
+    # same violation the real capture injected
+    # (kvstore_fixtures.inject_unmapped_failure_mode) on top, and the delta is
+    # kvstore's real docs_update commit (kvstore_fixtures.commit_docs_update),
+    # instead of a discarded live-bootstrap recording and an ad hoc seed/delta
+    # -- the local triage message now matches the fixture byte for byte.
+    # Still failing, but NOT for the same clean stale-bootstrap-ID reason as
+    # the other 4 quarantined tests: the fixture's own recorded triage turn
+    # resolves the seeded violation itself via an agent-proposed amendment,
+    # before the system-originated "invariant repair" this scenario is meant
+    # to demonstrate ever gets a turn -- see test_update_load_seeded_repair.py's
+    # module docstring. Whether this needs recapturing for a different reason
+    # than the other 7 is open, separate follow-up work.
     tags = ["e2e", "quarantined"],
     deps = [
         "@pip//pytest_bazel",

@@ -17,6 +17,15 @@ reached here as a real Bazel data dependency (`testdata/kvstore/BUILD.bazel`)
 rather than `kvstore_repo.py`'s own plain-filesystem-path shortcut (its capture
 py_test targets run untagged "no-sandbox", against the real source checkout; this
 suite's targets run sandboxed and need a declared, hermetic dependency instead).
+
+`bootstrap_analyze_happy_path`/`inject_unmapped_failure_mode` similarly duplicate
+`tests/release/capture.py`'s own equivalents (`_bootstrap_analyze`'s replay
+mechanism and `inject_unmapped_failure_mode` respectively) for the same one-way
+import reason: an e2e test needing a genuine prior `.blare/` replays the
+already-captured `analyze-happy-path` fixture rather than seeding a hand-authored
+one, so its IDs match what a real bootstrap now deterministically produces
+(decisions.md, 2026-08-02: "Bootstrap via replaying analyze-happy-path, not a
+fresh live call").
 """
 
 from __future__ import annotations
@@ -26,6 +35,8 @@ import subprocess
 from pathlib import Path
 
 from python.runfiles import Runfiles
+
+from tests.e2e.pty_harness import PtyProcess, approve_all
 
 _FIXED_STORAGE_PY = '''"""Backing key-value storage: a small flat-file store.
 
@@ -236,6 +247,82 @@ def commit_dynamic_expansion_delta(repo: Path) -> str:
     return _commit_all(repo, "Fix storage collision bug and admin's stale-cache bug together")
 
 
+def _analyze_happy_path_fixture_dir() -> Path:
+    runfiles = Runfiles.Create()
+    assert runfiles is not None
+    located = runfiles.Rlocation(
+        "blare/tests/fixtures/claude-sdk/analyze-happy-path/scenario.jsonl"
+    )
+    assert located is not None
+    path = Path(located).parent
+    assert (path / "scenario.jsonl").exists()
+    return path
+
+
+def bootstrap_analyze_happy_path(blare_bin: Path, repo_dir: Path, xdg_state: Path) -> None:
+    """Build a genuine, deterministic prior `.blare/` for a test that needs one,
+    by replaying the already-captured, real `analyze-happy-path` fixture against
+    `repo_dir` -- mirrors `tests/release/capture.py`'s `_bootstrap_analyze`,
+    which does the equivalent for the release suite's own live captures via the
+    same mechanism (decisions.md, 2026-08-02: "Bootstrap via replaying
+    analyze-happy-path, not a fresh live call"). Deterministic and free of live-
+    API cost: the resulting `.blare/` always carries `analyze-happy-path`'s own
+    fixed, already-verified IDs, unlike the old bootstrap-via-fresh-live-call
+    model whose IDs differed every run. Drives with `approve_all`, not a fixed
+    occurrence count, because the real `analyze-happy-path` capture may fold an
+    organic, model-initiated amendment into any phase's own turn (`tests/
+    release/scenario_driver.py`'s own docstring), whose rejectable prompt text
+    does not match a plain checkpoint's."""
+    process = PtyProcess(
+        [str(blare_bin), "analyze"],
+        cwd=repo_dir,
+        env={
+            "BLARE_SDK_FIXTURES": f"replay:{_analyze_happy_path_fixture_dir()}",
+            "XDG_STATE_HOME": str(xdg_state),
+        },
+    )
+    result = approve_all(process)
+    assert result.exit_code == 0, result.output
+
+
+_ORPHAN_ID = "fm-orphan-injected"
+
+
+def inject_unmapped_failure_mode(
+    blare_root: Path, fm_id: str = _ORPHAN_ID, origin_note: str = "update-load-seeded-repair"
+) -> None:
+    """Hand-append a failure mode with `coverage_status: alertable` but no alert
+    coverage -- duplicates `tests/release/capture.py`'s function of the same
+    name (kept in sync manually, same one-way-import reason as this module's
+    other duplicated content) so an e2e test can reproduce the exact same
+    injected violation, under the exact same ID, that the real
+    `update-load-seeded-repair` capture was taken against."""
+    fm_path = blare_root / "failure-modes.yaml"
+    if fm_id not in fm_path.read_text():
+        with fm_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"- id: {fm_id}\n"
+                f"  title: hand-injected unmapped failure mode (T4.1 {origin_note} capture)\n"
+                "  description: Deliberately hand-added with coverage_status alertable but"
+                " no alert\n"
+                "    coverage, to seed a semantic violation for a real release-suite\n"
+                "    capture of a repair path.\n"
+                "  severity: warning\n"
+                "  user_visible: false\n"
+                "  caused_by: []\n"
+                "  coverage_status: alertable\n"
+            )
+    cov_path = blare_root / "coverage.yaml"
+    if fm_id not in cov_path.read_text():
+        with cov_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"- failure_mode_id: {fm_id}\n"
+                "  detecting_metric_ids: []\n"
+                "  metric_recommendation_ids: []\n"
+                "  alert_ids: []\n"
+            )
+
+
 __all__ = [
     "build_genesis",
     "commit_fix_evictor",
@@ -243,4 +330,6 @@ __all__ = [
     "commit_test_only_change",
     "commit_multi_commit_range",
     "commit_dynamic_expansion_delta",
+    "bootstrap_analyze_happy_path",
+    "inject_unmapped_failure_mode",
 ]

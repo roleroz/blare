@@ -12,6 +12,20 @@ anyway: a re-analysis is only a meaningful scenario once the codebase has moved,
 and it lets these tests assert the SHA actually advancing to a genuinely different
 value (artifacts.md's write-primitives test plan: "an empty edit set with a new
 SHA changes exactly the state file") rather than a same-SHA no-op.
+
+Mechanism fixed (2026-08-02, decisions.md: "Bootstrap via replaying
+analyze-happy-path, not a fresh live call"): the bootstrap analysis both tests
+below need is now driven by `kvstore_fixtures.bootstrap_analyze_happy_path`
+(`approve_all`, robust to the real analyze-happy-path capture folding an
+organic, model-initiated amendment into any phase's own turn) rather than this
+module's own `_run_analyze`, whose fixed occurrence count over the plain
+checkpoint prompt could stall on exactly such an amendment's rejectable prompt.
+Recapture pending (separate follow-up, not this task): `analyze-reanalysis-
+update`'s own committed fixture was captured against the *old*, non-
+deterministic live-bootstrap model, so its recorded edits still reference IDs
+from that discarded session -- this test is expected to keep failing, now for
+that one, cleanly-isolated reason, until `analyze-reanalysis-update` is
+recaptured against the fixed bootstrap.
 """
 
 from __future__ import annotations
@@ -23,6 +37,7 @@ from typing import Any
 from python.runfiles import Runfiles
 from ruamel.yaml import YAML
 
+from tests.e2e import kvstore_fixtures
 from tests.e2e.pty_harness import PtyProcess
 from tests.e2e.repo_fixtures import commit_file, head_sha, init_repo
 
@@ -173,7 +188,7 @@ def test_e2e_reanalysis_unchanged_conclusions_preserve_ids_and_bytes(tmp_path: P
     xdg_state = tmp_path / "xdg"
     blare_root = repo_dir / ".blare"
 
-    _run_analyze(blare_bin, _fixture_dir("analyze-happy-path"), repo_dir, xdg_state)
+    kvstore_fixtures.bootstrap_analyze_happy_path(blare_bin, repo_dir, xdg_state)
     first_sha = head_sha(repo_dir)
     _hand_annotate_metrics(blare_root)
     before = _snapshot(blare_root)
@@ -215,7 +230,7 @@ def test_e2e_reanalysis_changed_conclusion_rewrites_only_that_entry(tmp_path: Pa
     xdg_state = tmp_path / "xdg"
     blare_root = repo_dir / ".blare"
 
-    _run_analyze(blare_bin, _fixture_dir("analyze-happy-path"), repo_dir, xdg_state)
+    kvstore_fixtures.bootstrap_analyze_happy_path(blare_bin, repo_dir, xdg_state)
     first_sha = head_sha(repo_dir)
     _hand_annotate_metrics(blare_root)
     _hand_annotate_fm_slow(blare_root)

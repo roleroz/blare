@@ -6,6 +6,20 @@ afterward, in phase order.
 
 Traces `engineering/architecture.md`'s T3.2 scope: "dynamic expansion (ahead
 and behind) ... Traces: ... R18 (dynamic clauses)".
+
+Mechanism fixed (2026-08-02, decisions.md: "Bootstrap via replaying
+analyze-happy-path, not a fresh live call"): the prior `.blare/` this test
+needs is now built by replaying the already-captured, real `analyze-happy-path`
+fixture (`kvstore_fixtures.bootstrap_analyze_happy_path`) rather than seeding a
+hand-authored, minimal `.blare/`, and the delta is kvstore's real
+`dynamic_expansion_delta` commit (`kvstore_fixtures.commit_dynamic_expansion_delta`,
+the real capture's own delta) rather than an ad hoc file. Recapture pending
+(separate follow-up, not this task): `update-dynamic-expansion`'s own committed
+fixture was captured against the *old*, non-deterministic live-bootstrap
+model, so its recorded edits still reference IDs from that discarded session --
+this test is expected to keep failing, now for that one, cleanly-isolated
+reason, until `update-dynamic-expansion` is recaptured against the fixed
+bootstrap.
 """
 
 from __future__ import annotations
@@ -16,8 +30,8 @@ from typing import Any
 from python.runfiles import Runfiles
 from ruamel.yaml import YAML
 
+from tests.e2e import kvstore_fixtures
 from tests.e2e.pty_harness import PtyProcess
-from tests.e2e.repo_fixtures import commit_file, head_sha, init_repo
 
 _CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
 _YAML = YAML(typ="safe")
@@ -45,37 +59,6 @@ def _fixture_dir(name: str) -> Path:
     return path
 
 
-def _write_valid_update_state(blare_root: Path, analyzed_sha: str) -> None:
-    """A structurally and semantically valid `.blare/`: one excluded failure mode,
-    so step 7's semantic check seeds nothing -- only the dynamic-expansion
-    mechanism itself is under test here."""
-    blare_root.mkdir(parents=True, exist_ok=True)
-    (blare_root / "state.yaml").write_text(
-        f'analyzed_sha: "{analyzed_sha}"\nschema_version: 1\n'
-    )
-    (blare_root / "config.yaml").write_text("stack: prometheus\n")
-    (blare_root / "system-map.yaml").write_text("[]\n")
-    (blare_root / "failure-modes.yaml").write_text(
-        "- id: fm-timeout\n"
-        "  title: upstream timeout\n"
-        "  description: a call to an upstream service times out\n"
-        "  severity: warning\n"
-        "  user_visible: false\n"
-        "  caused_by: []\n"
-        "  coverage_status: excluded\n"
-        "  exclusion_reason: not independently detectable\n"
-    )
-    (blare_root / "metrics.yaml").write_text("[]\n")
-    (blare_root / "metric-recommendations.yaml").write_text("[]\n")
-    (blare_root / "alert-recommendations.yaml").write_text("[]\n")
-    (blare_root / "coverage.yaml").write_text(
-        "- failure_mode_id: fm-timeout\n"
-        "  detecting_metric_ids: []\n"
-        "  metric_recommendation_ids: []\n"
-        "  alert_ids: []\n"
-    )
-
-
 def test_e2e_update_dynamic_expansion_ahead_and_behind(tmp_path: Path) -> None:
     """triage names phase 3 only; mid-phase-3 the model also flags phase 2
     (behind) and phase 4 (ahead) via a bare `affected_verdict`. All three
@@ -83,16 +66,13 @@ def test_e2e_update_dynamic_expansion_ahead_and_behind(tmp_path: Path) -> None:
     SHA advances -- no artifacts change since every phase concludes trivially."""
     blare_bin = _blare_bin()
     repo_dir = tmp_path / "repo"
-    init_repo(repo_dir)
+    first_sha = kvstore_fixtures.build_genesis(repo_dir)
     xdg_state = tmp_path / "xdg"
     blare_root = repo_dir / ".blare"
 
-    first_sha = head_sha(repo_dir)
-    _write_valid_update_state(blare_root, first_sha)
+    kvstore_fixtures.bootstrap_analyze_happy_path(blare_bin, repo_dir, xdg_state)
 
-    second_sha = commit_file(
-        repo_dir, "src/handlers.py", "# request handlers\n", "add handlers"
-    )
+    second_sha = kvstore_fixtures.commit_dynamic_expansion_delta(repo_dir)
     assert second_sha != first_sha
 
     process = PtyProcess(

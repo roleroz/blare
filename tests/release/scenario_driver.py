@@ -94,6 +94,35 @@ def start_recording(
     )
 
 
+def start_replaying(
+    blare_bin: Path,
+    args: list[str],
+    repo_dir: Path,
+    fixture_dir: Path,
+    scratch_dir: Path,
+    xdg_state: Path,
+) -> Capture:
+    """Launch `blare` against `repo_dir` through a PTY with
+    `BLARE_SDK_FIXTURES=replay:<fixture_dir>` -- deterministically replays an
+    already-captured fixture instead of driving a fresh, non-deterministic live
+    session. No recording is produced (replay mode writes no `scenario.jsonl`);
+    `scratch_dir` is only where this replay's own `live_transcript` gets written
+    (unrelated to any recording), so `Capture.record_dir` points at it but
+    nothing is ever finalized from it. Used to bootstrap a genuine, reproducible
+    prior `.blare/` state by replaying an already-captured fixture (e.g.
+    `analyze-happy-path`) rather than paying for another live `blare analyze`
+    call whose failure-mode/metric IDs would differ every run (decisions.md,
+    2026-08-02)."""
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    env = {"BLARE_SDK_FIXTURES": f"replay:{fixture_dir}", "XDG_STATE_HOME": str(xdg_state)}
+    process = PtyProcess([str(blare_bin), *args], cwd=repo_dir, env=env)
+    live_transcript = scratch_dir / "live_terminal_output.txt"
+    live_transcript.write_text("")
+    return Capture(
+        process=process, record_dir=scratch_dir, live_transcript=live_transcript, repo=repo_dir
+    )
+
+
 def _append_live(cap: Capture, output: str) -> None:
     with cap.live_transcript.open("a", encoding="utf-8") as handle:
         handle.write(output)
@@ -257,6 +286,7 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "Capture",
     "start_recording",
+    "start_replaying",
     "approve_until",
     "approve_to_exit",
     "chat_at_marker",

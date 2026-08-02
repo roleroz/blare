@@ -4,27 +4,20 @@ artifacts change; the recorded SHA advances to the delta's end commit.
 
 Traces: R6, R9.
 
-KNOWN ISSUE (T4.1, unresolved): this test does not yet pass against the real,
-live-captured update-happy-path fixture. `kvstore_fixtures.commit_fix_evictor`
-reproduces the real delta exactly (confirmed: the triage message's patch_text/
-delta_files now match the fixture byte for byte, unlike this test's old ad hoc
-repo content). What remains unresolved is the *pre-existing* `.blare/` state:
-this fixture's edits reference specific failure-mode/metric/alert IDs (e.g.
-fm-cache-unbounded-growth) that came from the real capture's own bootstrap
-`blare analyze` run -- and capture.py deliberately discards that bootstrap
-run's own recording (architecture.md, Test strategy: "this bootstrap run's own
-recording is discarded ... it exists only to produce a genuine .blare/, not as
-the fixture being captured"), so there is no way to replay it and reconstruct
-the exact seed those IDs need to already exist in. `_write_valid_update_state`
-below is deliberately minimal and does not contain them, so the replaying
-client's fidelity check fails once the fixture's first "update" edit targets
-an ID that was never seeded. A hand-crafted seed containing every referenced
-ID (with correctly cross-referenced coverage_status/alert_ids/severity fields
-satisfying R3-R5) was investigated but not completed -- see T4.1's report for
-the same issue across every update-mode e2e test whose capture bootstrapped a
-real prior analysis (test_update_r8_multi_commit_delta,
-test_update_dynamic_expansion, test_update_load_seeded_repair) and
-test_analyze_reanalysis's re-analysis-mode equivalent.
+Mechanism fixed (2026-08-02, decisions.md: "Bootstrap via replaying
+analyze-happy-path, not a fresh live call"): the prior `.blare/` this test
+needs is now built by replaying the already-captured, real `analyze-happy-path`
+fixture (`kvstore_fixtures.bootstrap_analyze_happy_path`) rather than seeding a
+hand-authored, minimal `.blare/` -- so its IDs are the same real, fixed IDs a
+fresh real bootstrap now deterministically reproduces. Recapture pending
+(separate follow-up, not this task): `update-happy-path`'s own committed
+fixture was captured against the *old*, non-deterministic live-bootstrap
+model, so its recorded edits still reference IDs (e.g.
+fm-evictor-unit-mismatch-never-expires) that don't exist in the new,
+correctly-bootstrapped `.blare/` (which has analyze-happy-path's own
+fm-evictor-no-op-unit-bug instead) -- this test is expected to keep failing,
+now for that one, cleanly-isolated reason, until `update-happy-path` is
+recaptured against the fixed bootstrap.
 """
 
 from __future__ import annotations
@@ -63,38 +56,6 @@ def _fixture_dir(name: str) -> Path:
     return path
 
 
-def _write_valid_update_state(blare_root: Path, analyzed_sha: str) -> None:
-    """A structurally and semantically valid `.blare/`: one excluded failure mode
-    (needs no metrics/alerts to satisfy every R3-R5 invariant), so step 7's
-    semantic check seeds nothing and the run's only affected phase is the one
-    triage names."""
-    blare_root.mkdir(parents=True, exist_ok=True)
-    (blare_root / "state.yaml").write_text(
-        f'analyzed_sha: "{analyzed_sha}"\nschema_version: 1\n'
-    )
-    (blare_root / "config.yaml").write_text("stack: prometheus\n")
-    (blare_root / "system-map.yaml").write_text("[]\n")
-    (blare_root / "failure-modes.yaml").write_text(
-        "- id: fm-timeout\n"
-        "  title: upstream timeout\n"
-        "  description: a call to an upstream service times out\n"
-        "  severity: warning\n"
-        "  user_visible: false\n"
-        "  caused_by: []\n"
-        "  coverage_status: excluded\n"
-        "  exclusion_reason: not independently detectable\n"
-    )
-    (blare_root / "metrics.yaml").write_text("[]\n")
-    (blare_root / "metric-recommendations.yaml").write_text("[]\n")
-    (blare_root / "alert-recommendations.yaml").write_text("[]\n")
-    (blare_root / "coverage.yaml").write_text(
-        "- failure_mode_id: fm-timeout\n"
-        "  detecting_metric_ids: []\n"
-        "  metric_recommendation_ids: []\n"
-        "  alert_ids: []\n"
-    )
-
-
 def test_e2e_update_happy_path_only_affected_phase_pauses_and_changes(
     tmp_path: Path,
 ) -> None:
@@ -108,7 +69,7 @@ def test_e2e_update_happy_path_only_affected_phase_pauses_and_changes(
     xdg_state = tmp_path / "xdg"
     blare_root = repo_dir / ".blare"
 
-    _write_valid_update_state(blare_root, first_sha)
+    kvstore_fixtures.bootstrap_analyze_happy_path(blare_bin, repo_dir, xdg_state)
     before = {
         name: (blare_root / name).read_bytes()
         for name in ("system-map.yaml", "failure-modes.yaml", "coverage.yaml")

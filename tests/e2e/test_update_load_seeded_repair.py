@@ -1,14 +1,45 @@
 """e2e: R18's load-seeded violation repair (T3.2) -- the loaded state already
-violates R4 (an unmapped failure mode, `fm-orphan`, with no alert coverage);
-triage settles on an unrelated phase, and the orchestrator's own proactive
-post-triage check (`_repair_residual_violations`) surfaces the violation via
-`request_repair` right after `triage()` returns, before the queue is ever
-drained -- `request_repair` is the only channel that can ever tell the model
-about a load-time violation (agent.md: "loaded-state violations do not travel
-in RunContext").
+violates R4 (an unmapped failure mode, `fm-orphan-injected`, with no alert
+coverage); triage settles on an unrelated phase, and the orchestrator's own
+proactive post-triage check (`_repair_residual_violations`) surfaces the
+violation via `request_repair` right after `triage()` returns, before the
+queue is ever drained -- `request_repair` is the only channel that can ever
+tell the model about a load-time violation (agent.md: "loaded-state
+violations do not travel in RunContext").
 
 Traces `engineering/architecture.md`'s T3.2 scope: "load-seeded violations
 discovered during an update run ... Traces: R15, R18 (dynamic clauses)".
+
+Mechanism fixed (2026-08-02, decisions.md: "Bootstrap via replaying
+analyze-happy-path, not a fresh live call"): the prior `.blare/` this test
+needs is now built by replaying the already-captured, real `analyze-happy-path`
+fixture (`kvstore_fixtures.bootstrap_analyze_happy_path`), then hand-injecting
+the same violation the real capture injected
+(`kvstore_fixtures.inject_unmapped_failure_mode`, mirroring `tests/release/
+capture.py`'s own function of the same name) rather than seeding a
+hand-authored, minimal `.blare/` from scratch, and the delta is kvstore's real
+`docs_update` commit (`kvstore_fixtures.commit_docs_update`, the real
+capture's own delta) rather than an ad hoc file -- the local triage message
+now matches the fixture's recorded one byte for byte, confirmed against the
+committed fixture (no divergence through at least the first ~35 recorded
+entries).
+
+Still failing, but NOT for the same clean "stale bootstrap ID" reason as the
+other 4 quarantined tests (confirmed by reading the committed fixture
+directly, not assumed): `update-load-seeded-repair`'s own recorded triage turn
+has the model resolve the seeded `fm-orphan-injected` violation itself, via an
+agent-proposed `amend_proposal`/`propose_edits(remove)`, before
+`_repair_residual_violations` (orchestrator.py) ever gets a turn to fire its
+own system-originated "invariant repair" -- the mechanism this scenario and
+this test are meant to demonstrate. This appears to be the same kind of
+organic-resolution non-convergence documented for `amendment-system`'s first
+attempt and `analyze-reanalysis-noop` (agent.md, Provisional mocks: "the
+model organically resolves the seeded ... violation ... before the gate can
+catch it"), just not previously noticed for this scenario because the test
+never got far enough past the old bootstrap-ID mismatch to reach it. Whether
+this fixture needs recapturing for a different reason than the other 7 (to
+force the intended system-repair path, not just fix bootstrap IDs) is a
+question for that follow-up work, not resolved here.
 """
 
 from __future__ import annotations
@@ -19,8 +50,8 @@ from typing import Any
 from python.runfiles import Runfiles
 from ruamel.yaml import YAML
 
+from tests.e2e import kvstore_fixtures
 from tests.e2e.pty_harness import PtyProcess
-from tests.e2e.repo_fixtures import commit_file, head_sha, init_repo
 
 _CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
 _YAML = YAML(typ="safe")
@@ -48,36 +79,6 @@ def _fixture_dir(name: str) -> Path:
     return path
 
 
-def _write_update_state_with_semantic_violation(blare_root: Path, analyzed_sha: str) -> None:
-    """A structurally valid but semantically *violating* `.blare/`: one
-    non-excluded failure mode (`fm-orphan`) with no alert coverage -- step 7's
-    semantic check seeds its repair phase (4, per `model._REPAIR_PHASE`)."""
-    blare_root.mkdir(parents=True, exist_ok=True)
-    (blare_root / "state.yaml").write_text(
-        f'analyzed_sha: "{analyzed_sha}"\nschema_version: 1\n'
-    )
-    (blare_root / "config.yaml").write_text("stack: prometheus\n")
-    (blare_root / "system-map.yaml").write_text("[]\n")
-    (blare_root / "failure-modes.yaml").write_text(
-        "- id: fm-orphan\n"
-        "  title: an unmapped failure\n"
-        "  description: has a coverage status but no alert coverage\n"
-        "  severity: warning\n"
-        "  user_visible: false\n"
-        "  caused_by: []\n"
-        "  coverage_status: alertable\n"
-    )
-    (blare_root / "metrics.yaml").write_text("[]\n")
-    (blare_root / "metric-recommendations.yaml").write_text("[]\n")
-    (blare_root / "alert-recommendations.yaml").write_text("[]\n")
-    (blare_root / "coverage.yaml").write_text(
-        "- failure_mode_id: fm-orphan\n"
-        "  detecting_metric_ids: []\n"
-        "  metric_recommendation_ids: []\n"
-        "  alert_ids: []\n"
-    )
-
-
 def test_e2e_update_load_seeded_violation_repaired_proactively(tmp_path: Path) -> None:
     """triage settles on phase 2 only (never naming phase 4, the violation's
     own repair phase); the proactive repair's amendment is presented first
@@ -86,17 +87,14 @@ def test_e2e_update_load_seeded_violation_repaired_proactively(tmp_path: Path) -
     `request_repair`, not either phase's own turn."""
     blare_bin = _blare_bin()
     repo_dir = tmp_path / "repo"
-    init_repo(repo_dir)
+    first_sha = kvstore_fixtures.build_genesis(repo_dir)
     xdg_state = tmp_path / "xdg"
     blare_root = repo_dir / ".blare"
 
-    first_sha = head_sha(repo_dir)
-    _write_update_state_with_semantic_violation(blare_root, first_sha)
-    assert (blare_root / "alert-recommendations.yaml").read_bytes() == b"[]\n"
+    kvstore_fixtures.bootstrap_analyze_happy_path(blare_bin, repo_dir, xdg_state)
+    kvstore_fixtures.inject_unmapped_failure_mode(blare_root)
 
-    second_sha = commit_file(
-        repo_dir, "src/handlers.py", "# request handlers\n", "add handlers"
-    )
+    second_sha = kvstore_fixtures.commit_docs_update(repo_dir)
     assert second_sha != first_sha
 
     process = PtyProcess(
