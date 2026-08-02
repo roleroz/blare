@@ -234,3 +234,41 @@ message but explicitly said to add review to future work instead, once the two o
 (separate command vs. a flag on `blare analyze`) were on the table.
 **Why**: the user's own instruction, given directly rather than defaulting silently to
 either build option.
+
+## 2026-08-01 — `testdata/kvstore` replaces miniflux_v2 as the release-suite test codebase
+
+**Chosen**: a small, dedicated Python fixture this project owns outright (`testdata/kvstore`
+— a minimal key-value store with four chained, intentional failure modes and one existing
+metric) replaces `~/external_git/miniflux_v2` as the codebase T4.1's live captures analyze.
+Alongside the swap, the release suite's capture module (`tests/release/kvstore_repo.py`,
+replacing `miniflux_repo.py`) builds a fresh kvstore git repo with real commit history
+inside each capture's own `tmp_path`, rather than navigating one shared, externally-located
+checkout — every scenario that needs a prior analyzed state now bootstraps its own real
+`blare analyze` rather than depending on `test_capture_analyze_happy_path` having already
+run, in order, in the same release-suite session.
+**Rejected**: keeping the shared-checkout model and merely pointing `MINIFLUX_ROOT` at
+kvstore instead — rejected because the actual reasons every live-capture test carried
+`tags = ["exclusive"]` (one shared, real, external checkout's `.blare/` mutated in place by
+every scenario) go away entirely once the target is a fixture this project owns: nothing
+stops each capture from getting its own instance. Keeping the old model would have carried
+forward a fragile, undocumented-outside-a-docstring run-order requirement for no remaining
+reason. Also rejected: giving kvstore a single, fixed, checked-into-git commit history
+(actual `.git` history alongside `testdata/kvstore`'s files) — rejected in favor of building
+the history procedurally at capture time (`kvstore_repo.build()`), which keeps
+`testdata/kvstore` itself as one clean, canonical "current, buggy" snapshot the README can
+describe, while the release suite's demonstration fix-commits live only in the module that
+builds them, not duplicated into version control.
+**Why**: two user-identified problems with `~/external_git/miniflux_v2` as the target — (1)
+several T4.1 captures had embedded byte-exact copies of its real source and literal diff
+output into committed fixtures/testdata with no attribution anywhere in the repo (not a
+license incompatibility, both Apache-2.0, but a real attribution gap); (2) it is a large,
+expensive-to-analyze production codebase and also the checkout the user separately uses for
+their own manual testing of `blare`, which shouldn't be conflated with the automated suite's
+target. Once the target became a small, cheap fixture, the shared-checkout/exclusive-tag
+design stopped being necessary and became worth removing on its own terms: it depended on a
+human (or agent) remembering to run one specific capture first, in the same session, before
+any other — the kind of implicit ordering that's easy to violate silently. Bazel's own
+per-test-action isolation (empirically confirmed 2026-08-01: every test action gets a
+private `TEST_TMPDIR`, even concurrent instances of the identical target, including under
+`tags = ["local", "no-sandbox"]`) makes the self-contained design both correct and something
+`bazel test --test_tag_filters=live //...` can now run in genuine parallel.

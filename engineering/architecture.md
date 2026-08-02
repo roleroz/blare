@@ -221,14 +221,23 @@ suites: fast = `--test_tag_filters=-e2e,-live` preceded by lint (`ruff check`, `
   **agent** module — the only test seam in production code, detailed in `agent.md`.
 - **Integration**: orchestrator+artifacts+gitrepo against real temp repos (delta computation,
   ancestry refusals, atomic write ordering, lock contention); artifacts+stack for validation.
-- **Release**: the full-analysis and diff flows against `~/external_git/miniflux_v2` with the
-  live SDK, asserting contract shape (artifacts validate, invariants hold), never exact
-  content; each run re-records the SDK fixtures it exercised. It reuses the PTY harness with
-  scripted approvals — every checkpoint is approved as presented, satisfying R22's
-  interactivity without a human — plus scripted interaction scenarios (chat alterations, an
-  amendment rejection, a diff-mode redirect), so fixtures for the interactive paths R2 and
-  R18 require are captured live rather than staying provisional; the scenario list lives in
-  `agent.md`.
+- **Release**: the full-analysis and diff flows against `testdata/kvstore` (2026-08-01,
+  decisions.md — a small, dedicated fixture this project owns outright, replacing
+  `~/external_git/miniflux_v2`) with the live SDK, asserting contract shape (artifacts
+  validate, invariants hold), never exact content; each run re-records the SDK fixtures it
+  exercised. It reuses the PTY harness with scripted approvals — every checkpoint is
+  approved as presented, satisfying R22's interactivity without a human — plus scripted
+  interaction scenarios (chat alterations, an amendment rejection, a diff-mode redirect), so
+  fixtures for the interactive paths R2 and R18 require are captured live rather than
+  staying provisional; the scenario list lives in `agent.md`. Each capture builds its own
+  fresh `kvstore` repo (real commit history, `tests/release/kvstore_repo.py`) inside its own
+  `tmp_path` and bootstraps its own real `blare analyze` where a prior analyzed state is
+  needed, rather than sharing one external checkout's `.blare/` across scenarios in a fixed
+  run order — this removes the `exclusive` bazel tag the miniflux-era captures needed
+  (confirmed empirically, 2026-08-01: bazel gives every test action, even concurrent
+  instances of the identical target, an isolated `TEST_TMPDIR`, including under
+  `tags = ["local", "no-sandbox"]`), so `bazel test --test_tag_filters=live //...` now runs
+  every capture in parallel.
 
 ## Module design docs
 
@@ -317,42 +326,41 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T4 — Release readiness
 
-- [ ] **T4.1 release suite** (in progress — 1 of 16 scenarios captured, driver built;
-  reset 2026-08-01, see below): the scripted PTY scenarios against a live SDK in record
-  mode — one per entry on agent.md's provisional list, which is the binding enumeration;
-  captured fixtures replace the provisional set, and emptying that list is this task's
-  definition of done, per the global rule that it gates the first release. T4.1 originally
-  ran these captures against `~/external_git/miniflux_v2` and landed seven real captures:
-  analyze-happy-path, analyze-reanalysis-update, update-load-seeded-repair,
-  update-happy-path, update-multi-commit, update-no-impact, update-no-impact-redirect. On
-  2026-08-01 the user had all seven reverted back to provisional (agent.md has the detail):
-  some had embedded byte-exact copies of miniflux_v2's real source and literal diff output
-  in committed fixtures/testdata with no attribution anywhere in the repo, and miniflux_v2
-  is also large and expensive as a release-suite target, and separately the user's own
-  manual-testing checkout — conflating the two isn't wanted. `tests/e2e/testdata/*` (the
-  copied-source directories) was deleted outright. A smaller, dedicated test codebase will
-  be chosen in a separate design task before this task resumes capturing against it; this
-  entry does not guess what that codebase will be. Only auth-required's real capture
-  survived the revert — it runs against a throwaway scratch repo, never miniflux_v2, so
-  neither reason for reverting applied to it. T4.4 closed the `patch_text=""` gap that
-  blocked update-mode scenarios from seeing real diff content (that fix and its
-  synthetic-placeholder fixture updates are unaffected by the revert); T4.1's own
-  continuation then found and fixed a second, deeper bug in the same area —
-  `_LiveSDKClient.send()` never actually folded `patch_text`/`delta_files` into the text
-  sent to the live model at all (agent.md, also unaffected by the revert) — confirmed by
-  the first update-happy-path attempt visibly hallucinating an unrelated history before the
-  fix. T4.5/T4.6 addressed the checkpoint-wait/gate-timing concern that had paused this
-  task (decisions.md); the user has since re-authorized it to continue.
-  `update-dynamic-expansion` remains unresolved after two good-faith real attempts against
-  miniflux_v2 (agent.md has the detail) — it was never finalized, so there was nothing to
-  revert, and it stays exactly as T4.1 left it; its capture wrapper now hard-fails rather
-  than risk finalizing the wrong shape. Remaining once the new test codebase is chosen:
-  analyze-happy-path, analyze-reanalysis-update, update-load-seeded-repair,
-  update-happy-path, update-multi-commit, update-no-impact, update-no-impact-redirect (all
-  reset by the revert), update-dynamic-expansion (needs a better-chosen delta),
-  analyze-reanalysis-noop (3 earlier attempts didn't converge — needs a different approach,
-  not necessarily a code fix), and amendment-system, amendment-agent (×2),
-  amendment-cascade (×2), analyze-checkpoint-chat (scaffolding in place, not yet
+- [ ] **T4.1 release suite** (in progress — 1 of 16 scenarios captured for real, driver
+  retargeted to `testdata/kvstore` 2026-08-01, see below): the scripted PTY scenarios
+  against a live SDK in record mode — one per entry on agent.md's provisional list, which
+  is the binding enumeration; captured fixtures replace the provisional set, and emptying
+  that list is this task's definition of done, per the global rule that it gates the first
+  release. T4.1 originally ran these captures against `~/external_git/miniflux_v2` and
+  landed seven real captures, all later reverted back to provisional (2026-08-01,
+  decisions.md): some had embedded byte-exact copies of miniflux_v2's real source and
+  literal diff output in committed fixtures/testdata with no attribution anywhere in the
+  repo, and miniflux_v2 is also large and expensive as a release-suite target, and
+  separately the user's own manual-testing checkout — conflating the two isn't wanted.
+  `tests/e2e/testdata/*` (the copied-source directories) was deleted outright. Only
+  auth-required's real capture survived the revert — it runs against a throwaway scratch
+  repo, never miniflux_v2, so neither reason for reverting applied to it. The driver is now
+  retargeted to `testdata/kvstore` (Test strategy, decisions.md) via
+  `tests/release/kvstore_repo.py`, replacing `miniflux_repo.py`; every capture builds its
+  own fresh kvstore repo and bootstraps its own analysis rather than sharing one external
+  checkout, so what was previously a fixed, ordered "run analyze-happy-path first, in the
+  same session" human protocol is gone along with the `exclusive` tag it required. T4.4
+  closed the `patch_text=""` gap that blocked update-mode scenarios from seeing real diff
+  content (unaffected by the revert or the retarget); T4.1's own continuation then found and
+  fixed a second, deeper bug in the same area — `_LiveSDKClient.send()` never actually
+  folded `patch_text`/`delta_files` into the text sent to the live model at all (agent.md,
+  likewise unaffected) — confirmed by the first update-happy-path attempt visibly
+  hallucinating an unrelated history before the fix. T4.5/T4.6 addressed the
+  checkpoint-wait/gate-timing concern that had paused this task (decisions.md); the user has
+  since re-authorized it to continue. `update-dynamic-expansion`'s two prior miniflux_v2
+  attempts (agent.md has the detail) no longer apply now the target has changed; kvstore's
+  `dynamic_expansion_delta` commit (a storage-collision fix and a stale-cache fix bundled
+  into one commit, spanning two distinct failure domains) is this task's new candidate for
+  it. Remaining, all against kvstore now: analyze-happy-path, analyze-reanalysis-update,
+  update-load-seeded-repair, update-happy-path, update-multi-commit, update-no-impact,
+  update-no-impact-redirect (all reset by the revert and re-pointed at kvstore),
+  update-dynamic-expansion, analyze-reanalysis-noop, and amendment-system, amendment-agent
+  (×2), amendment-cascade (×2), analyze-checkpoint-chat (scaffolding in place, not yet
   attempted).
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
