@@ -1,8 +1,8 @@
 """e2e: `blare analyze` re-run over an existing state file (R16), and the byte
 stability R9 permits it to rest on -- an unchanged conclusion keeps its entry's
 exact ID and bytes; a changed one gets a new serialization while every untouched
-entry (siblings in the same file, and every other canonical file and derived doc)
-keeps its bytes verbatim; the recorded SHA advances to the new HEAD either way.
+entry (a sibling in the same file, and a file untouched by any edit) keeps its
+bytes verbatim; the recorded SHA advances to the new HEAD either way.
 
 Traces: R16, R9. `blare analyze`'s `end_sha` is `repo.head_sha()` captured at run
 start (orchestrator.md, step 1) -- unlike `blare update`'s step 5, analyze mode
@@ -13,19 +13,27 @@ and it lets these tests assert the SHA actually advancing to a genuinely differe
 value (artifacts.md's write-primitives test plan: "an empty edit set with a new
 SHA changes exactly the state file") rather than a same-SHA no-op.
 
-Mechanism fixed (2026-08-02, decisions.md: "Bootstrap via replaying
-analyze-happy-path, not a fresh live call"): the bootstrap analysis both tests
-below need is now driven by `kvstore_fixtures.bootstrap_analyze_happy_path`
-(`approve_all`, robust to the real analyze-happy-path capture folding an
-organic, model-initiated amendment into any phase's own turn) rather than this
-module's own `_run_analyze`, whose fixed occurrence count over the plain
-checkpoint prompt could stall on exactly such an amendment's rejectable prompt.
-Recapture pending (separate follow-up, not this task): `analyze-reanalysis-
-update`'s own committed fixture was captured against the *old*, non-
-deterministic live-bootstrap model, so its recorded edits still reference IDs
-from that discarded session -- this test is expected to keep failing, now for
-that one, cleanly-isolated reason, until `analyze-reanalysis-update` is
-recaptured against the fixed bootstrap.
+The bootstrap analysis both tests below need is driven by
+`kvstore_fixtures.bootstrap_analyze_happy_path` (`approve_all`, robust to the
+real analyze-happy-path capture folding an organic, model-initiated amendment
+into any phase's own turn).
+
+`analyze-reanalysis-update` recaptured (2026-08-02, T4.1 continuation) against
+the fixed bootstrap: the real re-analysis session's own conclusions are much
+richer than the scenario's original one-entry-severity-change premise -- the
+`fix_evictor` commit retires `fm-evictor-no-op-unit-bug` (now fixed, excluded
+rather than an active bug), which ripples into four sibling failure modes'
+`caused_by` chains, adds one new failure mode (a real race the model noticed
+while re-reading the code, `fm-cache-insert-race-resets-age`), and needs a
+genuine system-originated repair to close out. `system-map.yaml`,
+`metric-recommendations.yaml`, `alert-recommendations.yaml`, and
+`coverage.yaml` all change too (not just `failure-modes.yaml`, as the
+scenario's original premise assumed) -- only `metrics.yaml` is untouched
+(phase 3's file-level skip; no metric-emitting code changed). R9's byte-
+stability claim is asserted at the level it actually holds: siblings within
+the changed `failure-modes.yaml` that the re-analysis didn't touch keep their
+exact bytes, and `metrics.yaml` (the one file no edit batch touched) stays
+byte-identical including a hand-edited annotation.
 """
 
 from __future__ import annotations
@@ -38,10 +46,9 @@ from python.runfiles import Runfiles
 from ruamel.yaml import YAML
 
 from tests.e2e import kvstore_fixtures
-from tests.e2e.pty_harness import PtyProcess
+from tests.e2e.pty_harness import PtyProcess, approve_all
 from tests.e2e.repo_fixtures import commit_file, head_sha, init_repo
 
-_CHECKPOINT_PROMPT = "$ approve · abort · anything else is chat"
 _YAML = YAML(typ="safe")
 
 _CANONICAL_ENTRY_FILES = (
@@ -94,17 +101,17 @@ def _fixture_dir(name: str) -> Path:
 
 
 def _run_analyze(blare_bin: Path, fixture_dir: Path, repo_dir: Path, xdg: Path) -> str:
-    """Drive one `blare analyze` run to completion through all four checkpoints,
-    approving every one; returns the process's full output."""
+    """Drive one `blare analyze` run to completion, approving every real
+    reply-pending prompt the replayed session actually presents (`approve_all`,
+    robust to however many checkpoints/amendments a given real capture turns
+    out to need, rather than a fixed occurrence count); returns the process's
+    full output."""
     process = PtyProcess(
         [str(blare_bin), "analyze"],
         cwd=repo_dir,
         env={"BLARE_SDK_FIXTURES": f"replay:{fixture_dir}", "XDG_STATE_HOME": str(xdg)},
     )
-    for occurrence in (1, 2, 3, 4):
-        process.read_until(_CHECKPOINT_PROMPT, occurrence=occurrence)
-        process.send_line("approve")
-    result = process.read_all_until_exit()
+    result = approve_all(process)
     assert result.exit_code == 0, result.output
     return result.output
 
@@ -146,19 +153,21 @@ def _hand_annotate_metrics(blare_root: Path) -> None:
     )
 
 
-def _hand_annotate_fm_slow(blare_root: Path) -> None:
-    """Hand-edit `failure-modes.yaml`'s fm-slow entry -- a *sibling*, within the
-    same file as fm-503, which the reanalysis-update fixture does touch. Unlike
-    `_hand_annotate_metrics` (whose file is skipped wholesale), this specifically
-    exercises `_merge_entry_file`'s per-entry preserve-vs-replace branch: fm-503 in
-    this same file gets replaced while fm-slow must be individually preserved from
-    the deep-copied loaded sequence, not merely because its containing file was
-    skipped."""
-    _hand_annotate(
-        blare_root / "failure-modes.yaml",
-        "  coverage_status: metric-gap\n",
-        "  # hand note: still tracking this one\n",
-    )
+def _hand_annotate_failure_mode(blare_root: Path, entry_id: str, comment: str) -> None:
+    """Hand-edit one specific `failure-modes.yaml` entry, inserting `comment` as
+    the first line of its own body (right after its own `- id: <entry_id>` line)
+    -- pinned by ID rather than by a field value that may not be unique to one
+    entry, so this lands on exactly the entry the caller names regardless of
+    what other entries happen to share a field value with it."""
+    path = blare_root / "failure-modes.yaml"
+    original = path.read_text()
+    marker = f"- id: {entry_id}\n"
+    idx = original.find(marker)
+    assert idx != -1, f"entry {entry_id!r} not found in {path}"
+    insert_at = idx + len(marker)
+    annotated = original[:insert_at] + comment + original[insert_at:]
+    assert annotated != original
+    path.write_text(annotated)
 
 
 def _entries_by_id(raw: bytes) -> dict[str, str]:
@@ -218,12 +227,17 @@ def test_e2e_reanalysis_unchanged_conclusions_preserve_ids_and_bytes(tmp_path: P
     assert b"# hand-verified against the codebase" in after["metrics.yaml"]
 
 
-def test_e2e_reanalysis_changed_conclusion_rewrites_only_that_entry(tmp_path: Path) -> None:
-    """R16/R9: a second `blare analyze` run whose replayed session updates one
-    existing failure mode's severity rewrites exactly that entry -- its ID
-    unchanged, its bytes changed -- while every sibling entry (same file and every
-    other canonical file/derived doc) keeps its exact bytes; the recorded SHA
-    still advances to the delta's new HEAD."""
+def test_e2e_reanalysis_changed_conclusions_preserve_untouched_entries_and_files(
+    tmp_path: Path,
+) -> None:
+    """R16/R9: a second `blare analyze` run whose replayed session reaches real,
+    substantive new conclusions (a fixed bug's failure mode retired to
+    `excluded`, a new failure mode added, ripple edits to four sibling
+    `caused_by` chains, a genuine system-originated repair) rewrites every file
+    an edit actually touched -- but a sibling entry within the one changed file
+    that no edit named keeps its exact bytes, and `metrics.yaml` (the one file
+    no edit batch touches at all) stays byte-identical, hand-edited annotation
+    included; the recorded SHA still advances to the delta's new HEAD."""
     blare_bin = _blare_bin()
     repo_dir = tmp_path / "repo"
     init_repo(repo_dir)
@@ -233,12 +247,16 @@ def test_e2e_reanalysis_changed_conclusion_rewrites_only_that_entry(tmp_path: Pa
     kvstore_fixtures.bootstrap_analyze_happy_path(blare_bin, repo_dir, xdg_state)
     first_sha = head_sha(repo_dir)
     _hand_annotate_metrics(blare_root)
-    _hand_annotate_fm_slow(blare_root)
+    # fm-cache-oom-crash: a real analyze-happy-path entry the fix_evictor
+    # re-analysis never touches (a sibling, within the same failure-modes.yaml
+    # that fm-evictor-no-op-unit-bug and others below do get rewritten in).
+    _hand_annotate_failure_mode(
+        blare_root, "fm-cache-oom-crash", "  # hand note: still tracking this one\n"
+    )
     before = _snapshot(blare_root)
     before_config = (blare_root / "config.yaml").read_bytes()
     before_fm_entries = _entries_by_id(before["failure-modes.yaml"])
-    assert "severity: critical" in before_fm_entries["fm-503"]
-    assert "# hand note: still tracking this one" in before_fm_entries["fm-slow"]
+    assert "  # hand note: still tracking this one\n" in before_fm_entries["fm-cache-oom-crash"]
 
     second_sha = commit_file(
         repo_dir, "src/extra.py", "# a later, unrelated change\n", "a later commit"
@@ -248,7 +266,11 @@ def test_e2e_reanalysis_changed_conclusion_rewrites_only_that_entry(tmp_path: Pa
     output = _run_analyze(
         blare_bin, _fixture_dir("analyze-reanalysis-update"), repo_dir, xdg_state
     )
-    assert "0 added · 1 updated · 0 removed" in output
+    assert "analysis complete" in output
+    assert "4 added · 11 updated · 0 removed" in output
+    # 26 failure modes total (25 from analyze-happy-path, 1 new this run), all
+    # resolved one way or another -- none left unmapped for a future run to find.
+    assert "3 alertable · 20 metric-gap · 3 excluded" in output
 
     state = _load_yaml(blare_root / "state.yaml")
     assert state["analyzed_sha"] == second_sha
@@ -256,31 +278,38 @@ def test_e2e_reanalysis_changed_conclusion_rewrites_only_that_entry(tmp_path: Pa
 
     after = _snapshot(blare_root)
 
-    # failure-modes.yaml is the only canonical file whose bytes changed.
-    for filename in _CANONICAL_ENTRY_FILES:
-        if filename == "failure-modes.yaml":
-            assert after[filename] != before[filename]
-        else:
-            assert after[filename] == before[filename], f"{filename} changed unexpectedly"
-    assert (blare_root / "config.yaml").read_bytes() == before_config
+    # metrics.yaml is the one canonical file no edit in this run touches at all
+    # (the fix_evictor commit changes no metric-emitting code) -- byte-
+    # identical, hand-edited annotation included.
+    assert after["metrics.yaml"] == before["metrics.yaml"]
     assert b"# hand-verified against the codebase" in after["metrics.yaml"]
+    # Every other canonical file gets real, substantive edits this run.
+    for filename in _CANONICAL_ENTRY_FILES:
+        if filename != "metrics.yaml":
+            assert after[filename] != before[filename], f"{filename} did not change as expected"
 
-    # Within failure-modes.yaml: fm-timeout and fm-slow (siblings, untouched) keep
-    # their exact bytes; fm-503's ID is stable even though its content (severity)
-    # changed, and its new bytes reflect the new severity.
+    # Within failure-modes.yaml: fm-cache-oom-crash (a sibling, untouched) keeps
+    # its exact bytes, hand-edited annotation included; fm-evictor-no-op-unit-bug
+    # (the bug this commit fixes)'s ID is stable even though its content
+    # changed, and its new bytes reflect the fix (excluded, no longer active).
     after_fm_entries = _entries_by_id(after["failure-modes.yaml"])
-    assert set(after_fm_entries) == set(before_fm_entries)
-    assert after_fm_entries["fm-timeout"] == before_fm_entries["fm-timeout"]
-    assert after_fm_entries["fm-slow"] == before_fm_entries["fm-slow"]
-    assert after_fm_entries["fm-503"] != before_fm_entries["fm-503"]
-    assert "severity: warning" in after_fm_entries["fm-503"]
-    assert "severity: critical" not in after_fm_entries["fm-503"]
+    assert set(after_fm_entries) - set(before_fm_entries) == {"fm-cache-insert-race-resets-age"}
+    assert after_fm_entries["fm-cache-oom-crash"] == before_fm_entries["fm-cache-oom-crash"]
+    before_evictor_bug = before_fm_entries["fm-evictor-no-op-unit-bug"]
+    after_evictor_bug = after_fm_entries["fm-evictor-no-op-unit-bug"]
+    assert after_evictor_bug != before_evictor_bug
+    assert "coverage_status: excluded" in after_evictor_bug
 
-    # failure-modes.md is the only derived doc whose bytes changed (R9/R10:
-    # unchanged YAML renders byte-identically even though every doc is rewritten).
+    # config.yaml (the stack choice) never changes on a re-analysis.
+    assert (blare_root / "config.yaml").read_bytes() == before_config
+
+    # metrics.md is the one derived doc that stays byte-identical, matching its
+    # canonical YAML (R9/R10: unchanged YAML renders byte-identically even
+    # though every doc is rewritten); every other doc changes along with its
+    # canonical file.
     for doc_filename in _DOC_FILES:
         key = f"docs/{doc_filename}"
-        if doc_filename == "failure-modes.md":
-            assert after[key] != before[key]
+        if doc_filename == "metrics.md":
+            assert after[key] == before[key]
         else:
-            assert after[key] == before[key], f"{key} changed unexpectedly"
+            assert after[key] != before[key], f"{key} did not change as expected"
