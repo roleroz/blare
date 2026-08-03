@@ -214,48 +214,57 @@ captures; all were reverted (2026-08-01, decisions.md — an attribution gap in 
 fixtures, plus miniflux_v2 being both expensive and the user's separate manual-testing
 checkout) and the driver retargeted to `testdata/kvstore` (decisions.md, Test strategy) via
 `tests/release/kvstore_repo.py`, each capture building its own fresh repo and bootstrapping
-its own analysis. Against kvstore, T4.1's continuation (2026-08-02) then captured 14 of 16
-scenarios for real. `_LiveSDKClient.send()`'s `patch_text`/`delta_files`-dropping bug
-(2026-08-01, independent of target codebase) and the stall-detection fix in
-`tests/release/scenario_driver.py`'s `_drive()` (2026-08-02 — `cli.py`'s progress-spinner
-tick counter defeated the raw-delta repeat comparison, so a genuine repeating gate-repair
-loop never got the stall hint and just exhausted `max_iterations`; fixed by stripping
-spinner lines before comparing) both remain in effect and are unaffected by any of the
-above.
+its own analysis via a fresh *live* `blare analyze` call. That live bootstrap's
+non-determinism (different failure-mode/metric IDs every run) broke every e2e test for a
+scenario that needed one; fixed 2026-08-02 (decisions.md) by bootstrapping via *replaying*
+the already-captured `analyze-happy-path` fixture instead — free, deterministic, fixed IDs.
+`_LiveSDKClient.send()`'s `patch_text`/`delta_files`-dropping bug (2026-08-01, independent
+of target codebase) and the stall-detection fix in `tests/release/scenario_driver.py`'s
+`_drive()` (2026-08-02 — `cli.py`'s progress-spinner tick counter defeated the raw-delta
+repeat comparison, so a genuine repeating gate-repair loop never got the stall hint and
+just exhausted `max_iterations`; fixed by stripping spinner lines before comparing) both
+remain in effect throughout.
 
-Captured for real (no longer provisional): auth-required (R12, exempt from the miniflux
-revert — runs against a throwaway scratch repo, never a target codebase, so neither revert
-reason applied); analyze-happy-path (a rich, sensible real analysis — 24 failure modes
-correctly identifying kvstore's actual bugs); analyze-checkpoint-chat (R2);
-analyze-reanalysis-update (R16, real commits ahead — kvstore's `fix_evictor` commit);
-amendment-agent-approved and -rejected; amendment-cascade-approved and -rejected;
-amendment-system (a hand-injected R4 violation caught at the final approval gate, on the
-second convergent attempt — see below for the first); update-happy-path (`fix_evictor`,
+Captured for real (no longer provisional) — 15 of 16: auth-required (R12, exempt from the
+miniflux revert — runs against a throwaway scratch repo, never a target codebase, so
+neither revert reason applied); analyze-happy-path (a rich, sensible real analysis — 24
+failure modes correctly identifying kvstore's actual bugs; also now the fixed bootstrap
+source every other scenario replays); analyze-checkpoint-chat (R2); analyze-reanalysis-update
+(R16, real commits ahead — kvstore's `fix_evictor` commit); amendment-agent-approved and
+-rejected; amendment-cascade-approved and -rejected; update-happy-path (`fix_evictor`,
 single-file); update-multi-commit (R8, `multi_commit_range_end`, three commits);
 update-no-impact (`test_only_change`); update-no-impact-redirect (`docs_update`,
-chat-redirected); update-load-seeded-repair (a hand-seeded R4 violation, `docs_update` as
-the delta since its content doesn't matter); update-dynamic-expansion (kvstore's
-`dynamic_expansion_delta` commit — a storage-collision fix and a stale-cache fix bundled
-into one commit, spanning two distinct failure domains — genuinely converged, opening more
-than one phase, after two earlier non-convergent attempts against miniflux_v2).
+chat-redirected); update-dynamic-expansion (kvstore's `dynamic_expansion_delta` commit — a
+storage-collision fix and a stale-cache fix bundled into one commit, spanning two distinct
+failure domains — genuinely converged, opening more than one phase, after two earlier
+non-convergent attempts against miniflux_v2).
+
+update-load-seeded-repair and amendment-system both hit the same non-convergence class
+before converging: a hand-injected, still-unmapped failure mode is meant to survive an
+ordinary pass and get caught only at the final gate/proactive-repair check, but a real
+attempt at each found the model organically resolving the violation itself first (an
+agent-proposed amendment), so the system-originated repair this scenario exists to
+demonstrate never fired. update-load-seeded-repair's capture test
+(`tests/release/test_capture_update_load_seeded_repair.py`) gained a guard that only
+finalizes the capture if the rendered output actually shows the system-originated
+`"amendment · invariant repair"` firing; it converged on the first attempt under that
+guard. amendment-system took three real attempts (organic resolution, a transient SDK
+rate-limit error, then convergence) — and its capture surfaced a real doc/reality mismatch:
+this section previously described it as already captured on a "second, convergent
+attempt," but the committed fixture had in fact never been touched since its original
+2026-07-30 hand-authored placeholder, confirmed directly against git history. It was
+genuinely never captured before now; the earlier claim in this doc was simply wrong.
 
 Still provisional after genuine, repeated non-convergence (not a forced shape) — a
-release-suite capture still supersedes both:
+release-suite capture still supersedes it:
 
 - analyze re-run over an existing state file, unchanged conclusions (R16 re-analysis noop)
-  — `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl`. Four real attempts
-  total (one against miniflux_v2, three against kvstore, the last with an explicit
-  `.blare/`-check chat hint) have not converged to a genuine zero-diff: a real re-analysis
-  has no way to learn a prior analysis exists except its own initiative, and even prompted
-  to check, the model's re-analysis still finds enough to say differently that the diff
-  isn't empty.
-- system-originated amendment first-attempt non-convergence, for the record (the second
-  attempt above did converge): a hand-injected, still-unmapped failure mode is meant to
-  survive an ordinary re-analysis pass and get caught only at the final approval gate. The
-  first kvstore attempt found the model's phase-4 sweep organically resolves the injected
-  violation on its own initiative before the gate ever runs, so no system-originated
-  amendment fires — a real, reportable non-convergence, distinct from the second attempt's
-  real capture above.
+  — `tests/fixtures/claude-sdk/analyze-reanalysis-noop/scenario.jsonl`. Six real attempts
+  total across this project's history (one against miniflux_v2, five against kvstore,
+  including with an explicit `.blare/`-check chat hint) have not converged to a genuine
+  zero-diff: a real re-analysis has no way to learn a prior analysis exists except its own
+  initiative, and even prompted to check, the model's re-analysis still finds enough to say
+  differently that the diff isn't empty.
 - progress feedback (R25) — a slow phase 1 turn with scripted filesystem-read
   `"activity"` events (each carrying a real `delay_before`) ahead of the ordinary
   `propose_edits` round trip, giving the e2e test real wall-clock time to observe genuine
@@ -264,17 +273,16 @@ release-suite capture still supersedes both:
   16-scenario enumeration above (it doesn't target a real codebase), so still untouched —
   a release-suite capture still supersedes it.
 
-**2026-08-02 quarantine.** Landing the 14 real captures broke 6 `tests/e2e` tests, now
-tagged `quarantined` and excluded from fast/full (decisions.md).
-`test_amendment_agent_approved` is genuinely flaky (confirmed passing and failing across
-identical re-runs, root cause not found). The other 5 (`test_analyze_reanalysis`,
-`test_update_happy_path`, `test_update_r8_multi_commit_delta`,
-`test_update_dynamic_expansion`, `test_update_load_seeded_repair`) hit a real design gap:
-the bootstrap `blare analyze` `capture.py` runs to get a genuine prior `.blare/` state has
-its own recording discarded, so a real capture's delta edits reference failure-mode/metric
-IDs nothing preserves, and no hand-authored e2e seed can reproduce them. Closing this —
-what the bootstrap's recording should become, and how these 5 e2e tests replay it — is
-design work still to be done.
+**2026-08-02 quarantine, resolved same day.** Landing the first 14 real captures against
+the old live bootstrap broke 6 `tests/e2e` tests, tagged `quarantined` and excluded from
+fast/full (decisions.md). `test_amendment_agent_approved` is genuinely flaky (confirmed
+passing and failing across identical re-runs, root cause not found) and remains
+quarantined. The other 5 (`test_analyze_reanalysis`, `test_update_happy_path`,
+`test_update_r8_multi_commit_delta`, `test_update_dynamic_expansion`,
+`test_update_load_seeded_repair`) hit the bootstrap non-determinism described above; once
+the bootstrap was fixed and its 8 dependent scenarios recaptured against it, all 5 are now
+un-quarantined, their assertions rewritten against the real (often richer-than-expected)
+capture content rather than weakened. Full suite: 34/34.
 
 The transport-error and rate/overload shapes are deliberately *not* fixture entries: both
 are typed exception classes of the pinned SDK, verified by unit tests importing those

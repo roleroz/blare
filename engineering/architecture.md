@@ -326,7 +326,7 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
 
 ### T4 — Release readiness
 
-- [ ] **T4.1 release suite** (in progress — 14 of 16 scenarios captured for real against
+- [ ] **T4.1 release suite** (in progress — 15 of 16 scenarios captured for real against
   `testdata/kvstore`, 2026-08-02, see below): the scripted PTY scenarios against a live SDK
   in record mode — one per entry on agent.md's provisional list, which is the binding
   enumeration; captured fixtures replace the provisional set, and emptying that list is
@@ -336,35 +336,46 @@ list (a coding agent never edits design docs). T4.1 is where captures replace th
   expensive target and the user's separate manual-testing checkout) and the driver
   retargeted to `testdata/kvstore` via `tests/release/kvstore_repo.py` (Test strategy,
   decisions.md), each capture building its own fresh repo and bootstrapping its own
-  analysis rather than sharing one external checkout. Against kvstore, 14 of 16 scenarios
-  are now captured for real: analyze-happy-path, analyze-checkpoint-chat,
-  analyze-reanalysis-update, amendment-agent-approved, amendment-agent-rejected,
-  amendment-cascade-approved, amendment-cascade-rejected, amendment-system,
-  update-happy-path, update-multi-commit, update-no-impact, update-no-impact-redirect,
-  update-load-seeded-repair, and update-dynamic-expansion (converged this time against
-  kvstore's `dynamic_expansion_delta` commit, after two earlier non-convergent attempts
-  against miniflux_v2). Two remain provisional after genuine, repeated non-convergence, not
-  a forced shape: analyze-reanalysis-noop (the model doesn't reach a genuine zero-diff even
-  with a `.blare/`-check hint) and amendment-system (the model organically resolves the
-  seeded R4 violation during phase 4's ordinary sweep before the final gate can catch it
-  unrepaired, so the system-originated amendment never fires).
+  analysis rather than sharing one external checkout. That bootstrap originally made a
+  fresh live `blare analyze` call per scenario, whose failure-mode/metric IDs differed
+  every run; fixed 2026-08-02 (decisions.md) to instead replay the already-captured
+  `analyze-happy-path` fixture, giving every bootstrap-dependent scenario the same fixed,
+  reusable IDs and removing an entire live analyze call from each one's cost.
 
-  Landing the real captures broke 6 `tests/e2e` tests, now tagged `quarantined` and excluded
-  from fast/full (2026-08-02, decisions.md): `test_amendment_agent_approved` is genuinely
-  flaky (root cause not found); the other 5
-  (`test_analyze_reanalysis`, `test_update_happy_path`, `test_update_r8_multi_commit_delta`,
-  `test_update_dynamic_expansion`, `test_update_load_seeded_repair`) hit a real design gap —
-  `capture.py`'s bootstrap `blare analyze` (run to get a genuine prior `.blare/` for
-  scenarios that need one) has its own recording discarded, so the real capture's delta
-  edits reference failure-mode/metric IDs nothing preserves, and no hand-authored e2e seed
-  can reproduce them. Closed (2026-08-02, decisions.md): the bootstrap now replays the
-  already-captured `analyze-happy-path` fixture instead of making a fresh live call, so its
-  IDs are fixed and reusable by both future captures and e2e replay. 8 scenarios used the
-  old live bootstrap and need recapturing against the new fixed state — update-happy-path,
-  update-multi-commit, update-no-impact, update-no-impact-redirect,
-  update-dynamic-expansion, update-load-seeded-repair, analyze-reanalysis-update, and
-  amendment-system — plus analyze-reanalysis-noop, still provisional regardless. Cheaper
-  than their first capture, since none of them pays for a live bootstrap analyze anymore.
+  Against kvstore, 15 of 16 scenarios are now captured for real: analyze-happy-path,
+  analyze-checkpoint-chat, analyze-reanalysis-update, amendment-agent-approved,
+  amendment-agent-rejected, amendment-cascade-approved, amendment-cascade-rejected,
+  amendment-system, update-happy-path, update-multi-commit, update-no-impact,
+  update-no-impact-redirect, update-load-seeded-repair, and update-dynamic-expansion
+  (converged against kvstore's `dynamic_expansion_delta` commit, after two earlier
+  non-convergent attempts against miniflux_v2). `update-load-seeded-repair` needed a
+  convergence guard added to its capture test first (only finalizes if the real session's
+  output shows the system-originated repair actually firing) after an earlier attempt
+  showed the model organically resolving the seeded violation itself; it converged on the
+  first attempt under that guard. `amendment-system` needed three real attempts (organic
+  resolution, a transient SDK rate-limit error, then convergence) — and its capture
+  surfaced a doc/reality mismatch: despite this doc and agent.md previously describing it
+  as already captured on a "second, convergent attempt," the committed fixture had in fact
+  never been touched since its original 2026-07-30 hand-authored placeholder, confirmed
+  directly against git history. That was this scenario's first genuine real capture, not a
+  recapture — the earlier claim was simply wrong.
+
+  One scenario remains provisional after genuine, repeated non-convergence, not a forced
+  shape: **analyze-reanalysis-noop** — six real attempts across this project's history
+  (one against miniflux_v2, five against kvstore, including with an explicit
+  `.blare/`-check chat hint) have not converged to a genuine zero-diff; a real re-analysis
+  has no way to learn a prior analysis exists except its own initiative, and even prompted
+  to check, it keeps finding enough to say differently that the diff isn't empty.
+
+  Landing the real captures against the old bootstrap briefly broke 6 `tests/e2e` tests,
+  tagged `quarantined` and excluded from fast/full (2026-08-02, decisions.md).
+  `test_amendment_agent_approved` is genuinely flaky (root cause not found) and remains
+  quarantined. The other 5 (`test_analyze_reanalysis`, `test_update_happy_path`,
+  `test_update_r8_multi_commit_delta`, `test_update_dynamic_expansion`,
+  `test_update_load_seeded_repair`) hit the bootstrap-ID design gap described above; once
+  the bootstrap was fixed and all 8 dependent scenarios recaptured against it, all 5 are
+  now un-quarantined, their assertions rewritten against the real (often
+  richer-than-expected) capture content rather than weakened. Full suite: 34/34.
 - [x] **T4.2 user documentation**: `README.md` per the pipeline's step 6 (description, when
   to use and not, install, quick start), written to the brand voice.
 - [x] **T4.3 progress feedback**: R25 — `agent`'s tool-call activity callback (firing for
