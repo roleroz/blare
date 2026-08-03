@@ -398,8 +398,13 @@ py_test(
     # fails across identical re-runs with no code change (real PTY timing
     # interacting with the stall-detection boundary in
     # tests/e2e/pty_harness.py's approve_all/approve_until). Root cause not
-    # yet found; never leave a known-flaky test gating commits.
-    tags = ["e2e", "quarantined"],
+    # yet found; never leave a known-flaky test gating commits. manual: a
+    # custom tag like "quarantined" only excludes a target from build/test
+    # commands that explicitly filter it out (as fast/full do) -- unlike
+    # "live" elsewhere in this repo, this test has no other reason to need
+    # `data`/`env_inherit` workarounds, so `manual` alone is enough to also
+    # keep it out of any bare `bazel test //...` or explicit target build.
+    tags = ["e2e", "manual", "quarantined"],
     deps = [
         "@pip//pytest_bazel",
         "@pip//ruamel_yaml",
